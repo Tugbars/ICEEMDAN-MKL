@@ -2,6 +2,100 @@
 
 Fast Ensemble Empirical Mode Decomposition using Intel MKL.
 
+## What is EEMD?
+
+**Empirical Mode Decomposition (EMD)** is an adaptive signal processing technique that decomposes a signal into a set of **Intrinsic Mode Functions (IMFs)** — oscillatory components ordered from highest to lowest frequency. Unlike Fourier or wavelet transforms, EMD is:
+
+- **Data-driven** — no predefined basis functions
+- **Adaptive** — handles non-stationary, non-linear signals
+- **Local** — captures instantaneous frequency changes
+
+**Ensemble EMD (EEMD)** improves on EMD by adding white noise across multiple trials and averaging the results, which eliminates **mode mixing** (where different frequency components leak into the same IMF).
+
+```
+Original Signal
+     │
+     ▼
+┌─────────────────────────────────────┐
+│           EEMD Decomposition        │
+└─────────────────────────────────────┘
+     │
+     ├──► IMF 1: Highest frequency (noise, microstructure)
+     ├──► IMF 2: High frequency (short-term oscillations)
+     ├──► IMF 3: Medium frequency (cycles, patterns)
+     ├──► IMF 4: Lower frequency (trends)
+     ├──► ...
+     └──► Residue: Underlying trend
+```
+
+## Finance Use Cases
+
+### 1. Trend Extraction
+Separate the underlying trend from cyclical and noise components:
+```cpp
+// IMFs 1-3: noise + short-term fluctuations (discard or analyze separately)
+// IMFs 4+: trend components (use for regime detection)
+// Residue: long-term drift
+```
+
+### 2. Denoising for Regime Detection
+Feed cleaned signals into regime detection algorithms (e.g., BOCPD, HMM):
+```cpp
+// Remove high-frequency IMFs before changepoint detection
+// Reduces false positives from market microstructure noise
+```
+
+### 3. Multi-Scale Volatility Analysis
+Each IMF captures volatility at different timescales:
+```cpp
+// IMF 1-2: Tick-level / intraday volatility
+// IMF 3-4: Daily volatility cycles
+// IMF 5+:  Weekly/monthly volatility regimes
+```
+
+### 4. Feature Engineering for ML
+Use IMFs as features for machine learning models:
+```cpp
+// Extract instantaneous amplitude and frequency from each IMF
+// Feed into classifiers, regressors, or reinforcement learning agents
+```
+
+### 5. Signal Reconstruction
+Reconstruct signals with specific frequency bands removed:
+```cpp
+// Reconstruct without IMF 1-2: smoothed signal for trend-following
+// Reconstruct only IMF 1-2: mean-reversion signals
+```
+
+### Example: Price Decomposition
+```cpp
+#include "eemd_mkl.hpp"
+
+int main() {
+    eemd_init_low_latency(8);
+    
+    // Load 1024 log-returns
+    std::vector<double> returns = load_returns("SPY", 1024);
+    
+    eemd::EEMDConfig config;
+    config.ensemble_size = 100;
+    config.noise_std = 0.2;
+    
+    eemd::EEMD decomposer(config);
+    std::vector<std::vector<double>> imfs;
+    int32_t n_imfs;
+    
+    decomposer.decompose(returns.data(), returns.size(), imfs, n_imfs);
+    
+    // imfs[0]: Microstructure noise
+    // imfs[1-2]: Short-term mean-reversion
+    // imfs[3-4]: Momentum/trend components
+    // imfs[n_imfs-1] + residue: Long-term drift
+    
+    // Feed trend components into your trading strategy...
+}
+```
+
 ## Features
 
 - **Header-only** — single file `eemd_mkl.hpp`
