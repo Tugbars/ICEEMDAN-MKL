@@ -105,9 +105,14 @@ bool test_mkl_spline_raw()
     double sites[] = {0.5, 1.5, 2.5};
     double results[3];
 
+    // dorder specifies which derivatives to compute
+    // dorder[i] = 1 means "compute i-th derivative"
+    // We want function value (0th derivative)
+    const MKL_INT dorder[] = {1};
+
     status = dfdInterpolate1D(task, DF_INTERP, DF_METHOD_PP,
-                              n_sites, sites, DF_NON_UNIFORM_PARTITION,
-                              1, nullptr, nullptr,
+                              n_sites, sites, DF_SORTED_DATA,
+                              1, dorder, nullptr,
                               results, DF_NO_HINT, nullptr);
 
     std::cout << "dfdInterpolate1D status: " << status;

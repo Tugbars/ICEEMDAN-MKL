@@ -585,19 +585,25 @@ namespace eemd
 
             const MKL_INT mkl_n_sites = static_cast<MKL_INT>(n_sites);
 
+            // dorder specifies which derivatives to compute
+            // dorder[i] = 1 means "compute the i-th derivative"
+            // We want just the function value (0th derivative), so dorder = {1}
+            const MKL_INT dorder[] = {1}; // Compute 0th derivative (function value)
+
             MKL_INT status = dfdInterpolate1D(
                 task_,
                 DF_INTERP,
                 DF_METHOD_PP,
                 mkl_n_sites,
                 sites,
-                DF_NON_UNIFORM_PARTITION,
-                1,
-                nullptr,
-                nullptr,
+                DF_SORTED_DATA, // Sites must be sorted - changed from DF_NON_UNIFORM_PARTITION
+                1,              // ndorder: compute 1 derivative order
+                dorder,         // Which derivatives: just function value
+                nullptr,        // datahint: not used
                 results,
                 DF_NO_HINT,
-                nullptr);
+                nullptr // cell: optional output, not needed
+            );
 
             if (status != DF_STATUS_OK)
             {
