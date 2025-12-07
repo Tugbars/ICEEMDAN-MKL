@@ -355,12 +355,13 @@ void benchmark() {
 }
 
 int main(int argc, char* argv[]) {
-    // Initialize MKL threading
-    mkl_set_num_threads(omp_get_max_threads());
+    // CRITICAL: Keep MKL sequential, let OpenMP handle parallelism
+    mkl_set_num_threads(1);
     
     std::cout << "EEMD-MKL Test Suite" << std::endl;
     std::cout << "===================" << std::endl;
-    std::cout << "MKL threading: " << mkl_get_max_threads() << " threads" << std::endl;
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential)" << std::endl;
     
     test_basic_emd();
     test_eemd_ensemble();

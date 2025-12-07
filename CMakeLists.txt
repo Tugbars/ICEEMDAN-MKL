@@ -115,6 +115,17 @@ if(EEMD_BUILD_BENCH)
     )
 endif()
 
+# Debug/diagnostic executable
+option(EEMD_BUILD_DEBUG "Build diagnostic tool" ON)
+if(EEMD_BUILD_DEBUG)
+    add_executable(eemd_debug eemd_debug.cpp)
+    target_link_libraries(eemd_debug PRIVATE eemd_mkl)
+    target_compile_options(eemd_debug PRIVATE
+        "$<$<CONFIG:Release>:${EEMD_CXX_FLAGS_RELEASE}>"
+        "$<$<CONFIG:Debug>:${EEMD_CXX_FLAGS_DEBUG}>"
+    )
+endif()
+
 # ==============================================================================
 # Installation
 # ==============================================================================
