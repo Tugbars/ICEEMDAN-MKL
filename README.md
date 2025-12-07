@@ -6,6 +6,9 @@ Fast Ensemble Empirical Mode Decomposition using Intel MKL.
 
 - **Header-only** — single file `eemd_mkl.hpp`
 - **MKL-accelerated** — cubic spline interpolation via MKL Data Fitting
+- **DF_UNIFORM_PARTITION** — O(1) knot lookup instead of O(log K) binary search
+- **Raw pointer hot paths** — no std::vector overhead in inner loops
+- **Fused loops** — single memory pass for mean/SD/update
 - **Parallel** — OpenMP ensemble parallelization with thread-local accumulation
 - **Zero-allocation hot path** — pre-allocated scratch buffers, grow-only memory
 - **Portable SIMD** — compiler-aware `#pragma omp simd` (works with MSVC, ICX, GCC, Clang)
@@ -23,7 +26,7 @@ Fast Ensemble Empirical Mode Decomposition using Intel MKL.
 
 int main() {
     // Initialize (call once at startup)
-    init_14900kf(true);  // Configures threads, DAZ/FTZ, MKL settings
+    eemd_init_low_latency(8, true);  // 8 cores, verbose
     
     // Configure
     eemd::EEMDConfig config;
@@ -92,14 +95,34 @@ make -j$(nproc)
 
 Tested on Intel Core i9-14900KF (8 P-cores, MKL sequential, OpenMP parallel):
 
-| Signal | Ensemble | Time | Throughput |
-|--------|----------|------|------------|
-| 256 | 100 | 7 ms | 3.5 MS/s |
-| 1024 | 100 | 48 ms | 2.1 MS/s |
-| 2048 | 100 | 92 ms | 2.2 MS/s |
-| 8192 | 100 | 420 ms | 1.9 MS/s |
+### EEMD (100 ensemble trials)
 
-Single EMD latency: **~1 ms** for 1024 samples.
+| Signal | Time | Throughput |
+|--------|------|------------|
+| 256 | 1.5 ms | 17 MS/s |
+| 512 | 1.6 ms | 32 MS/s |
+| 1024 | 2.7 ms | 38 MS/s |
+| 2048 | 5.9 ms | 35 MS/s |
+| 4096 | 17 ms | 24 MS/s |
+| 8192 | 40 ms | 20 MS/s |
+
+### Single EMD Latency
+
+| Signal | Latency |
+|--------|---------|
+| 256 | 26 µs |
+| 512 | 43 µs |
+| 1024 | 86 µs |
+| 2048 | 202 µs |
+| 4096 | 464 µs |
+
+### Key Optimizations
+
+| Optimization | Impact |
+|--------------|--------|
+| `DF_UNIFORM_PARTITION` | O(1) knot lookup vs O(log K) binary search |
+| Raw pointer hot paths | No std::vector overhead in inner loops |
+| Fused mean/SD/update | Single memory pass instead of three |
 
 ## API
 
@@ -138,10 +161,16 @@ bool compute_instantaneous_frequency(
 
 | Function | Use Case |
 |----------|----------|
-| `init_14900kf()` | Low-latency (8 threads, infinite blocktime, P-cores only) |
-| `init_14900kf_throughput()` | Batch processing (16 threads with HT) |
+| `eemd_init_low_latency(n_cores)` | Low-latency (infinite blocktime, P-cores only) |
+| `eemd_init_throughput(n_cores)` | Batch processing (with HT, allows sleep) |
 
-Adjust thread counts in the source for your specific CPU.
+```cpp
+// 8 physical cores, low-latency mode
+eemd_init_low_latency(8, true);
+
+// 6 cores with hyperthreading (12 threads)
+eemd_init_throughput(6, true);
+```
 
 ## License
 
