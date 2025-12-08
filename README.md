@@ -2,10 +2,107 @@
 
 Fast Ensemble Empirical Mode Decomposition using Intel MKL.
 
+## What is EEMD?
+
+**Empirical Mode Decomposition (EMD)** is an adaptive signal processing technique that decomposes a signal into a set of **Intrinsic Mode Functions (IMFs)** — oscillatory components ordered from highest to lowest frequency. Unlike Fourier or wavelet transforms, EMD is:
+
+- **Data-driven** — no predefined basis functions
+- **Adaptive** — handles non-stationary, non-linear signals
+- **Local** — captures instantaneous frequency changes
+
+**Ensemble EMD (EEMD)** improves on EMD by adding white noise across multiple trials and averaging the results, which eliminates **mode mixing** (where different frequency components leak into the same IMF).
+
+```
+Original Signal
+     │
+     ▼
+┌─────────────────────────────────────┐
+│           EEMD Decomposition        │
+└─────────────────────────────────────┘
+     │
+     ├──► IMF 1: Highest frequency (noise, microstructure)
+     ├──► IMF 2: High frequency (short-term oscillations)
+     ├──► IMF 3: Medium frequency (cycles, patterns)
+     ├──► IMF 4: Lower frequency (trends)
+     ├──► ...
+     └──► Residue: Underlying trend
+```
+
+## Finance Use Cases
+
+### 1. Trend Extraction
+Separate the underlying trend from cyclical and noise components:
+```cpp
+// IMFs 1-3: noise + short-term fluctuations (discard or analyze separately)
+// IMFs 4+: trend components (use for regime detection)
+// Residue: long-term drift
+```
+
+### 2. Denoising for Regime Detection
+Feed cleaned signals into regime detection algorithms (e.g., BOCPD, HMM):
+```cpp
+// Remove high-frequency IMFs before changepoint detection
+// Reduces false positives from market microstructure noise
+```
+
+### 3. Multi-Scale Volatility Analysis
+Each IMF captures volatility at different timescales:
+```cpp
+// IMF 1-2: Tick-level / intraday volatility
+// IMF 3-4: Daily volatility cycles
+// IMF 5+:  Weekly/monthly volatility regimes
+```
+
+### 4. Feature Engineering for ML
+Use IMFs as features for machine learning models:
+```cpp
+// Extract instantaneous amplitude and frequency from each IMF
+// Feed into classifiers, regressors, or reinforcement learning agents
+```
+
+### 5. Signal Reconstruction
+Reconstruct signals with specific frequency bands removed:
+```cpp
+// Reconstruct without IMF 1-2: smoothed signal for trend-following
+// Reconstruct only IMF 1-2: mean-reversion signals
+```
+
+### Example: Price Decomposition
+```cpp
+#include "eemd_mkl.hpp"
+
+int main() {
+    eemd_init_low_latency(8);
+    
+    // Load 1024 log-returns
+    std::vector<double> returns = load_returns("SPY", 1024);
+    
+    eemd::EEMDConfig config;
+    config.ensemble_size = 100;
+    config.noise_std = 0.2;
+    
+    eemd::EEMD decomposer(config);
+    std::vector<std::vector<double>> imfs;
+    int32_t n_imfs;
+    
+    decomposer.decompose(returns.data(), returns.size(), imfs, n_imfs);
+    
+    // imfs[0]: Microstructure noise
+    // imfs[1-2]: Short-term mean-reversion
+    // imfs[3-4]: Momentum/trend components
+    // imfs[n_imfs-1] + residue: Long-term drift
+    
+    // Feed trend components into your trading strategy...
+}
+```
+
 ## Features
 
 - **Header-only** — single file `eemd_mkl.hpp`
 - **MKL-accelerated** — cubic spline interpolation via MKL Data Fitting
+- **DF_UNIFORM_PARTITION** — O(1) knot lookup instead of O(log K) binary search
+- **Raw pointer hot paths** — no std::vector overhead in inner loops
+- **Fused loops** — single memory pass for mean/SD/update
 - **Parallel** — OpenMP ensemble parallelization with thread-local accumulation
 - **Zero-allocation hot path** — pre-allocated scratch buffers, grow-only memory
 - **Portable SIMD** — compiler-aware `#pragma omp simd` (works with MSVC, ICX, GCC, Clang)
@@ -23,7 +120,7 @@ Fast Ensemble Empirical Mode Decomposition using Intel MKL.
 
 int main() {
     // Initialize (call once at startup)
-    init_14900kf(true);  // Configures threads, DAZ/FTZ, MKL settings
+    eemd_init_low_latency(8, true);  // 8 cores, verbose
     
     // Configure
     eemd::EEMDConfig config;
@@ -92,14 +189,34 @@ make -j$(nproc)
 
 Tested on Intel Core i9-14900KF (8 P-cores, MKL sequential, OpenMP parallel):
 
-| Signal | Ensemble | Time | Throughput |
-|--------|----------|------|------------|
-| 256 | 100 | 7 ms | 3.5 MS/s |
-| 1024 | 100 | 48 ms | 2.1 MS/s |
-| 2048 | 100 | 92 ms | 2.2 MS/s |
-| 8192 | 100 | 420 ms | 1.9 MS/s |
+### EEMD (100 ensemble trials)
 
-Single EMD latency: **~1 ms** for 1024 samples.
+| Signal | Time | Throughput |
+|--------|------|------------|
+| 256 | 1.5 ms | 17 MS/s |
+| 512 | 1.6 ms | 32 MS/s |
+| 1024 | 2.7 ms | 38 MS/s |
+| 2048 | 5.9 ms | 35 MS/s |
+| 4096 | 17 ms | 24 MS/s |
+| 8192 | 40 ms | 20 MS/s |
+
+### Single EMD Latency
+
+| Signal | Latency |
+|--------|---------|
+| 256 | 26 µs |
+| 512 | 43 µs |
+| 1024 | 86 µs |
+| 2048 | 202 µs |
+| 4096 | 464 µs |
+
+### Key Optimizations
+
+| Optimization | Impact |
+|--------------|--------|
+| `DF_UNIFORM_PARTITION` | O(1) knot lookup vs O(log K) binary search |
+| Raw pointer hot paths | No std::vector overhead in inner loops |
+| Fused mean/SD/update | Single memory pass instead of three |
 
 ## API
 
@@ -138,10 +255,16 @@ bool compute_instantaneous_frequency(
 
 | Function | Use Case |
 |----------|----------|
-| `init_14900kf()` | Low-latency (8 threads, infinite blocktime, P-cores only) |
-| `init_14900kf_throughput()` | Batch processing (16 threads with HT) |
+| `eemd_init_low_latency(n_cores)` | Low-latency (infinite blocktime, P-cores only) |
+| `eemd_init_throughput(n_cores)` | Batch processing (with HT, allows sleep) |
 
-Adjust thread counts in the source for your specific CPU.
+```cpp
+// 8 physical cores, low-latency mode
+eemd_init_low_latency(8, true);
+
+// 6 cores with hyperthreading (12 threads)
+eemd_init_throughput(6, true);
+```
 
 ## License
 
