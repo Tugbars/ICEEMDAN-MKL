@@ -1256,8 +1256,11 @@ namespace eemd
             bool stop_decomposition = false;
 
             // Pre-compute volatility scaling factor for scalar mode
-            const double scalar_vol = vol_result.is_scalar ? config_.noise_std * vol_result.scalar : 0.0;
+            const double base_scalar_vol = vol_result.is_scalar ? config_.noise_std * vol_result.scalar : 0.0;
             const bool use_scalar_vol = vol_result.is_scalar;
+
+            // Noise decay multiplier (decreases each IMF)
+            double decay_factor = 1.0;
 
             // =================================================================
             // PARALLEL REGION (Lock-Free Reduction)
@@ -1332,20 +1335,22 @@ namespace eemd
                             if (use_scalar_vol)
                             {
                                 // Global mode: scalar multiplier (no array read)
+                                const double scaled_vol = decay_factor * base_scalar_vol;
                                 EEMD_OMP_SIMD
                                 for (int32_t j = 0; j < n; ++j)
                                 {
-                                    p[j] = r[j] + scalar_vol * nz[j];
+                                    p[j] = r[j] + scaled_vol * nz[j];
                                 }
                             }
                             else
                             {
                                 // SMA/EMA mode: per-sample volatility
                                 const double *__restrict lv = local_vol_array.data;
+                                const double scaled_noise_std = decay_factor * config_.noise_std;
                                 EEMD_OMP_SIMD
                                 for (int32_t j = 0; j < n; ++j)
                                 {
-                                    p[j] = r[j] + config_.noise_std * lv[j] * nz[j];
+                                    p[j] = r[j] + scaled_noise_std * lv[j] * nz[j];
                                 }
                             }
                         }
@@ -1374,20 +1379,22 @@ namespace eemd
                             if (use_scalar_vol)
                             {
                                 // Global mode: scalar multiplier (no array read)
+                                const double scaled_vol = decay_factor * base_scalar_vol;
                                 EEMD_OMP_SIMD
                                 for (int32_t j = 0; j < n; ++j)
                                 {
-                                    p[j] = r[j] - scalar_vol * nz[j]; // NEGATED
+                                    p[j] = r[j] - scaled_vol * nz[j]; // NEGATED
                                 }
                             }
                             else
                             {
                                 // SMA/EMA mode: per-sample volatility
                                 const double *__restrict lv = local_vol_array.data;
+                                const double scaled_noise_std = decay_factor * config_.noise_std;
                                 EEMD_OMP_SIMD
                                 for (int32_t j = 0; j < n; ++j)
                                 {
-                                    p[j] = r[j] - config_.noise_std * lv[j] * nz[j]; // NEGATED
+                                    p[j] = r[j] - scaled_noise_std * lv[j] * nz[j]; // NEGATED
                                 }
                             }
 
@@ -1460,7 +1467,7 @@ namespace eemd
                             // Update residue
                             std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
 
-                            noise_amplitude *= config_.noise_decay;
+                            decay_factor *= config_.noise_decay;
 
                             // Check stopping criteria
                             if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||

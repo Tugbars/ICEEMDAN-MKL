@@ -143,6 +143,16 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_test.cpp")
     add_iceemdan_executable(iceemdan_test iceemdan_test.cpp)
 endif()
 
+# --- ICEEMDAN Optimized (uses iceemdan_mkl_opt.hpp) ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_opt_bench.cpp")
+    add_iceemdan_executable(iceemdan_opt_bench iceemdan_opt_bench.cpp)
+endif()
+
+# --- ICEEMDAN Finance Benchmark ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_finance_bench.cpp")
+    add_iceemdan_executable(iceemdan_finance_bench iceemdan_finance_bench.cpp)
+endif()
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================
@@ -157,6 +167,7 @@ install(TARGETS eemd_mkl iceemdan_mkl
 install(FILES 
     eemd_mkl.hpp 
     iceemdan_mkl.hpp
+    iceemdan_mkl_opt.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
