@@ -7,7 +7,7 @@ The first public C/C++ implementation of Improved Complete Ensemble Empirical Mo
 
 ## What is ICEEMDAN?
 
-**Empirical Mode Decomposition (EMD)** decomposes nonlinear, non-stationary signals into oscillatory components called Intrinsic Mode Functions (IMFs) — no predefined basis functions, fully data-driven. However, EMD suffers from **mode mixing**: a single IMF may contain wildly different frequencies.
+**Empirical Mode Decomposition (EMD)** decomposes nonlinear, non-stationary signals into oscillatory components called Intrinsic Mode Functions (IMFs): no predefined basis functions, fully data-driven. However, EMD suffers from **mode mixing**: a single IMF may contain wildly different frequencies.
 
 | Method | Year | Key Innovation | Limitation |
 |--------|------|----------------|------------|
@@ -66,7 +66,7 @@ For financial and scientific applications, this means cleaner trend extraction, 
 | **IMF 6-7** | Very Low | Monthly/quarterly cycles. Earnings, macro regimes. |
 | **Residue** | Trend | Underlying drift component. |
 
-Each IMF captures roughly half the frequency of the previous — octave-spaced bands without manual tuning.
+Each IMF captures roughly half the frequency of the previous, octave-spaced bands without manual tuning.
 
 ---
 
@@ -433,7 +433,7 @@ cmake --build build
 ./build/example_finance_csv
 
 # 2. Open Jupyter notebook
-cd notebooks
+cd jupyter
 jupyter notebook iceemdan_visualization.ipynb
 ```
 
