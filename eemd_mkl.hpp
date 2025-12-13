@@ -125,6 +125,23 @@ namespace eemd
 {
 
     // ============================================================================
+    // Spline Method Selection
+    // ============================================================================
+
+    /**
+     * Spline interpolation method for envelope construction
+     * - Cubic: Smooth C2 spline, can overshoot on sharp changes (default)
+     * - Akima: Local C1 spline, resistant to outliers (recommended for finance)
+     * - Linear: Simple linear interpolation (fastest, least accurate)
+     */
+    enum class SplineMethod : uint8_t
+    {
+        Cubic = 0, // DF_PP_CUBIC - smooth but can overshoot
+        Akima = 1, // DF_PP_AKIMA - local, outlier-resistant
+        Linear = 2 // DF_PP_LINEAR - fastest, for very few extrema
+    };
+
+    // ============================================================================
     // Configuration
     // ============================================================================
 
@@ -137,11 +154,14 @@ namespace eemd
         double noise_std = 0.2;
         int32_t boundary_extend = 2;
         uint32_t rng_seed = 42;
-        
+
         // S-number stopping criterion: stop after S consecutive iterations
         // where extrema count is stable. Benchmarks show S=6 gives ~12% speedup.
         // Set to 0 to disable (use only SD criterion).
         int32_t s_number = 6;
+
+        // Spline method for envelope interpolation
+        SplineMethod spline_method = SplineMethod::Cubic;
     };
 
     // ============================================================================
@@ -436,12 +456,46 @@ namespace eemd
         MKLSpline(const MKLSpline &) = delete;
         MKLSpline &operator=(const MKLSpline &) = delete;
 
-        bool construct(const double *x, const double *y, int32_t n)
+        bool construct(const double *x, const double *y, int32_t n,
+                       SplineMethod method = SplineMethod::Cubic)
         {
             cleanup();
 
             if (n < 2)
                 return false;
+
+            // Akima requires minimum 5 points - fall back to cubic if fewer
+            SplineMethod effective_method = method;
+            if (method == SplineMethod::Akima && n < 5)
+            {
+                effective_method = SplineMethod::Cubic;
+            }
+
+            // Convert SplineMethod to MKL constants
+            // dfdEditPPSpline1D signature: (task, s_order, s_type, bc_type, ...)
+            MKL_INT s_order; // Spline order (e.g., DF_PP_CUBIC, DF_PP_AKIMA)
+            MKL_INT s_type;  // Spline type (e.g., DF_PP_NATURAL, DF_PP_AKIMA)
+            MKL_INT bc_type; // Boundary condition type
+
+            switch (effective_method)
+            {
+            case SplineMethod::Akima:
+                s_order = DF_PP_AKIMA;
+                s_type = DF_PP_DEFAULT; // Ignored for Akima per MKL docs
+                bc_type = DF_NO_BC;     // Akima computes locally, no BC needed
+                break;
+            case SplineMethod::Linear:
+                s_order = DF_PP_LINEAR;
+                s_type = DF_PP_DEFAULT;
+                bc_type = DF_NO_BC;
+                break;
+            case SplineMethod::Cubic:
+            default:
+                s_order = DF_PP_CUBIC;
+                s_type = DF_PP_NATURAL;
+                bc_type = DF_BC_FREE_END;
+                break;
+            }
 
             const MKL_INT mkl_n = static_cast<MKL_INT>(n);
             const MKL_INT required = 4 * (mkl_n - 1);
@@ -459,8 +513,8 @@ namespace eemd
 
             task_valid_ = true;
 
-            status = dfdEditPPSpline1D(task_, DF_PP_CUBIC, DF_PP_NATURAL,
-                                       DF_BC_FREE_END, nullptr, DF_NO_IC, nullptr,
+            status = dfdEditPPSpline1D(task_, s_order, s_type,
+                                       bc_type, nullptr, DF_NO_IC, nullptr,
                                        coeffs_.data, DF_NO_HINT);
             if (status != DF_STATUS_OK)
             {
@@ -616,7 +670,7 @@ namespace eemd
                                    config_.boundary_extend, p_ext_x, p_ext_y,
                                    scratch_.n_ext, scratch_.ext_start);
 
-                if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext))
+                if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
                 {
                     return false;
                 }
@@ -630,7 +684,7 @@ namespace eemd
                                    config_.boundary_extend, p_ext_x, p_ext_y,
                                    scratch_.n_ext, scratch_.ext_start);
 
-                if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext))
+                if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
                 {
                     return false;
                 }

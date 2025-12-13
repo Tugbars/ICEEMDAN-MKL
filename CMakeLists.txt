@@ -176,6 +176,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_snumber.cpp")
     add_iceemdan_executable(bench_snumber bench_snumber.cpp)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_simd.cpp")
+    add_iceemdan_executable(bench_simd bench_simd.cpp)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_akima.cpp")
+    add_iceemdan_executable(test_akima test_akima.cpp)
+endif()
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================

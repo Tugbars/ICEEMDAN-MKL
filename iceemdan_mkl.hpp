@@ -65,7 +65,7 @@ namespace eemd
     // ============================================================================
     // Cache-Line Padded Counter (Prevents False Sharing)
     // ============================================================================
-
+    
     /**
      * Padded counter to prevent false sharing between threads.
      * Each counter occupies its own 64-byte cache line.
@@ -73,8 +73,8 @@ namespace eemd
     struct alignas(64) PaddedCounter
     {
         int32_t value;
-        char padding[60]; // Pad to 64 bytes
-
+        char padding[60];  // Pad to 64 bytes
+        
         PaddedCounter() : value(0) {}
         void reset() { value = 0; }
     };
@@ -96,7 +96,7 @@ namespace eemd
         uint32_t rng_seed = 42;
         double monotonic_threshold = 1e-6;
         int32_t min_extrema = 3;
-
+        
         // S-number stopping criterion for sifting: stop after S consecutive
         // iterations where extrema count is stable. Reduces iterations ~10-14%.
         // Benchmarks show S=6-8 gives best speedup with identical quality.
@@ -108,16 +108,20 @@ namespace eemd
         bool use_circular_bank = true;     // Single long decomposition
         int32_t circular_multiplier = 20;  // Long buffer = N × multiplier
         int32_t spline_fast_threshold = 6; // Linear interp if extrema < this
+        
+        // Spline method for envelope interpolation
+        // Akima is recommended for finance (resistant to outliers/gaps)
+        SplineMethod spline_method = SplineMethod::Cubic;
 
         // === Adaptive Ensemble Options ===
         // NOTE: Disabled by default. Benchmarks showed marginal benefit (~4-13%)
         // only with loose tolerance (0.07), and adds code complexity.
         // Keep code for experimentation with very large signals.
-        bool adaptive_ensemble = false;       // Stop early when mean stabilizes
-        int32_t adaptive_min_trials = 30;     // Minimum trials before checking
+        bool adaptive_ensemble = false;      // Stop early when mean stabilizes
+        int32_t adaptive_min_trials = 30;    // Minimum trials before checking
         int32_t adaptive_check_interval = 10; // Check every N trials
-        double adaptive_rel_tol = 0.07;       // 7% relative change threshold
-        int32_t adaptive_min_signal_len = 0;  // Enable for all signal lengths
+        double adaptive_rel_tol = 0.07;      // 7% relative change threshold
+        int32_t adaptive_min_signal_len = 0; // Enable for all signal lengths
 
         // === Mode-Controlled Settings ===
         VolatilityMethod volatility_method = VolatilityMethod::Global;
@@ -151,7 +155,7 @@ namespace eemd
                 track_convergence = false;
                 use_antithetic = true;
                 use_circular_bank = true;
-                adaptive_ensemble = false; // Disabled - marginal benefit
+                adaptive_ensemble = false;  // Disabled - marginal benefit
                 break;
 
             case ProcessingMode::Finance:
@@ -162,7 +166,8 @@ namespace eemd
                 track_convergence = true; // For risk engine
                 use_antithetic = true;
                 use_circular_bank = true;
-                adaptive_ensemble = false; // Disabled - marginal benefit
+                adaptive_ensemble = false;  // Disabled - marginal benefit
+                spline_method = SplineMethod::Akima;  // Outlier-resistant (falls back to Cubic if needed)
                 vol_ema_span = 20;
                 ar_damping = 0.5;
                 ar_max_slope_atr = 2.0;
@@ -749,7 +754,8 @@ namespace eemd
                                    int32_t fast_threshold = 6,
                                    BoundaryMethod boundary_method = BoundaryMethod::Mirror,
                                    int32_t ar_lookback = 5,
-                                   double ar_damping = 0.5, double ar_max_slope_atr = 2.0)
+                                   double ar_damping = 0.5, double ar_max_slope_atr = 2.0,
+                                   SplineMethod spline_method = SplineMethod::Cubic)
             : max_len_(max_len),
               boundary_extend_(boundary_extend),
               fast_threshold_(fast_threshold),
@@ -757,6 +763,7 @@ namespace eemd
               ar_lookback_(ar_lookback),
               ar_damping_(ar_damping),
               ar_max_slope_atr_(ar_max_slope_atr),
+              spline_method_(spline_method),
               max_idx_(max_len / 2 + 2),
               min_idx_(max_len / 2 + 2),
               ext_x_(max_len + 20),
@@ -918,6 +925,9 @@ namespace eemd
             out_count = pos;
         }
 
+        /**
+         * Robust envelope construction: Tries requested method, falls back to Cubic
+         */
         bool compute_envelope(const double *x_knots, const double *y_knots,
                               int32_t n_knots, double *envelope, int32_t n)
         {
@@ -928,14 +938,24 @@ namespace eemd
                 return true;
             }
 
-            // MKL spline path with SORTED evaluation (faster than uniform for dense knots)
-            if (!spline_.construct(x_knots, y_knots, n_knots))
+            // Try primary method (e.g., Akima)
+            if (spline_.construct(x_knots, y_knots, n_knots, spline_method_))
             {
-                return false;
+                if (spline_.evaluate(eval_sites_.data(), envelope, n))
+                    return true;
             }
 
-            // Use sorted evaluation instead of uniform
-            return spline_.evaluate(eval_sites_.data(), envelope, n);
+            // Fallback: If primary method failed (e.g., Akima geometric constraints),
+            // try Cubic as a robust fallback
+            if (spline_method_ != SplineMethod::Cubic)
+            {
+                if (spline_.construct(x_knots, y_knots, n_knots, SplineMethod::Cubic))
+                {
+                    return spline_.evaluate(eval_sites_.data(), envelope, n);
+                }
+            }
+
+            return false;
         }
 
         int32_t max_len_;
@@ -945,6 +965,7 @@ namespace eemd
         int32_t ar_lookback_;
         double ar_damping_;
         double ar_max_slope_atr_;
+        SplineMethod spline_method_;
 
         std::vector<int32_t> max_idx_;
         std::vector<int32_t> min_idx_;
@@ -1245,6 +1266,7 @@ namespace eemd
             emd_config.sift_threshold = config_.sift_threshold;
             emd_config.boundary_extend = config_.boundary_extend;
             emd_config.s_number = config_.s_number;
+            emd_config.spline_method = config_.spline_method;
 
             // Initialize noise bank (circular or standard)
             // Decision made ONCE here, not in hot loop
@@ -1302,11 +1324,11 @@ namespace eemd
 
             // Adaptive ensemble tracking
             AlignedBuffer<double> prev_mean_estimate(n);
-            int32_t adaptive_trials_used = 0; // Track actual trials used (for diagnostics)
-
+            int32_t adaptive_trials_used = 0;  // Track actual trials used (for diagnostics)
+            
             // Heuristic: disable adaptive for short signals (overhead > benefit)
-            const bool effective_adaptive = config_.adaptive_ensemble &&
-                                            (n >= config_.adaptive_min_signal_len);
+            const bool effective_adaptive = config_.adaptive_ensemble && 
+                                           (n >= config_.adaptive_min_signal_len);
 
             // =================================================================
             // PARALLEL REGION (Lock-Free Reduction)
@@ -1321,13 +1343,13 @@ namespace eemd
             }
             // Use cache-line padded counters to prevent false sharing
             std::vector<PaddedCounter> thread_valid_counts(n_threads_max);
-
+            
             // Batch processing state (shared across threads)
             int32_t batch_start = 0;
             int32_t batch_end = 0;
             bool ensemble_converged = false;
             int32_t total_valid_this_imf = 0;
-            int32_t cumulative_valid_trials = 0; // Accumulates across batches
+            int32_t cumulative_valid_trials = 0;  // Accumulates across batches
 
 #pragma omp parallel
             {
@@ -1340,7 +1362,8 @@ namespace eemd
                                               config_.boundary_method,
                                               config_.ar_lookback,
                                               config_.ar_damping,
-                                              config_.ar_max_slope_atr);
+                                              config_.ar_max_slope_atr,
+                                              config_.spline_method);
                 AlignedBuffer<double> tl_perturbed(n);
                 AlignedBuffer<double> tl_local_mean(n);
 
@@ -1365,7 +1388,7 @@ namespace eemd
                         batch_end = 0;
                         ensemble_converged = false;
                         total_valid_this_imf = 0;
-                        cumulative_valid_trials = 0; // Reset for new IMF
+                        cumulative_valid_trials = 0;  // Reset for new IMF
                         mean_accumulator.zero();
                         prev_mean_estimate.zero();
                     }
@@ -1396,7 +1419,7 @@ namespace eemd
                         // Check if we're done
                         if (batch_start >= base_trials)
                             break;
-
+                            
                         // Reset thread accumulators for THIS BATCH only
                         // (cumulative sum is in mean_accumulator)
                         thread_accs[tid].zero();
@@ -1512,7 +1535,7 @@ namespace eemd
                             {
                                 sum += thread_accs[t].data[j];
                             }
-                            mean_accumulator.data[j] += sum; // ACCUMULATE, not overwrite
+                            mean_accumulator.data[j] += sum;  // ACCUMULATE, not overwrite
                         }
 
 // Single thread: update cumulative count and check convergence
@@ -1525,7 +1548,7 @@ namespace eemd
                                 batch_valid_count += thread_valid_counts[t].value;
                             }
                             cumulative_valid_trials += batch_valid_count;
-                            total_valid_this_imf = cumulative_valid_trials; // Update shared var
+                            total_valid_this_imf = cumulative_valid_trials;  // Update shared var
 
                             // Check if we should stop (adaptive ensemble)
                             if (batch_end >= base_trials)
@@ -1533,17 +1556,17 @@ namespace eemd
                                 // Reached max trials
                                 ensemble_converged = true;
                             }
-                            else if (effective_adaptive &&
+                            else if (effective_adaptive && 
                                      batch_end >= config_.adaptive_min_trials &&
                                      cumulative_valid_trials > 0)
                             {
                                 // Compute current mean estimate
                                 const double inv_valid = 1.0 / cumulative_valid_trials;
-
+                                
                                 // Compute relative L2 change from previous estimate
                                 double diff_sq = 0.0;
                                 double curr_sq = 0.0;
-
+                                
                                 for (int32_t j = 0; j < n; ++j)
                                 {
                                     double curr = mean_accumulator.data[j] * inv_valid;
@@ -1552,9 +1575,10 @@ namespace eemd
                                     diff_sq += d * d;
                                     curr_sq += curr * curr;
                                 }
-
-                                double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
-
+                                
+                                double rel_change = (curr_sq > 1e-20) ? 
+                                    std::sqrt(diff_sq / curr_sq) : 0.0;
+                                
                                 if (rel_change < config_.adaptive_rel_tol)
                                 {
                                     ensemble_converged = true;
@@ -1565,7 +1589,7 @@ namespace eemd
                                     // Save current estimate for next comparison
                                     for (int32_t j = 0; j < n; ++j)
                                     {
-                                        prev_mean_estimate.data[j] =
+                                        prev_mean_estimate.data[j] = 
                                             mean_accumulator.data[j] * inv_valid;
                                     }
                                 }
@@ -1618,7 +1642,7 @@ namespace eemd
                         {
                             stop_decomposition = true;
                         }
-
+                        
                         // Reset thread accumulators for next IMF
                         for (int32_t t = 0; t < n_threads; ++t)
                         {
