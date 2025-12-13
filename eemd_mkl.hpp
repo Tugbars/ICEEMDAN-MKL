@@ -137,6 +137,11 @@ namespace eemd
         double noise_std = 0.2;
         int32_t boundary_extend = 2;
         uint32_t rng_seed = 42;
+
+        // S-number stopping criterion: stop after S consecutive iterations
+        // where extrema count is stable. Typical values: 3-5.
+        // Set to 0 to disable (use only SD criterion).
+        int32_t s_number = 4;
     };
 
     // ============================================================================
@@ -571,6 +576,10 @@ namespace eemd
             double *p_ext_x = scratch_.ext_x.data();
             double *p_ext_y = scratch_.ext_y.data();
 
+            // S-number tracking: count consecutive iterations with stable extrema
+            int32_t prev_n_extrema = -1;
+            int32_t s_count = 0;
+
             for (int32_t iter = 0; iter < config_.max_sift_iters; ++iter)
             {
                 // Find extrema (raw pointer output)
@@ -580,6 +589,26 @@ namespace eemd
                 if (scratch_.n_max < 2 || scratch_.n_min < 2)
                 {
                     return false;
+                }
+
+                // S-number criterion: track consecutive stable extrema counts
+                const int32_t n_extrema = scratch_.n_max + scratch_.n_min;
+                if (config_.s_number > 0)
+                {
+                    if (n_extrema == prev_n_extrema)
+                    {
+                        ++s_count;
+                        if (s_count >= config_.s_number)
+                        {
+                            // Converged by S-number criterion
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        s_count = 0;
+                        prev_n_extrema = n_extrema;
+                    }
                 }
 
                 // Upper envelope
@@ -639,7 +668,6 @@ namespace eemd
                     break;
 
                 // Early termination: extrema ≈ zero crossings
-                const int32_t n_extrema = scratch_.n_max + scratch_.n_min;
                 const int32_t n_zero = count_zero_crossings(work_.data, n);
 
                 if (std::abs(n_extrema - n_zero) <= 1 && sd < config_.sift_threshold * 10)
@@ -757,7 +785,7 @@ namespace eemd
 
                 Sifter sifter(n, config_);
 
-#pragma omp for schedule(dynamic)
+#pragma omp for schedule(static)
                 for (int32_t trial = 0; trial < config_.ensemble_size; ++trial)
                 {
                     // Generate noise

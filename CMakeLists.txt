@@ -167,6 +167,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_accuracy_test.cpp")
     add_iceemdan_executable(accuracy_test iceemdan_accuracy_test.cpp)
 endif()
 
+# --- Benchmarks ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_adaptive.cpp")
+    add_iceemdan_executable(bench_adaptive bench_adaptive.cpp)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_snumber.cpp")
+    add_iceemdan_executable(bench_snumber bench_snumber.cpp)
+endif()
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================

@@ -80,11 +80,26 @@ namespace eemd
         double monotonic_threshold = 1e-6;
         int32_t min_extrema = 3;
 
+        // S-number stopping criterion for sifting: stop after S consecutive
+        // iterations where extrema count is stable. Reduces iterations ~50%.
+        // Set to 0 to disable (use only SD criterion).
+        int32_t s_number = 4;
+
         // === Optimization Flags ===
         bool use_antithetic = true;        // ±noise pairs (2x variance reduction)
         bool use_circular_bank = true;     // Single long decomposition
         int32_t circular_multiplier = 20;  // Long buffer = N × multiplier
         int32_t spline_fast_threshold = 6; // Linear interp if extrema < this
+
+        // === Adaptive Ensemble Options ===
+        // NOTE: Disabled by default. Benchmarks showed marginal benefit (~4-13%)
+        // only with loose tolerance (0.07), and adds code complexity.
+        // Keep code for experimentation with very large signals.
+        bool adaptive_ensemble = false;       // Stop early when mean stabilizes
+        int32_t adaptive_min_trials = 30;     // Minimum trials before checking
+        int32_t adaptive_check_interval = 10; // Check every N trials
+        double adaptive_rel_tol = 0.07;       // 7% relative change threshold
+        int32_t adaptive_min_signal_len = 0;  // Enable for all signal lengths
 
         // === Mode-Controlled Settings ===
         VolatilityMethod volatility_method = VolatilityMethod::Global;
@@ -118,6 +133,7 @@ namespace eemd
                 track_convergence = false;
                 use_antithetic = true;
                 use_circular_bank = true;
+                adaptive_ensemble = false; // Disabled - marginal benefit
                 break;
 
             case ProcessingMode::Finance:
@@ -128,6 +144,7 @@ namespace eemd
                 track_convergence = true; // For risk engine
                 use_antithetic = true;
                 use_circular_bank = true;
+                adaptive_ensemble = false; // Disabled - marginal benefit
                 vol_ema_span = 20;
                 ar_damping = 0.5;
                 ar_max_slope_atr = 2.0;
@@ -141,6 +158,7 @@ namespace eemd
                 track_convergence = true;
                 use_antithetic = false;    // No variance tricks
                 use_circular_bank = false; // Independent noise
+                adaptive_ensemble = false; // Fixed ensemble for reproducibility
                 break;
             }
         }
@@ -155,6 +173,7 @@ namespace eemd
         double orthogonality_index = 0.0;     // IO metric (lower = better)
         std::vector<int32_t> sift_iterations; // Per-IMF iteration count
         std::vector<bool> convergence_flags;  // True if converged within max_iters
+        std::vector<int32_t> trials_per_imf;  // Actual trials used per IMF (adaptive)
         int32_t nan_count = 0;                // Input NaN/Inf count (sanitized)
         uint32_t rng_seed_used = 0;           // For audit trail reproducibility
         ProcessingMode mode_used = ProcessingMode::Standard;
@@ -1082,7 +1101,7 @@ namespace eemd
 
                 Sifter sifter(n, emd_config);
 
-#pragma omp for schedule(dynamic)
+#pragma omp for schedule(static)
                 for (int32_t i = 0; i < ensemble_size; ++i)
                 {
                     vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
@@ -1207,6 +1226,7 @@ namespace eemd
             emd_config.max_sift_iters = config_.max_sift_iters;
             emd_config.sift_threshold = config_.sift_threshold;
             emd_config.boundary_extend = config_.boundary_extend;
+            emd_config.s_number = config_.s_number;
 
             // Initialize noise bank (circular or standard)
             // Decision made ONCE here, not in hot loop
@@ -1262,6 +1282,14 @@ namespace eemd
             // Noise decay multiplier (decreases each IMF)
             double decay_factor = 1.0;
 
+            // Adaptive ensemble tracking
+            AlignedBuffer<double> prev_mean_estimate(n);
+            int32_t adaptive_trials_used = 0; // Track actual trials used (for diagnostics)
+
+            // Heuristic: disable adaptive for short signals (overhead > benefit)
+            const bool effective_adaptive = config_.adaptive_ensemble &&
+                                            (n >= config_.adaptive_min_signal_len);
+
             // =================================================================
             // PARALLEL REGION (Lock-Free Reduction)
             // =================================================================
@@ -1274,6 +1302,13 @@ namespace eemd
                 acc.resize(n);
             }
             std::vector<int32_t> thread_valid_counts(n_threads_max, 0);
+
+            // Batch processing state (shared across threads)
+            int32_t batch_start = 0;
+            int32_t batch_end = 0;
+            bool ensemble_converged = false;
+            int32_t total_valid_this_imf = 0;
+            int32_t cumulative_valid_trials = 0; // Accumulates across batches
 
 #pragma omp parallel
             {
@@ -1294,11 +1329,6 @@ namespace eemd
                 AlignedBuffer<double> tl_perturbed_neg(n);
                 AlignedBuffer<double> tl_local_mean_neg(n);
 
-                // Manual loop distribution
-                const int32_t chunk_size = (base_trials + n_threads - 1) / n_threads;
-                const int32_t my_start = tid * chunk_size;
-                const int32_t my_end = std::min(my_start + chunk_size, base_trials);
-
                 // =============================================================
                 // IMF EXTRACTION LOOP
                 // =============================================================
@@ -1309,101 +1339,95 @@ namespace eemd
                     if (stop_decomposition)
                         break;
 
-                    // Reset thread-local accumulator
-                    thread_accs[tid].zero();
-                    thread_valid_counts[tid] = 0;
-
-                    // =========================================================
-                    // ENSEMBLE LOOP (with optional antithetic)
-                    // =========================================================
-                    for (int32_t i = my_start; i < my_end; ++i)
+                    // Reset for new IMF (single thread initializes shared state)
+#pragma omp single
                     {
-                        // Get noise IMF slice (hoisted lambda - no branch in loop)
-                        const double *noise_imf = get_noise(i, k);
+                        batch_start = 0;
+                        batch_end = 0;
+                        ensemble_converged = false;
+                        total_valid_this_imf = 0;
+                        cumulative_valid_trials = 0; // Reset for new IMF
+                        mean_accumulator.zero();
+                        prev_mean_estimate.zero();
+                    }
 
-                        // --- POSITIVE BRANCH ---
-                        if (!noise_imf)
-                        {
-                            std::memcpy(tl_perturbed.data, r_current.data, n * sizeof(double));
-                        }
-                        else
-                        {
-                            const double *__restrict r = r_current.data;
-                            const double *__restrict nz = noise_imf;
-                            double *__restrict p = tl_perturbed.data;
+                    // =============================================================
+                    // BATCH PROCESSING LOOP (for adaptive ensemble)
+                    // =============================================================
+                    while (!ensemble_converged)
+                    {
+#pragma omp barrier
 
-                            if (use_scalar_vol)
+                        // Single thread updates batch boundaries
+#pragma omp single
+                        {
+                            batch_start = batch_end;
+                            if (effective_adaptive)
                             {
-                                // Global mode: scalar multiplier (no array read)
-                                const double scaled_vol = decay_factor * base_scalar_vol;
-                                EEMD_OMP_SIMD
-                                for (int32_t j = 0; j < n; ++j)
-                                {
-                                    p[j] = r[j] + scaled_vol * nz[j];
-                                }
+                                batch_end = std::min(batch_start + config_.adaptive_check_interval, base_trials);
                             }
                             else
                             {
-                                // SMA/EMA mode: per-sample volatility
-                                const double *__restrict lv = local_vol_array.data;
-                                const double scaled_noise_std = decay_factor * config_.noise_std;
-                                EEMD_OMP_SIMD
-                                for (int32_t j = 0; j < n; ++j)
-                                {
-                                    p[j] = r[j] + scaled_noise_std * lv[j] * nz[j];
-                                }
+                                batch_end = base_trials; // Process all at once
                             }
                         }
 
-                        if (lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data))
+#pragma omp barrier
+
+                        // Check if we're done
+                        if (batch_start >= base_trials)
+                            break;
+
+                        // Reset thread accumulators for THIS BATCH only
+                        // (cumulative sum is in mean_accumulator)
+                        thread_accs[tid].zero();
+                        thread_valid_counts[tid] = 0;
+
+                        // Process this batch of trials using static scheduling
+#pragma omp for schedule(static)
+                        for (int32_t i = batch_start; i < batch_end; ++i)
                         {
-                            ++thread_valid_counts[tid];
+                            // Get noise IMF slice
+                            const double *noise_imf = get_noise(i, k);
 
-                            double *__restrict acc = thread_accs[tid].data;
-                            const double *__restrict lm = tl_local_mean.data;
-
-                            EEMD_OMP_SIMD
-                            for (int32_t j = 0; j < n; ++j)
+                            // --- POSITIVE BRANCH ---
+                            if (!noise_imf)
                             {
-                                acc[j] += lm[j];
-                            }
-                        }
-
-                        // --- NEGATIVE BRANCH (Antithetic) ---
-                        if (config_.use_antithetic && noise_imf)
-                        {
-                            const double *__restrict r = r_current.data;
-                            const double *__restrict nz = noise_imf;
-                            double *__restrict p = tl_perturbed_neg.data;
-
-                            if (use_scalar_vol)
-                            {
-                                // Global mode: scalar multiplier (no array read)
-                                const double scaled_vol = decay_factor * base_scalar_vol;
-                                EEMD_OMP_SIMD
-                                for (int32_t j = 0; j < n; ++j)
-                                {
-                                    p[j] = r[j] - scaled_vol * nz[j]; // NEGATED
-                                }
+                                std::memcpy(tl_perturbed.data, r_current.data, n * sizeof(double));
                             }
                             else
                             {
-                                // SMA/EMA mode: per-sample volatility
-                                const double *__restrict lv = local_vol_array.data;
-                                const double scaled_noise_std = decay_factor * config_.noise_std;
-                                EEMD_OMP_SIMD
-                                for (int32_t j = 0; j < n; ++j)
+                                const double *__restrict r = r_current.data;
+                                const double *__restrict nz = noise_imf;
+                                double *__restrict p = tl_perturbed.data;
+
+                                if (use_scalar_vol)
                                 {
-                                    p[j] = r[j] - scaled_noise_std * lv[j] * nz[j]; // NEGATED
+                                    const double scaled_vol = decay_factor * base_scalar_vol;
+                                    EEMD_OMP_SIMD
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        p[j] = r[j] + scaled_vol * nz[j];
+                                    }
+                                }
+                                else
+                                {
+                                    const double *__restrict lv = local_vol_array.data;
+                                    const double scaled_noise_std = decay_factor * config_.noise_std;
+                                    EEMD_OMP_SIMD
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        p[j] = r[j] + scaled_noise_std * lv[j] * nz[j];
+                                    }
                                 }
                             }
 
-                            if (lm_computer.compute(tl_perturbed_neg.data, n, tl_local_mean_neg.data))
+                            if (lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data))
                             {
                                 ++thread_valid_counts[tid];
 
                                 double *__restrict acc = thread_accs[tid].data;
-                                const double *__restrict lm = tl_local_mean_neg.data;
+                                const double *__restrict lm = tl_local_mean.data;
 
                                 EEMD_OMP_SIMD
                                 for (int32_t j = 0; j < n; ++j)
@@ -1411,38 +1435,133 @@ namespace eemd
                                     acc[j] += lm[j];
                                 }
                             }
-                        }
-                    }
+
+                            // --- NEGATIVE BRANCH (Antithetic) ---
+                            if (config_.use_antithetic && noise_imf)
+                            {
+                                const double *__restrict r = r_current.data;
+                                const double *__restrict nz = noise_imf;
+                                double *__restrict p = tl_perturbed_neg.data;
+
+                                if (use_scalar_vol)
+                                {
+                                    const double scaled_vol = decay_factor * base_scalar_vol;
+                                    EEMD_OMP_SIMD
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        p[j] = r[j] - scaled_vol * nz[j];
+                                    }
+                                }
+                                else
+                                {
+                                    const double *__restrict lv = local_vol_array.data;
+                                    const double scaled_noise_std = decay_factor * config_.noise_std;
+                                    EEMD_OMP_SIMD
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        p[j] = r[j] - scaled_noise_std * lv[j] * nz[j];
+                                    }
+                                }
+
+                                if (lm_computer.compute(tl_perturbed_neg.data, n, tl_local_mean_neg.data))
+                                {
+                                    ++thread_valid_counts[tid];
+
+                                    double *__restrict acc = thread_accs[tid].data;
+                                    const double *__restrict lm = tl_local_mean_neg.data;
+
+                                    EEMD_OMP_SIMD
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        acc[j] += lm[j];
+                                    }
+                                }
+                            }
+                        } // end omp for
 
 // =========================================================
-// LOCK-FREE REDUCTION (no critical section!)
+// BATCH REDUCTION AND CONVERGENCE CHECK
 // =========================================================
 #pragma omp barrier
 
-// Parallel sum across threads - each thread handles a chunk of N
+// Parallel sum across threads - ADD to cumulative mean_accumulator
 #pragma omp for
-                    for (int32_t j = 0; j < n; ++j)
-                    {
-                        double sum = 0.0;
-                        for (int32_t t = 0; t < n_threads; ++t)
+                        for (int32_t j = 0; j < n; ++j)
                         {
-                            sum += thread_accs[t].data[j];
+                            double sum = 0.0;
+                            for (int32_t t = 0; t < n_threads; ++t)
+                            {
+                                sum += thread_accs[t].data[j];
+                            }
+                            mean_accumulator.data[j] += sum; // ACCUMULATE, not overwrite
                         }
-                        mean_accumulator.data[j] = sum;
-                    }
 
-// Single thread computes total valid count and processes result
+// Single thread: update cumulative count and check convergence
+#pragma omp single
+                        {
+                            // Sum valid counts for THIS BATCH
+                            int32_t batch_valid_count = 0;
+                            for (int32_t t = 0; t < n_threads; ++t)
+                            {
+                                batch_valid_count += thread_valid_counts[t];
+                            }
+                            cumulative_valid_trials += batch_valid_count;
+                            total_valid_this_imf = cumulative_valid_trials; // Update shared var
+
+                            // Check if we should stop (adaptive ensemble)
+                            if (batch_end >= base_trials)
+                            {
+                                // Reached max trials
+                                ensemble_converged = true;
+                            }
+                            else if (effective_adaptive &&
+                                     batch_end >= config_.adaptive_min_trials &&
+                                     cumulative_valid_trials > 0)
+                            {
+                                // Compute current mean estimate
+                                const double inv_valid = 1.0 / cumulative_valid_trials;
+
+                                // Compute relative L2 change from previous estimate
+                                double diff_sq = 0.0;
+                                double curr_sq = 0.0;
+
+                                for (int32_t j = 0; j < n; ++j)
+                                {
+                                    double curr = mean_accumulator.data[j] * inv_valid;
+                                    double prev = prev_mean_estimate.data[j];
+                                    double d = curr - prev;
+                                    diff_sq += d * d;
+                                    curr_sq += curr * curr;
+                                }
+
+                                double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
+
+                                if (rel_change < config_.adaptive_rel_tol)
+                                {
+                                    ensemble_converged = true;
+                                    adaptive_trials_used = batch_end;
+                                }
+                                else
+                                {
+                                    // Save current estimate for next comparison
+                                    for (int32_t j = 0; j < n; ++j)
+                                    {
+                                        prev_mean_estimate.data[j] =
+                                            mean_accumulator.data[j] * inv_valid;
+                                    }
+                                }
+                            }
+                        } // end omp single
+                    } // end while (!ensemble_converged)
+
+// =========================================================
+// FINALIZE IMF (after all batches complete)
+// =========================================================
 #pragma omp single
                     {
-                        int32_t global_valid = 0;
-                        for (int32_t t = 0; t < n_threads; ++t)
+                        if (total_valid_this_imf > 0)
                         {
-                            global_valid += thread_valid_counts[t];
-                        }
-
-                        if (global_valid > 0)
-                        {
-                            const double scale = 1.0 / global_valid;
+                            const double scale = 1.0 / total_valid_this_imf;
                             double *__restrict acc = mean_accumulator.data;
 
                             EEMD_OMP_SIMD
@@ -1480,9 +1599,16 @@ namespace eemd
                         {
                             stop_decomposition = true;
                         }
+
+                        // Reset thread accumulators for next IMF
+                        for (int32_t t = 0; t < n_threads; ++t)
+                        {
+                            thread_accs[t].zero();
+                            thread_valid_counts[t] = 0;
+                        }
                     }
-                }
-            }
+                } // end IMF loop
+            } // end omp parallel
 
             // Copy to output
             imfs.resize(actual_imf_count);
