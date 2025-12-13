@@ -394,8 +394,8 @@ If you use this implementation in your research, please cite:
 @software{iceemdan_mkl,
   author = {Your Name},
   title = {ICEEMDAN-MKL: High-Performance ICEEMDAN Implementation},
-  year = {2024},
-  url = {https://github.com/yourusername/iceemdan-mkl}
+  year = {2025},
+  url = {https://github.com/Tugbars/iceemdan-mkl}
 }
 ```
 
