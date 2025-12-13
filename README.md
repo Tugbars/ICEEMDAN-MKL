@@ -433,7 +433,7 @@ cmake --build build
 ./build/example_finance_csv
 
 # 2. Open Jupyter notebook
-cd notebooks
+cd jupyter
 jupyter notebook iceemdan_visualization.ipynb
 ```
 
