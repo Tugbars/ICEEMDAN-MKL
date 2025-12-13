@@ -20,10 +20,33 @@ Usage:
 
 import ctypes
 import numpy as np
+import os
+import sys
 from pathlib import Path
 from enum import IntEnum
 from typing import Tuple, Optional, Union, Dict
 import platform
+
+# =============================================================================
+# Windows MKL DLL paths (must be set BEFORE loading the library)
+# =============================================================================
+
+if sys.platform == "win32":
+    mkl_paths = [
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.1\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.2\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.3\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.2\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.3\bin",
+        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
+    ]
+    for p in mkl_paths:
+        if os.path.exists(p):
+            os.add_dll_directory(p)
 
 # ============================================================================
 # Enums
@@ -59,44 +82,53 @@ def _load_library() -> ctypes.CDLL:
     # Determine library name based on platform
     system = platform.system()
     if system == "Windows":
-        lib_names = ["iceemdan.dll", "libiceemdan.dll"]
+        lib_names = ["iceemdan.dll", "libiceemdan.dll", "iceemdan_shared.dll"]
     elif system == "Darwin":
         lib_names = ["libiceemdan.dylib", "libiceemdan.so"]
     else:
         lib_names = ["libiceemdan.so"]
     
     # Search paths
+    this_dir = Path(__file__).parent
+    root_dir = this_dir.parent  # Parent of python/ folder
+    
     search_paths = [
-        Path(__file__).parent,                    # Same directory as this file
-        Path(__file__).parent / "lib",            # ./lib/
-        Path(__file__).parent / "build",          # ./build/
-        Path(__file__).parent / "build" / "Release",  # ./build/Release/
+        this_dir,                                 # Same directory as this file
+        this_dir / "lib",                         # ./lib/
+        root_dir / "build" / "Release",           # ../build/Release/
+        root_dir / "build" / "Debug",             # ../build/Debug/
+        root_dir / "build",                       # ../build/
+        root_dir,                                 # ../
         Path.cwd(),                               # Current working directory
-        Path.cwd() / "build",
         Path.cwd() / "build" / "Release",
+        Path.cwd() / "build",
     ]
     
+    errors = []
     for search_path in search_paths:
         for lib_name in lib_names:
             lib_path = search_path / lib_name
             if lib_path.exists():
                 try:
                     return ctypes.CDLL(str(lib_path))
-                except OSError:
+                except OSError as e:
+                    errors.append(f"{lib_path}: {e}")
                     continue
     
     # Try system paths
     for lib_name in lib_names:
         try:
             return ctypes.CDLL(lib_name)
-        except OSError:
+        except OSError as e:
+            errors.append(f"{lib_name} (system): {e}")
             continue
     
-    raise RuntimeError(
-        f"Could not find ICEEMDAN library. "
-        f"Searched for {lib_names} in {[str(p) for p in search_paths]}. "
-        f"Please compile the library first."
-    )
+    error_msg = f"Could not find/load ICEEMDAN library.\n"
+    error_msg += f"Searched for {lib_names} in {[str(p) for p in search_paths]}.\n"
+    if errors:
+        error_msg += "Load errors:\n" + "\n".join(f"  - {e}" for e in errors)
+        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH."
+    raise RuntimeError(error_msg)
 
 # Load library
 _lib = _load_library()
@@ -157,14 +189,14 @@ _lib.iceemdan_get_all_imfs.restype = ctypes.c_int
 _lib.iceemdan_get_orthogonality_index.argtypes = [_HandlePtr]
 _lib.iceemdan_get_orthogonality_index.restype = ctypes.c_double
 
-_lib.iceemdan_get_reconstruction_error.argtypes = [_HandlePtr]
-_lib.iceemdan_get_reconstruction_error.restype = ctypes.c_double
-
-_lib.iceemdan_get_energy_conservation.argtypes = [_HandlePtr]
-_lib.iceemdan_get_energy_conservation.restype = ctypes.c_double
+_lib.iceemdan_get_nan_count.argtypes = [_HandlePtr]
+_lib.iceemdan_get_nan_count.restype = ctypes.c_int
 
 _lib.iceemdan_get_rng_seed_used.argtypes = [_HandlePtr]
 _lib.iceemdan_get_rng_seed_used.restype = ctypes.c_uint
+
+_lib.iceemdan_get_valid.argtypes = [_HandlePtr]
+_lib.iceemdan_get_valid.restype = ctypes.c_int
 
 _lib.iceemdan_get_error.argtypes = [_HandlePtr]
 _lib.iceemdan_get_error.restype = ctypes.c_char_p
@@ -349,9 +381,9 @@ class ICEEMDAN:
         diag : dict, optional
             Diagnostics (if diagnostics=True):
             - orthogonality_index: Mode mixing metric (lower = better)
-            - reconstruction_error: Max |signal - sum(imfs) - residue|
-            - energy_conservation: Energy ratio error
+            - nan_count: Number of NaN/Inf values sanitized
             - rng_seed_used: Actual RNG seed used
+            - valid: True if decomposition succeeded
         
         Examples
         --------
@@ -393,9 +425,9 @@ class ICEEMDAN:
         if diagnostics:
             diag = {
                 'orthogonality_index': _lib.iceemdan_get_orthogonality_index(self._handle),
-                'reconstruction_error': _lib.iceemdan_get_reconstruction_error(self._handle),
-                'energy_conservation': _lib.iceemdan_get_energy_conservation(self._handle),
+                'nan_count': _lib.iceemdan_get_nan_count(self._handle),
                 'rng_seed_used': _lib.iceemdan_get_rng_seed_used(self._handle),
+                'valid': bool(_lib.iceemdan_get_valid(self._handle)),
             }
             return imfs, residue, diag
         
@@ -531,7 +563,7 @@ if __name__ == "__main__":
     print(f"Signal length: {len(signal)}")
     print(f"IMFs extracted: {len(imfs)}")
     print(f"Orthogonality index: {diag['orthogonality_index']:.6f}")
-    print(f"Reconstruction error: {diag['reconstruction_error']:.2e}")
+    print(f"Valid: {diag['valid']}")
     
     # Verify reconstruction
     reconstructed = decomposer.reconstruct(imfs, residue)

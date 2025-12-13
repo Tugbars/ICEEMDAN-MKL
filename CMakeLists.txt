@@ -186,6 +186,32 @@ if(EXISTS "${TEST_DIR}/spline_bench.cpp")
 endif()
 
 # ============================================================================
+# Python Bindings (Shared Library)
+# ============================================================================
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_c.cpp")
+    add_library(iceemdan_shared SHARED iceemdan_c.cpp)
+    target_link_libraries(iceemdan_shared PRIVATE iceemdan_mkl)
+    set_target_properties(iceemdan_shared PROPERTIES
+        OUTPUT_NAME "iceemdan"
+        POSITION_INDEPENDENT_CODE ON
+    )
+    if(USE_IPO)
+        set_target_properties(iceemdan_shared PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
+        )
+    endif()
+    if(WIN32)
+        # Copy DLL to python folder for easy testing
+        add_custom_command(TARGET iceemdan_shared POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:iceemdan_shared>
+            ${CMAKE_CURRENT_SOURCE_DIR}/python/
+        )
+    endif()
+endif()
+
+# ============================================================================
 # Installation (optional)
 # ============================================================================
 
