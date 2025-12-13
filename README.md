@@ -44,8 +44,6 @@ For financial and scientific applications, this means cleaner trend extraction, 
 
 *Benchmarked on Intel Core i9-14900KF, 8 threads*
 
-Here's the complete section:
-
 ---
 
 ## Examples
