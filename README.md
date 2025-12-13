@@ -7,7 +7,7 @@ The first public C/C++ implementation of Improved Complete Ensemble Empirical Mo
 
 ## What is ICEEMDAN?
 
-**Empirical Mode Decomposition (EMD)** decomposes nonlinear, non-stationary signals into oscillatory components called Intrinsic Mode Functions (IMFs) — no predefined basis functions, fully data-driven. However, EMD suffers from **mode mixing**: a single IMF may contain wildly different frequencies.
+**Empirical Mode Decomposition (EMD)** decomposes nonlinear, non-stationary signals into oscillatory components called Intrinsic Mode Functions (IMFs): no predefined basis functions, fully data-driven. However, EMD suffers from **mode mixing**: a single IMF may contain wildly different frequencies.
 
 | Method | Year | Key Innovation | Limitation |
 |--------|------|----------------|------------|
