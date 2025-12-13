@@ -66,7 +66,7 @@ For financial and scientific applications, this means cleaner trend extraction, 
 | **IMF 6-7** | Very Low | Monthly/quarterly cycles. Earnings, macro regimes. |
 | **Residue** | Trend | Underlying drift component. |
 
-Each IMF captures roughly half the frequency of the previous — octave-spaced bands without manual tuning.
+Each IMF captures roughly half the frequency of the previous, octave-spaced bands without manual tuning.
 
 ---
 
