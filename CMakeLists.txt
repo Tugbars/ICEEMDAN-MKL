@@ -153,6 +153,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_finance_bench.cpp")
     add_iceemdan_executable(iceemdan_finance_bench iceemdan_finance_bench.cpp)
 endif()
 
+# --- Examples ---
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example_finance_csv.cpp")
+    add_iceemdan_executable(example_finance_csv example_finance_csv.cpp)
+endif()
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================
