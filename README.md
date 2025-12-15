@@ -462,7 +462,7 @@ If you use this implementation in your research, please cite:
 
 ```bibtex
 @software{iceemdan_mkl,
-  author = {Your Name},
+  author = Tugbars Heptaskin,
   title = {ICEEMDAN-MKL: High-Performance ICEEMDAN Implementation},
   year = {2025},
   url = {https://github.com/Tugbars/iceemdan-mkl}
