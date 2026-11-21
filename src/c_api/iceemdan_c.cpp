@@ -6,6 +6,7 @@
  */
 
 #include "iceemdan.hpp"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -25,6 +26,11 @@ struct ICEEMDANHandle
     std::vector<std::vector<double>> imfs;
     std::vector<double> residue;
     eemd::DecompositionDiagnostics diagnostics;
+    // the last iceemdan_decompose_batch()
+    std::vector<std::vector<std::vector<double>>> batch_imfs;
+    std::vector<std::vector<double>> batch_residues;
+    std::vector<eemd::DecompositionDiagnostics> batch_diagnostics;
+    int batch_max_imfs = 0;
     char error_msg[256];
 };
 
@@ -376,6 +382,115 @@ ICEEMDAN_API int iceemdan_get_all_imfs(ICEEMDANHandle *h, double *out)
     for (size_t k = 0; k < h->imfs.size(); ++k)
     {
         std::memcpy(out + k * n, h->imfs[k].data(), n * sizeof(double));
+    }
+    return 1;
+}
+
+// ============================================================================
+// Batches: many signals of one length (channels, epochs) in one call
+// ============================================================================
+
+/**
+ * Decompose count signals of n samples each, stored one after another
+ * (count x n, row-major): the channels of a recording, or its epochs. Each
+ * result is the same, bit for bit, as iceemdan_decompose() gives for that
+ * signal alone. The signals share one noise bank and are spread over the
+ * library's threads, a whole signal per thread when there are enough of them.
+ * The results stay in the handle until the next batch; read them with
+ * iceemdan_batch_get() (the single-signal getters keep referring to the last
+ * iceemdan_decompose()).
+ * @return the largest number of IMFs of any signal, or 0 on failure (see iceemdan_get_error())
+ */
+ICEEMDAN_API int iceemdan_decompose_batch(ICEEMDANHandle *h, const double *signals, int count, int n)
+{
+    if (!h || !h->decomposer || !signals || count < 1 || n < 4)
+    {
+        if (h)
+            snprintf(h->error_msg, sizeof(h->error_msg), "Invalid input");
+        return 0;
+    }
+    try
+    {
+        h->batch_max_imfs = 0;
+        const bool ok = h->decomposer->decompose_batch(signals, count, n, h->batch_imfs, h->batch_residues,
+                                                       &h->batch_diagnostics);
+        if (!ok)
+        {
+            h->batch_imfs.clear();
+            h->batch_residues.clear();
+            snprintf(h->error_msg, sizeof(h->error_msg),
+                     "Batch decomposition failed (noise bank larger than noise_bank_max_bytes?)");
+            return 0;
+        }
+        int most = 0;
+        for (const auto &m : h->batch_imfs)
+            most = std::max(most, static_cast<int>(m.size()));
+        h->batch_max_imfs = most;
+        return most > 0 ? most : 0;
+    }
+    catch (const std::exception &e)
+    {
+        snprintf(h->error_msg, sizeof(h->error_msg), "%s", e.what());
+        return 0;
+    }
+    catch (...)
+    {
+        snprintf(h->error_msg, sizeof(h->error_msg), "Unknown error");
+        return 0;
+    }
+}
+
+/** Signals in the last batch (0 when there is none). */
+ICEEMDAN_API int iceemdan_batch_count(ICEEMDANHandle *h)
+{
+    return h ? static_cast<int>(h->batch_residues.size()) : 0;
+}
+
+/** IMFs of signal s of the last batch; -1 when s is out of range. */
+ICEEMDAN_API int iceemdan_batch_num_imfs(ICEEMDANHandle *h, int s)
+{
+    if (!h || s < 0 || s >= static_cast<int>(h->batch_imfs.size()))
+        return -1;
+    return static_cast<int>(h->batch_imfs[s].size());
+}
+
+/** Orthogonality index of signal s of the last batch; -1 when s is out of range. */
+ICEEMDAN_API double iceemdan_batch_orthogonality_index(ICEEMDANHandle *h, int s)
+{
+    if (!h || s < 0 || s >= static_cast<int>(h->batch_diagnostics.size()))
+        return -1.0;
+    return h->batch_diagnostics[s].orthogonality_index;
+}
+
+/**
+ * Copy the last batch out. imfs: count x max_imfs x n (max_imfs as
+ * iceemdan_decompose_batch() returned it; a signal with fewer IMFs gets rows
+ * of zeros after its own, so its IMFs and residue still add up to it).
+ * residues: count x n. Either may be NULL.
+ * @return 1, or 0 when there is no batch result
+ */
+ICEEMDAN_API int iceemdan_batch_get(ICEEMDANHandle *h, double *imfs, double *residues)
+{
+    if (!h || h->batch_residues.empty())
+        return 0;
+    const size_t count = h->batch_residues.size();
+    const size_t n = h->batch_residues[0].size();
+    const size_t k_max = static_cast<size_t>(h->batch_max_imfs);
+    for (size_t s = 0; s < count; ++s)
+    {
+        if (imfs)
+        {
+            double *out = imfs + s * k_max * n;
+            for (size_t k = 0; k < k_max; ++k)
+            {
+                if (k < h->batch_imfs[s].size())
+                    std::memcpy(out + k * n, h->batch_imfs[s][k].data(), n * sizeof(double));
+                else
+                    std::memset(out + k * n, 0, n * sizeof(double));
+            }
+        }
+        if (residues)
+            std::memcpy(residues + s * n, h->batch_residues[s].data(), n * sizeof(double));
     }
     return 1;
 }

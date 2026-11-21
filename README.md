@@ -89,7 +89,7 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 - **Reproducible**: for a given seed, the same result bit for bit at any number of threads. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
 - **Three presets**: Standard, Scientific (no shortcuts, an audit trail) and Finance (Akima splines, noise scaled to the local volatility, causal boundaries, NaN and Inf cleaned from the input).
 - **Envelopes**: cubic (not-a-knot), Akima or linear splines; symmetric, mirrored, autoregressive or linear boundary extension.
-- **Made for batches**: the decomposed noise of the ensemble is kept between calls, so further signals of the same length take half the time or less.
+- **Batches and channels**: one call decomposes many signals of one length, such as the channels of an EEG or its epochs, from C++, C and Python. They share one noise bank and run a whole signal per thread, and every result is the same, bit for bit, as decomposing that signal alone. The decomposed noise is also kept between calls, so further signals of the same length take half the time or less.
 - **Speed options** for when exact agreement with the paper matters less than time (among them ± noise pairs, which halve the noise to decompose), and a memory cap for the noise bank.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
 - **Hilbert–Huang analysis**: the instantaneous amplitude, frequency and phase of every IMF, the Hilbert spectrum (energy over time and frequency) and the marginal spectrum, from C++, C and Python; spectral entropy.

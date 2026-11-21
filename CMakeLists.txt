@@ -293,6 +293,8 @@ add_iceemdan_executable(iceemdan_bench benchmarks/iceemdan_bench.cpp)
 add_iceemdan_executable(iceemdan_finance_bench benchmarks/iceemdan_finance_bench.cpp)
 add_iceemdan_executable(bench_adaptive benchmarks/bench_adaptive.cpp)
 add_iceemdan_executable(bench_snumber benchmarks/bench_snumber.cpp)
+# batch_bench: many channels one by one against one decompose_batch() call
+add_iceemdan_executable(batch_bench benchmarks/batch_bench.cpp)
 
 # ============================================================================
 # Intel MKL: optional, for two comparison programs only

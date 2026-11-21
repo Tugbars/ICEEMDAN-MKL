@@ -17,6 +17,15 @@
 #define ICEEMDAN_HPP
 
 #include "eemd.hpp"
+
+// One copy of a function's machine code for every caller: decompose() and
+// decompose_batch() must compute the same bits, and under -ffast-math two
+// inlined copies of the same code may sum in different orders
+#if defined(_MSC_VER) && !defined(__clang__)
+#define EEMD_NOINLINE __declspec(noinline)
+#else
+#define EEMD_NOINLINE __attribute__((noinline))
+#endif
 #include <memory>
 #include <numeric>
 
@@ -1575,9 +1584,226 @@ namespace eemd
             last_diag_.mode_used = mode_;
             last_diag_.local_mean_method_used = config_.local_mean_method;
             last_diag_.valid = false;
-
             if (n < 4 || config_.ensemble_size < 1 || config_.max_imfs < 1)
                 return false;
+
+            BankGuard bank_guard{this}; // frees the bank afterwards unless it is kept
+            BankUse bank;
+            if (!prepare_bank(n, bank))
+                return false;
+            return run(signal, n, bank, imfs, residue, last_diag_);
+        }
+
+        /**
+         * Decomposes count signals of n samples each, stored one after another
+         * (signal s at signals + s * n): the channels of a recording, or its
+         * epochs. Every result is the same, bit for bit, as decompose() gives
+         * for that signal alone with these settings.
+         *
+         * The signals share one noise bank, built once or kept from an earlier
+         * call. With at least as many signals as threads, each signal is
+         * decomposed whole on one thread, which keeps every thread busy even
+         * for short signals; with fewer, they are decomposed one after another,
+         * each on all the threads.
+         *
+         * imfs[s] and residues[s] receive signal s's IMFs and residue; diags,
+         * when given, its diagnostics.
+         * last_diagnostics() afterwards holds the last signal's. False when the
+         * arguments are bad or a signal could not be decomposed (that signal's
+         * diagnostics have valid = false).
+         */
+        bool decompose_batch(
+            const double *signals,
+            int32_t count,
+            int32_t n,
+            std::vector<std::vector<std::vector<double>>> &imfs,
+            std::vector<std::vector<double>> &residues,
+            std::vector<DecompositionDiagnostics> *diags = nullptr)
+        {
+            last_diag_ = DecompositionDiagnostics();
+            imfs.assign(static_cast<size_t>(std::max(count, 0)), {});
+            residues.assign(static_cast<size_t>(std::max(count, 0)), {});
+            if (diags)
+                diags->assign(static_cast<size_t>(std::max(count, 0)), DecompositionDiagnostics());
+            if (!signals || count < 1 || n < 4 || config_.ensemble_size < 1 || config_.max_imfs < 1)
+                return false;
+
+            BankGuard bank_guard{this};
+            BankUse bank;
+            if (!prepare_bank(n, bank))
+                return false;
+
+            std::vector<DecompositionDiagnostics> d(static_cast<size_t>(count));
+            std::vector<char> ok(static_cast<size_t>(count), 0);
+            auto one = [&](int32_t s)
+            {
+                ok[s] = run(signals + static_cast<size_t>(s) * n, n, bank, imfs[s], residues[s], d[s]) ? 1 : 0;
+            };
+            const int32_t team = threads::team_size();
+            if (count >= team && team > 1)
+                threads::for_dynamic(team, count, [&](int32_t s, int) { one(s); }); // a signal per thread
+            else
+                for (int32_t s = 0; s < count; ++s)
+                    one(s); // each on all the threads
+
+            last_diag_ = d.back();
+            if (diags)
+                *diags = std::move(d);
+            for (char v : ok)
+                if (!v)
+                    return false;
+            return true;
+        }
+
+    private:
+        /** What prepare_bank() left for run(): which bank, and whether it was kept from before. */
+        struct BankUse
+        {
+            bool circular = false;
+            bool reused = false;
+        };
+
+        /** Frees the noise bank when the decomposer is not to keep it (config.keep_noise_bank). */
+        struct BankGuard
+        {
+            ICEEMDAN *self;
+            ~BankGuard()
+            {
+                if (!self->config_.keep_noise_bank)
+                    self->release_noise_bank();
+            }
+        };
+
+        /** The sifting settings of the noise bank's EMD. */
+        EEMDConfig bank_sifting() const
+        {
+            EEMDConfig emd_config;
+            emd_config.max_imfs = config_.max_imfs;
+            emd_config.max_sift_iters = config_.max_sift_iters;
+            emd_config.sift_threshold = config_.sift_threshold;
+            emd_config.boundary_extend = config_.boundary_extend;
+            emd_config.s_number = config_.s_number;
+            emd_config.spline_method = config_.spline_method;
+            emd_config.stop_rule = config_.sift_stop_rule;
+            emd_config.rilling = config_.rilling;
+            // Noise modes are synthetic (causality does not apply to them):
+            // use the stable symmetric ends whenever sifting runs long
+            emd_config.symmetric_boundary = (config_.sift_stop_rule == SiftStopRule::Rilling) ||
+                                            (config_.boundary_method == BoundaryMethod::Symmetric);
+            return emd_config;
+        }
+
+        /** Realizations in the bank: one per trial, or per antithetic pair (rounded up). */
+        int32_t base_trials() const
+        {
+            return config_.use_antithetic ? (config_.ensemble_size + 1) / 2 : config_.ensemble_size;
+        }
+
+        /**
+         * The noise bank for signals of length n (independent realizations or
+         * circular): kept from the last call when everything it depends on is
+         * the same, built otherwise. False when even the circular bank would
+         * not fit in noise_bank_max_bytes.
+         */
+        bool prepare_bank(int32_t n, BankUse &use)
+        {
+            const EEMDConfig emd_config = bank_sifting();
+            const int32_t trials = base_trials();
+
+            // A realization of length n has about log2(n) modes, so the bank
+            // never holds more than this many per realization
+            int32_t bank_modes = 2;
+            for (int32_t len = n; len > 1; len >>= 1)
+                ++bank_modes;
+            bank_modes = std::min(bank_modes, config_.max_imfs);
+            const size_t independent_bytes = static_cast<size_t>(trials) *
+                                             static_cast<size_t>(bank_modes) *
+                                             static_cast<size_t>(n) * sizeof(double);
+            const bool use_circular = config_.use_circular_bank ||
+                                      independent_bytes > config_.noise_bank_max_bytes;
+
+            NoiseBankKey key;
+            key.n = n;
+            key.ensemble_size = config_.ensemble_size;
+            key.base_trials = trials;
+            key.seed = config_.rng_seed;
+            key.circular = use_circular;
+            key.circular_multiplier = config_.circular_multiplier;
+            key.max_bytes = config_.noise_bank_max_bytes;
+            key.sifting = emd_config;
+
+            use.circular = use_circular;
+            use.reused = bank_valid_ && key == bank_key_;
+            if (!use.reused)
+            {
+                release_noise_bank();
+                if (use_circular)
+                {
+                    if (!circular_bank_.initialize(n, config_.ensemble_size, bank_modes,
+                                                   emd_config, config_.rng_seed,
+                                                   config_.circular_multiplier,
+                                                   config_.noise_bank_max_bytes))
+                    {
+                        return false; // noise bank would not fit in noise_bank_max_bytes
+                    }
+                }
+                else
+                {
+                    standard_bank_.initialize(n, trials, bank_modes, emd_config, config_.rng_seed);
+                }
+                bank_key_ = key;
+                bank_valid_ = true;
+            }
+            return true;
+        }
+
+        /**
+         * IO = sum over pairs |<IMF_i, IMF_j>| / sum <IMF_i, IMF_i> (lower =
+         * better). Given the 64-byte aligned buffers of run(): a vectorized
+         * sum can depend on where its data starts, so it is taken where that
+         * is always the same.
+         */
+        EEMD_NOINLINE static double orthogonality_index(const AlignedBuffer<double> *imfs, int32_t count, int32_t n)
+        {
+            double cross_sum = 0.0;
+            double auto_sum = 0.0;
+            for (int32_t i = 0; i < count; ++i)
+            {
+                const double *a = imfs[i].data;
+                double norm_i = 0.0;
+                for (int32_t k = 0; k < n; ++k)
+                    norm_i += a[k] * a[k];
+                auto_sum += norm_i;
+                for (int32_t j = i + 1; j < count; ++j)
+                {
+                    const double *b = imfs[j].data;
+                    double inner = 0.0;
+                    for (int32_t k = 0; k < n; ++k)
+                        inner += a[k] * b[k];
+                    cross_sum += std::abs(inner);
+                }
+            }
+            return (auto_sum > 1e-10) ? cross_sum / auto_sum : 0.0;
+        }
+
+        /**
+         * One signal's decomposition on the bank prepare_bank() made: reads
+         * the decomposer and its bank, writes only its arguments, so several
+         * can run at once (decompose_batch()).
+         */
+        EEMD_NOINLINE bool run(
+            const double *signal,
+            int32_t n,
+            const BankUse &bank,
+            std::vector<std::vector<double>> &imfs,
+            std::vector<double> &residue,
+            DecompositionDiagnostics &diag) const
+        {
+            diag = DecompositionDiagnostics();
+            diag.rng_seed_used = config_.rng_seed;
+            diag.mode_used = mode_;
+            diag.local_mean_method_used = config_.local_mean_method;
+            diag.valid = false;
 
             // Input sanitization (NaN/Inf protection)
             AlignedBuffer<double> signal_clean(n);
@@ -1588,7 +1814,7 @@ namespace eemd
             {
                 nan_count = sanitize_signal(signal_clean.data, n);
             }
-            last_diag_.nan_count = nan_count;
+            diag.nan_count = nan_count;
 
             const double *clean_signal = signal_clean.data;
 
@@ -1618,87 +1844,11 @@ namespace eemd
             const bool reference_path = config_.sift_stop_rule == SiftStopRule::Rilling &&
                                         config_.local_mean_method == LocalMeanMethod::Sifted;
 
-            // Build EMD config
-            EEMDConfig emd_config;
-            emd_config.max_imfs = config_.max_imfs;
-            emd_config.max_sift_iters = config_.max_sift_iters;
-            emd_config.sift_threshold = config_.sift_threshold;
-            emd_config.boundary_extend = config_.boundary_extend;
-            emd_config.s_number = config_.s_number;
-            emd_config.spline_method = config_.spline_method;
-            emd_config.stop_rule = config_.sift_stop_rule;
-            emd_config.rilling = config_.rilling;
-            // Noise modes are synthetic (causality does not apply to them):
-            // use the stable symmetric ends whenever sifting runs long
-            emd_config.symmetric_boundary = (config_.sift_stop_rule == SiftStopRule::Rilling) ||
-                                            (config_.boundary_method == BoundaryMethod::Symmetric);
-
-            // Effective ensemble size (halved if using antithetic)
-            // Round UP to avoid silently losing trials with odd ensemble sizes
-            const int32_t base_trials = config_.use_antithetic ? (config_.ensemble_size + 1) / 2 : config_.ensemble_size;
-
-            // Noise bank (independent realizations or circular). One
-            // realization per base trial (antithetic pairs share theirs).
-            // It depends on the key below and on nothing in the signal, so the
-            // bank of the last call is used again when the key is the same.
-            // A realization of length n has about log2(n) modes, so the bank
-            // never holds more than this many per realization
-            int32_t bank_modes = 2;
-            for (int32_t len = n; len > 1; len >>= 1)
-                ++bank_modes;
-            bank_modes = std::min(bank_modes, config_.max_imfs);
-            const size_t independent_bytes = static_cast<size_t>(base_trials) *
-                                             static_cast<size_t>(bank_modes) *
-                                             static_cast<size_t>(n) * sizeof(double);
-            const bool use_circular = config_.use_circular_bank ||
-                                      independent_bytes > config_.noise_bank_max_bytes;
-
-            NoiseBankKey key;
-            key.n = n;
-            key.ensemble_size = config_.ensemble_size;
-            key.base_trials = base_trials;
-            key.seed = config_.rng_seed;
-            key.circular = use_circular;
-            key.circular_multiplier = config_.circular_multiplier;
-            key.max_bytes = config_.noise_bank_max_bytes;
-            key.sifting = emd_config;
-
-            // Frees the bank on every way out when it is not to be kept
-            struct BankGuard
-            {
-                ICEEMDAN *self;
-                ~BankGuard()
-                {
-                    if (!self->config_.keep_noise_bank)
-                        self->release_noise_bank();
-                }
-            } bank_guard{this};
-
-            const bool reuse_bank = bank_valid_ && key == bank_key_;
-            if (!reuse_bank)
-            {
-                release_noise_bank();
-                if (use_circular)
-                {
-                    if (!circular_bank_.initialize(n, config_.ensemble_size, bank_modes,
-                                                   emd_config, config_.rng_seed,
-                                                   config_.circular_multiplier,
-                                                   config_.noise_bank_max_bytes))
-                    {
-                        return false; // noise bank would not fit in noise_bank_max_bytes
-                    }
-                }
-                else
-                {
-                    standard_bank_.initialize(n, base_trials, bank_modes,
-                                              emd_config, config_.rng_seed);
-                }
-                bank_key_ = key;
-                bank_valid_ = true;
-            }
-            last_diag_.noise_bank_reused = reuse_bank;
+            const int32_t base_trials = this->base_trials();
+            const bool use_circular = bank.circular;
+            diag.noise_bank_reused = bank.reused;
             if (use_circular)
-                last_diag_.noise_bank_multiplier = circular_bank_.multiplier();
+                diag.noise_bank_multiplier = circular_bank_.multiplier();
 
             // Capture noise bank accessor as lambda (hoisted out of hot loop)
             const CircularNoiseBank &circular_bank = circular_bank_;
@@ -2053,12 +2203,12 @@ namespace eemd
                         ++actual_imf_count;
 
                         // Diagnostics for this IMF
-                        last_diag_.sift_iterations.push_back(stage_total.max_iterations);
-                        last_diag_.mean_sift_iterations.push_back(
+                        diag.sift_iterations.push_back(stage_total.max_iterations);
+                        diag.mean_sift_iterations.push_back(
                             static_cast<double>(stage_total.iterations) / stage_total.valid);
-                        last_diag_.nonconverged_trials.push_back(stage_total.nonconverged);
-                        last_diag_.convergence_flags.push_back(stage_total.nonconverged == 0);
-                        last_diag_.trials_per_imf.push_back(stage_total.valid);
+                        diag.nonconverged_trials.push_back(stage_total.nonconverged);
+                        diag.convergence_flags.push_back(stage_total.nonconverged == 0);
+                        diag.trials_per_imf.push_back(stage_total.valid);
 
                         // Update residue
                         std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
@@ -2098,10 +2248,12 @@ namespace eemd
             residue.resize(n);
             std::memcpy(residue.data(), r_current.data, n * sizeof(double));
 
-            last_diag_.valid = true;
+            diag.orthogonality_index = orthogonality_index(imf_storage.data(), actual_imf_count, n);
+            diag.valid = true;
             return true;
         }
 
+    public:
         /**
          * Convenience wrapper
          */
@@ -2137,41 +2289,11 @@ namespace eemd
             DecompositionDiagnostics &diag)
         {
             const bool ok = decompose(signal, n, imfs, residue);
-            if (ok)
-            {
-                // Orthogonality index (lower = better)
-                // IO = sum(|<IMF_i, IMF_j>|) / sum(<IMF_i, IMF_i>)
-                double cross_sum = 0.0;
-                double auto_sum = 0.0;
-
-                for (size_t i = 0; i < imfs.size(); ++i)
-                {
-                    double norm_i = 0.0;
-                    for (int32_t k = 0; k < n; ++k)
-                    {
-                        norm_i += imfs[i][k] * imfs[i][k];
-                    }
-                    auto_sum += norm_i;
-
-                    for (size_t j = i + 1; j < imfs.size(); ++j)
-                    {
-                        double inner = 0.0;
-                        for (int32_t k = 0; k < n; ++k)
-                        {
-                            inner += imfs[i][k] * imfs[j][k];
-                        }
-                        cross_sum += std::abs(inner);
-                    }
-                }
-
-                last_diag_.orthogonality_index = (auto_sum > 1e-10) ? cross_sum / auto_sum : 0.0;
-            }
             diag = last_diag_;
             return ok;
         }
 
-        /** Diagnostics of the most recent decompose() (orthogonality index only
-         *  from decompose_with_diagnostics()). */
+        /** Diagnostics of the most recent decompose() or decompose_batch() (its last signal). */
         const DecompositionDiagnostics &last_diagnostics() const { return last_diag_; }
 
         ICEEMDANConfig &config() { return config_; }

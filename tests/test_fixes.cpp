@@ -241,6 +241,96 @@ int main()
     }
 
     // ------------------------------------------------------------------
+    std::printf("ICEEMDAN: decompose_batch, signal by signal as decompose()\n");
+    {
+        // 13 channels of 900 samples: different signals, some noisier (other IMF counts)
+        const int count = 13, len = 900;
+        std::vector<double> channels(static_cast<size_t>(count) * len);
+        for (int s = 0; s < count; ++s)
+        {
+            const std::vector<double> c = test_signal(len, 200 + s);
+            std::mt19937 rng(s);
+            std::normal_distribution<double> g(0.0, 0.3 * (s % 4));
+            for (int j = 0; j < len; ++j)
+                channels[static_cast<size_t>(s) * len + j] = c[j] + g(rng);
+        }
+        auto one_by_one = [&](int threads)
+        {
+            eemd::set_num_threads(threads);
+            eemd::ICEEMDAN d;
+            d.config().ensemble_size = 24;
+            std::vector<Run> out(count);
+            for (int s = 0; s < count; ++s)
+                out[s].ok = d.decompose_with_diagnostics(&channels[static_cast<size_t>(s) * len], len, out[s].imfs,
+                                                         out[s].residue, out[s].diag);
+            return out;
+        };
+        auto batch = [&](int threads, int n_signals, std::vector<eemd::DecompositionDiagnostics> *diags = nullptr)
+        {
+            eemd::set_num_threads(threads);
+            eemd::ICEEMDAN d;
+            d.config().ensemble_size = 24;
+            std::vector<std::vector<std::vector<double>>> imfs;
+            std::vector<std::vector<double>> res;
+            const bool ok = d.decompose_batch(channels.data(), n_signals, len, imfs, res, diags);
+            std::vector<Run> out(n_signals);
+            for (int s = 0; s < n_signals; ++s)
+            {
+                out[s].ok = ok;
+                out[s].imfs = imfs[s];
+                out[s].residue = res[s];
+            }
+            return out;
+        };
+        const std::vector<Run> alone = one_by_one(4);
+        bool counts_differ = false;
+        for (int s = 1; s < count; ++s)
+            counts_differ = counts_differ || alone[s].imfs.size() != alone[0].imfs.size();
+
+        for (int threads : {1, 3, 8})
+        {
+            std::vector<eemd::DecompositionDiagnostics> diags;
+            const std::vector<Run> b = batch(threads, count, &diags);
+            bool same = true, diag_ok = diags.size() == static_cast<size_t>(count);
+            for (int s = 0; s < count; ++s)
+            {
+                same = same && b[s].ok && bitwise_equal(b[s], alone[s]);
+                diag_ok = diag_ok && diags[s].valid && diags[s].sift_iterations.size() == b[s].imfs.size() &&
+                          diags[s].orthogonality_index == alone[s].diag.orthogonality_index;
+            }
+            char label[96];
+            std::snprintf(label, sizeof(label), "13 channels on %d thread%s: each as decompose() alone", threads,
+                          threads == 1 ? "" : "s");
+            check(same, label);
+            if (threads == 3)
+                check(diag_ok, "diagnostics per channel, as decompose_with_diagnostics() gives them");
+        }
+        check(counts_differ, "the channels do not all have the same number of IMFs (the test covers that)");
+
+        // fewer signals than threads: one after another, each on all threads
+        const std::vector<Run> few = batch(8, 3);
+        check(bitwise_equal(few[0], alone[0]) && bitwise_equal(few[2], alone[2]),
+              "3 channels on 8 threads: each as decompose() alone");
+
+        // the bank: built once for the batch, then kept for a single decomposition of that length
+        eemd::set_num_threads(4);
+        eemd::ICEEMDAN d;
+        d.config().ensemble_size = 24;
+        std::vector<std::vector<std::vector<double>>> imfs;
+        std::vector<std::vector<double>> res;
+        std::vector<eemd::DecompositionDiagnostics> diags;
+        d.decompose_batch(channels.data(), count, len, imfs, res, &diags);
+        Run single;
+        single.ok = d.decompose_with_diagnostics(channels.data(), len, single.imfs, single.residue, single.diag);
+        check(!diags[0].noise_bank_reused && single.diag.noise_bank_reused,
+              "the batch builds the noise bank once; a later call of that length keeps it");
+
+        check(!d.decompose_batch(channels.data(), 0, len, imfs, res) && !d.decompose_batch(nullptr, 2, len, imfs, res) &&
+                  !d.decompose_batch(channels.data(), 2, 3, imfs, res),
+              "no signals, no data, or signals of 3 samples: refused");
+    }
+
+    // ------------------------------------------------------------------
     std::printf("EEMD: repeatable at a fixed thread count, stable across counts\n");
     {
         eemd::EEMDConfig cfg;

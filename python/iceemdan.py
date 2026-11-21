@@ -209,6 +209,16 @@ _lib.iceemdan_get_valid.restype = ctypes.c_int
 _lib.iceemdan_get_noise_bank_reused.argtypes = [_HandlePtr]
 _lib.iceemdan_get_noise_bank_reused.restype = ctypes.c_int
 
+# Batches
+_lib.iceemdan_decompose_batch.argtypes = [_HandlePtr, ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_int]
+_lib.iceemdan_decompose_batch.restype = ctypes.c_int
+_lib.iceemdan_batch_num_imfs.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_batch_num_imfs.restype = ctypes.c_int
+_lib.iceemdan_batch_orthogonality_index.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_batch_orthogonality_index.restype = ctypes.c_double
+_lib.iceemdan_batch_get.argtypes = [_HandlePtr, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+_lib.iceemdan_batch_get.restype = ctypes.c_int
+
 for _name, _restype in [('iceemdan_get_imf_sift_iterations', ctypes.c_int),
                         ('iceemdan_get_imf_mean_sift_iterations', ctypes.c_double),
                         ('iceemdan_get_imf_nonconverged_trials', ctypes.c_int),
@@ -252,6 +262,13 @@ _lib.iceemdan_hilbert_spectrum.restype = ctypes.c_int
 # ============================================================================
 # Python Wrapper Class
 # ============================================================================
+
+class BatchDecomposition(NamedTuple):
+    """The decompositions of many signals of one length (see ICEEMDAN.decompose_batch())."""
+    imfs: np.ndarray       # (count, max IMFs, n): a signal with fewer IMFs has rows of zeros after its own
+    residues: np.ndarray   # (count, n)
+    num_imfs: np.ndarray   # (count,): the IMFs of each signal
+
 
 class ICEEMDAN:
     """
@@ -517,6 +534,56 @@ class ICEEMDAN:
         
         return imfs, residue
     
+    def decompose_batch(self, signals) -> BatchDecomposition:
+        """
+        Decompose many signals of one length in one call: the channels of a
+        recording, or its epochs.
+
+        Each result is the same, bit for bit, as decompose() gives for that
+        signal alone. The signals share one noise bank and are spread over
+        the library's threads, a whole signal per thread when there are
+        enough of them, which uses the threads better than decomposing short
+        signals one after another.
+
+        Parameters
+        ----------
+        signals : np.ndarray
+            (count, n): one signal per row. A list of equal-length 1D arrays
+            works as well.
+
+        Returns
+        -------
+        BatchDecomposition
+            imfs (count, max IMFs, n), residues (count, n), num_imfs (count,).
+            A signal with fewer IMFs than the most has rows of zeros after its
+            own, so imfs[s].sum(axis=0) + residues[s] is signal s.
+
+        Examples
+        --------
+        >>> eeg.shape                  # 64 channels, 10 s at 256 Hz
+        (64, 2560)
+        >>> imfs, residues, num_imfs = decomposer.decompose_batch(eeg)
+        >>> imfs.shape
+        (64, 11, 2560)
+        """
+        rows = np.ascontiguousarray(signals, dtype=np.float64)
+        if rows.ndim != 2:
+            raise ValueError("signals must be 2D: (count, n), one signal per row")
+        count, n = rows.shape
+        if count < 1 or n < 4:
+            raise ValueError("need at least one signal of at least 4 samples")
+        most = _lib.iceemdan_decompose_batch(self._handle, rows.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                                             count, n)
+        if most == 0:
+            error = _lib.iceemdan_get_error(self._handle).decode('utf-8')
+            raise RuntimeError(f"Batch decomposition failed: {error}")
+        imfs = np.zeros((count, most, n))
+        residues = np.zeros((count, n))
+        _lib.iceemdan_batch_get(self._handle, imfs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                                residues.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+        num_imfs = np.array([_lib.iceemdan_batch_num_imfs(self._handle, s) for s in range(count)])
+        return BatchDecomposition(imfs, residues, num_imfs)
+
     # ========================================================================
     # Utility Methods
     # ========================================================================
@@ -645,6 +712,23 @@ def decompose(
             setattr(decomposer, key, value)
     
     return decomposer.decompose(signal)
+
+
+def decompose_batch(
+    signals: np.ndarray,
+    mode: ProcessingMode = ProcessingMode.STANDARD,
+    **kwargs
+) -> BatchDecomposition:
+    """
+    Convenience function: many signals of one length in one call (see
+    ICEEMDAN.decompose_batch()). Keyword arguments set configuration options
+    (ensemble_size, noise_std, ...).
+    """
+    decomposer = ICEEMDAN(mode=mode)
+    for key, value in kwargs.items():
+        if hasattr(decomposer, key):
+            setattr(decomposer, key, value)
+    return decomposer.decompose_batch(signals)
 
 
 # ============================================================================
