@@ -305,7 +305,68 @@ namespace eemd
 
     // ============================================================================
     // Peak Finding - Raw Pointer Output (No vector push_back)
+    //
+    // A strict peak (x[i-1] < x[i] > x[i+1]) is the common case and is found
+    // in one pass. Flat extrema - runs of equal samples such as
+    // prices quantized to a tick - have no strict peak, so when the pass sees
+    // two equal neighbours it rescans with plateau handling: a run bounded by
+    // lower (higher) samples on both sides is one maximum (minimum), placed at
+    // the centre of the run. Runs touching either end are not extrema.
     // ============================================================================
+
+    namespace detail
+    {
+        // kMax = true: maxima; false: minima. out_idx may be null (count only).
+        template <bool kMax>
+        inline int32_t scan_extrema(const double *__restrict s, int32_t n, int32_t *__restrict out_idx)
+        {
+            if (n < 3)
+                return 0;
+
+            auto above = [](double a, double b) { return kMax ? (a > b) : (a < b); };
+
+            int32_t count = 0;
+            bool has_tie = false;
+            for (int32_t i = 1; i < n - 1; ++i)
+            {
+                const double c = s[i];
+                has_tie |= (c == s[i + 1]);
+                if (above(c, s[i - 1]) & above(c, s[i + 1]))
+                {
+                    if (out_idx)
+                        out_idx[count] = i;
+                    ++count;
+                }
+            }
+            if (!has_tie)
+                return count;
+
+            // Plateau-aware rescan (same result as above wherever there is no tie)
+            count = 0;
+            int32_t i = 1;
+            while (i < n - 1)
+            {
+                if (above(s[i], s[i - 1]))
+                {
+                    int32_t j = i;
+                    while (j < n - 1 && s[j + 1] == s[i])
+                        ++j; // run [i, j] of equal values
+                    if (j < n - 1 && above(s[i], s[j + 1]))
+                    {
+                        if (out_idx)
+                            out_idx[count] = i + (j - i) / 2;
+                        ++count;
+                    }
+                    i = j + 1;
+                }
+                else
+                {
+                    ++i;
+                }
+            }
+            return count;
+        }
+    } // namespace detail
 
     inline void find_maxima_raw(
         const double *__restrict signal,
@@ -313,21 +374,7 @@ namespace eemd
         int32_t *__restrict out_idx,
         int32_t &out_count)
     {
-        int32_t count = 0;
-
-        if (n >= 3)
-        {
-            for (int32_t i = 1; i < n - 1; ++i)
-            {
-                const bool peak = (signal[i] > signal[i - 1]) & (signal[i] > signal[i + 1]);
-                if (peak)
-                {
-                    out_idx[count++] = i;
-                }
-            }
-        }
-
-        out_count = count;
+        out_count = detail::scan_extrema<true>(signal, n, out_idx);
     }
 
     inline void find_minima_raw(
@@ -336,21 +383,14 @@ namespace eemd
         int32_t *__restrict out_idx,
         int32_t &out_count)
     {
-        int32_t count = 0;
+        out_count = detail::scan_extrema<false>(signal, n, out_idx);
+    }
 
-        if (n >= 3)
-        {
-            for (int32_t i = 1; i < n - 1; ++i)
-            {
-                const bool trough = (signal[i] < signal[i - 1]) & (signal[i] < signal[i + 1]);
-                if (trough)
-                {
-                    out_idx[count++] = i;
-                }
-            }
-        }
-
-        out_count = count;
+    /** Number of local maxima plus minima (plateau-aware, same rule as above). */
+    inline int32_t count_extrema_raw(const double *signal, int32_t n)
+    {
+        return detail::scan_extrema<true>(signal, n, nullptr) +
+               detail::scan_extrema<false>(signal, n, nullptr);
     }
 
     inline int32_t count_zero_crossings(const double *signal, int32_t n)

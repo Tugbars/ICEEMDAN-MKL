@@ -228,20 +228,10 @@ namespace eemd
         return ratio > 0.95;
     }
 
+    /** Local maxima plus minima, plateau-aware (same rule as the sifting). */
     inline int32_t count_extrema(const double *signal, int32_t n)
     {
-        if (n < 3)
-            return 0;
-
-        int32_t count = 0;
-        for (int32_t i = 1; i < n - 1; ++i)
-        {
-            bool is_max = (signal[i] > signal[i - 1]) && (signal[i] > signal[i + 1]);
-            bool is_min = (signal[i] < signal[i - 1]) && (signal[i] < signal[i + 1]);
-            if (is_max || is_min)
-                ++count;
-        }
-        return count;
+        return count_extrema_raw(signal, n);
     }
 
     inline double compute_std(const double *signal, int32_t n)
