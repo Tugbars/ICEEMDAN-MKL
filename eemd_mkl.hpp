@@ -1032,55 +1032,53 @@ namespace eemd
                     }
                 }
 
+                // Knots of the upper envelope in (ext_x, ext_y), of the lower
+                // one in (ext_x2, ext_y2)
+                double *p_ext_x2 = scratch_.ext_x2.data();
+                double *p_ext_y2 = scratch_.ext_y2.data();
+                bool knots_ok = true;
                 if (config_.symmetric_boundary)
                 {
-                    double *p_ext_x2 = scratch_.ext_x2.data();
-                    double *p_ext_y2 = scratch_.ext_y2.data();
-                    const bool ok =
-                        extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
-                                                 work_.data, n, config_.boundary_extend,
-                                                 p_ext_x, p_ext_y, scratch_.n_ext,
-                                                 p_ext_x2, p_ext_y2, scratch_.n_ext2) &&
-                        upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method) &&
-                        upper_spline_.evaluate_uniform(upper_env_.data, n) &&
-                        lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2, config_.spline_method) &&
-                        lower_spline_.evaluate_uniform(lower_env_.data, n);
-                    if (!ok)
-                    {
-                        if (rilling && iter > 0)
-                            break; // keep the mode as it stands (emd.m)
-                        return false;
-                    }
+                    knots_ok = extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
+                                                        work_.data, n, config_.boundary_extend,
+                                                        p_ext_x, p_ext_y, scratch_.n_ext,
+                                                        p_ext_x2, p_ext_y2, scratch_.n_ext2);
                 }
                 else
                 {
-                    // Upper envelope
                     extend_extrema_raw(p_max, scratch_.n_max, work_.data, n,
                                        config_.boundary_extend, p_ext_x, p_ext_y,
                                        scratch_.n_ext, scratch_.ext_start);
-
-                    if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
-                    {
-                        return false;
-                    }
-                    if (!upper_spline_.evaluate_uniform(upper_env_.data, n))
-                    {
-                        return false;
-                    }
-
-                    // Lower envelope (reuse ext buffers)
                     extend_extrema_raw(p_min, scratch_.n_min, work_.data, n,
-                                       config_.boundary_extend, p_ext_x, p_ext_y,
-                                       scratch_.n_ext, scratch_.ext_start);
+                                       config_.boundary_extend, p_ext_x2, p_ext_y2,
+                                       scratch_.n_ext2, scratch_.ext_start);
+                }
 
-                    if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                // The two envelopes share nothing (a spline, a knot set and an
+                // output each). A long series sifted outside a fork, as the
+                // circular noise bank's is, takes them on two threads; inside
+                // a fork team_size() is 1 and they follow one another.
+                bool env_ok[2] = {false, false};
+                if (knots_ok)
+                {
+                    const int env_threads = (n >= envelope_fork_min) ? std::min(2, threads::team_size()) : 1;
+                    threads::for_static(env_threads, 2, [&](int32_t first, int32_t last, int)
                     {
-                        return false;
-                    }
-                    if (!lower_spline_.evaluate_uniform(lower_env_.data, n))
-                    {
-                        return false;
-                    }
+                        for (int32_t e = first; e < last; ++e)
+                        {
+                            env_ok[e] = (e == 0)
+                                            ? upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method) &&
+                                                  upper_spline_.evaluate_uniform(upper_env_.data, n)
+                                            : lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2, config_.spline_method) &&
+                                                  lower_spline_.evaluate_uniform(lower_env_.data, n);
+                        }
+                    });
+                }
+                if (!(env_ok[0] && env_ok[1]))
+                {
+                    if (config_.symmetric_boundary && rilling && iter > 0)
+                        break; // keep the mode as it stands (emd.m)
+                    return false;
                 }
 
                 const double *__restrict upper = upper_env_.data;
@@ -1148,6 +1146,9 @@ namespace eemd
         }
 
     private:
+        // Shortest series whose two envelopes are worth a fork
+        static constexpr int32_t envelope_fork_min = 16384;
+
         const EEMDConfig &config_;
         int32_t max_len_;
 
