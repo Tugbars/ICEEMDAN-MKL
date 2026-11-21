@@ -32,7 +32,7 @@ For financial and scientific applications, this means cleaner trend extraction, 
 - **VectorFFT** — FFTs (Hilbert transform, instantaneous frequency, spectral entropy) via [VectorFFT](https://github.com/Tugbars/VectorFFT)
 - **Reproducible** — for a given seed, identical results at any number of threads
 - **Multiple Spline Methods** — Cubic (smooth), Akima (outlier-resistant), Linear (fast)
-- **OpenMP Parallelization** — Scales across CPU cores with lock-free reduction
+- **Multithreaded, no OpenMP** — the ensemble runs on the library's own thread pool (standard C++ threads): no OpenMP runtime to install or ship
 - **Multiple Processing Modes** — Standard (audio/seismic), Finance (trading), Scientific (reproducible research)
 - **Header-Only** — headers only; the FFTs link VectorFFT's ready-built library (CMake downloads and links it)
 - **Cross-Platform** — Windows and Linux on x86-64 (GCC, Clang, ICX, MSVC)
@@ -55,7 +55,8 @@ reference code. **Results differ from 1.0**, and the default is slower (see [Per
 The 1.0 behaviour is still available: see [Speed options](#speed-options). Also fixed in 1.1:
 compilation with GCC/Clang, NaN/Inf sanitizing under `-ffast-math`, the Hilbert transform for
 odd lengths, flat extrema (tick-quantized prices), per-IMF convergence diagnostics, a memory cap
-for the noise bank, and loading the Python binding on Linux.
+for the noise bank, and loading the Python binding on Linux. The library no longer needs OpenMP:
+it runs its own threads (see [Threads](#threads)), with the same results.
 
 ---
 
@@ -174,8 +175,8 @@ loads one of the other two, by what the CPU runs.
 
 MKL is taken from `-DMKL_DIR=<folder of MKLConfig.cmake>` when you pass it, else from `MKLROOT`
 (oneAPI's `setvars` sets it), else from oneAPI's standard install folder, else from CMake's own
-search. With MinGW GCC on Windows the build links MKL's single dynamic library (`mkl_rt`); the
-compiler must come with its OpenMP runtime (libgomp).
+search. The build links MKL's sequential layer (with MinGW GCC on Windows, MKL's single dynamic
+library `mkl_rt`), so no OpenMP runtime is needed, neither the compiler's nor Intel's.
 
 ### Basic Usage
 
@@ -402,10 +403,33 @@ To reproduce: [`validation/README.md`](validation/README.md).
 ### Reproducibility
 
 For a given `rng_seed` and configuration, `ICEEMDAN::decompose()` returns bit-identical IMFs at
-any number of OpenMP threads (tested at 1–4 threads in every mode): each realization's noise
+any number of threads (tested at 1–4 threads in every mode): each realization's noise
 comes from its own Philox4x32-10 stream keyed by (seed, trial), and trials are summed in fixed
 blocks in trial order. `EEMD::decompose()` is bit-identical between runs at a fixed thread
 count; across thread counts it differs only by summation rounding.
+
+### Threads
+
+The ensemble runs on the library's own thread pool ([`eemd_threads.hpp`](eemd_threads.hpp)),
+built on standard C++ threads. There is no OpenMP, and `OMP_NUM_THREADS` has no effect.
+
+```cpp
+eemd::set_num_threads(8);   // threads per decomposition, for the whole process
+eemd::set_num_threads(0);   // every logical processor (the default)
+int n = eemd::get_num_threads();
+```
+
+The environment variable `EEMD_NUM_THREADS` sets the count at start-up. From C:
+`iceemdan_set_num_threads(n)`; from Python: `iceemdan.set_num_threads(n)`. The results do not
+depend on the count (see [Reproducibility](#reproducibility)).
+
+The worker threads start with the first decomposition, sleep between decompositions (they use
+no processor while idle) and last until the process ends. A program that unloads the library
+while it keeps running calls `eemd::shutdown_threads()` first (`iceemdan_shutdown_threads()`
+from C).
+
+MKL is called from each of these threads and needs none of its own: link its sequential layer,
+as the CMake build does.
 
 ### Diagnostics
 

@@ -6,10 +6,14 @@
  *     kept for the life of the process (or until shutdown_threads()).
  *   - The calling thread is slot 0 and runs its share inline; workers are
  *     slots 1, 2, ...
- *   - A worker that took part in the last fork spins for the block time
- *     (1 ms by default), so the forks that follow one another inside a
- *     decomposition find it awake, then sleeps until the next fork. A worker
- *     the last fork did not use sleeps at once, and no fork waits for it.
+ *   - A fork wakes the workers of its team and no others, and waits for
+ *     those alone.
+ *   - A worker sleeps as soon as its share of a fork is done (block time 0,
+ *     the default): it uses no processor between forks, and the system
+ *     places it on a free core when it wakes. With a block time it spins
+ *     that long first, which answers the next fork sooner but keeps a
+ *     processor busy; on a machine whose every hyperthread is in use that
+ *     was measured slower, not faster.
  *   - One fork-join at a time: two application threads that decompose at
  *     once take turns on the workers.
  *   - A body that forks again runs its slots one after another on its own
@@ -32,6 +36,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -109,17 +114,18 @@ namespace eemd
                         return;
                     }
 
-                    bool wake = false;
                     {
                         std::lock_guard<std::mutex> lock(m_);
                         fn_ = fn;
                         ctx_ = ctx;
                         pending_.store(team - 1, std::memory_order_relaxed);
                         signal_.store(next_signal(team), std::memory_order_release);
-                        wake = sleepers_ > 0;
+                        for (int i = 0; i < team - 1; ++i)
+                        {
+                            if (workers_[i]->sleeping)
+                                workers_[i]->wake.notify_one();
+                        }
                     }
-                    if (wake)
-                        cv_work_.notify_all();
 
                     inside_team() = true;
                     try
@@ -139,8 +145,8 @@ namespace eemd
                     std::exception_ptr error;
                     {
                         std::unique_lock<std::mutex> lock(m_);
-                        cv_done_.wait(lock, [this]
-                                      { return pending_.load(std::memory_order_acquire) == 0; });
+                        done_.wait(lock, [this]
+                                   { return pending_.load(std::memory_order_acquire) == 0; });
                         error = error_;
                         error_ = nullptr;
                     }
@@ -160,16 +166,24 @@ namespace eemd
                         std::lock_guard<std::mutex> lock(m_);
                         stop_.store(true, std::memory_order_release);
                         signal_.store(next_signal(0), std::memory_order_release);
+                        for (const std::unique_ptr<Worker> &worker : workers_)
+                            worker->wake.notify_one();
                     }
-                    cv_work_.notify_all();
-                    for (std::thread &worker : workers_)
-                        worker.join();
+                    for (const std::unique_ptr<Worker> &worker : workers_)
+                        worker->thread.join();
                     workers_.clear();
                     stop_.store(false, std::memory_order_release);
                 }
 
             private:
                 using Clock = std::chrono::steady_clock;
+
+                struct Worker
+                {
+                    std::thread thread;
+                    std::condition_variable wake;
+                    bool sleeping = false; // under m_
+                };
 
                 /**
                  * The fork signal: a counter in the high bits, the team size
@@ -245,15 +259,18 @@ namespace eemd
                     {
                         const int slot = static_cast<int>(workers_.size()) + 1;
                         const uint64_t seen = signal_.load(std::memory_order_relaxed);
+                        std::unique_ptr<Worker> worker(new Worker());
+                        Worker *self = worker.get();
                         try
                         {
-                            workers_.emplace_back([this, slot, seen]
-                                                  { worker_main(slot, seen); });
+                            worker->thread = std::thread([this, self, slot, seen]
+                                                         { worker_main(*self, slot, seen); });
                         }
                         catch (const std::system_error &)
                         {
                             break;
                         }
+                        workers_.push_back(std::move(worker));
                     }
                 }
 
@@ -266,9 +283,11 @@ namespace eemd
 
                 /**
                  * Blocks until the signal moves on from `seen`: spins for the
-                 * block time when `spin` is set, then sleeps.
+                 * block time when `spin` is set, then sleeps. A sleeping
+                 * worker is woken by the forks that have it in their team;
+                 * the signal it then reads may be several forks on.
                  */
-                uint64_t wait_signal(uint64_t seen, bool spin)
+                uint64_t wait_signal(Worker &self, uint64_t seen, bool spin)
                 {
                     const double block = block_ms(); // < 0: never sleep
                     if (spin && block != 0.0)
@@ -286,20 +305,20 @@ namespace eemd
                         }
                     }
                     std::unique_lock<std::mutex> lock(m_);
-                    ++sleepers_;
-                    cv_work_.wait(lock, [this, seen]
-                                  { return signal_.load(std::memory_order_acquire) != seen; });
-                    --sleepers_;
+                    self.sleeping = true;
+                    self.wake.wait(lock, [this, seen]
+                                   { return signal_.load(std::memory_order_acquire) != seen; });
+                    self.sleeping = false;
                     return signal_.load(std::memory_order_acquire);
                 }
 
-                void worker_main(int slot, uint64_t seen)
+                void worker_main(Worker &self, int slot, uint64_t seen)
                 {
                     inside_team() = true; // a body that forks again runs its slots serially
                     bool in_team = true;  // false: the last fork did not use this worker
                     for (;;)
                     {
-                        seen = wait_signal(seen, in_team);
+                        seen = wait_signal(self, seen, in_team);
                         if (stop_.load(std::memory_order_acquire))
                             return;
                         in_team = slot < team_of(seen);
@@ -318,27 +337,25 @@ namespace eemd
                         if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
                         {
                             std::lock_guard<std::mutex> lock(m_);
-                            cv_done_.notify_one();
+                            done_.notify_one();
                         }
                     }
                 }
 
                 std::mutex turn_; // one fork-join at a time; also guards workers_
-                std::vector<std::thread> workers_;
+                std::vector<std::unique_ptr<Worker>> workers_;
 
-                std::mutex m_; // the fork's fields, sleepers_, error_
-                std::condition_variable cv_work_;
-                std::condition_variable cv_done_;
+                std::mutex m_; // the fork's fields, the workers' sleeping flags, error_
+                std::condition_variable done_;
                 Fn fn_ = nullptr;
                 void *ctx_ = nullptr;
-                int sleepers_ = 0;
                 std::exception_ptr error_;
 
                 std::atomic<uint64_t> signal_{0}; // moves once per fork
                 std::atomic<int> pending_{0};     // the team's workers that have not finished the fork
                 std::atomic<bool> stop_{false};
                 std::atomic<int> setting_{1};
-                std::atomic<double> block_ms_{1.0};
+                std::atomic<double> block_ms_{0.0};
             };
         } // namespace detail
 
@@ -422,8 +439,8 @@ namespace eemd
     }
 
     /**
-     * Sets it. 0: sleep at once. Negative: the workers a decomposition uses
-     * never sleep (lowest latency, one busy core each).
+     * Sets it. 0 (the default): sleep at once. Negative: the workers a
+     * decomposition uses never sleep (one busy processor each).
      */
     inline void set_thread_block_ms(double ms)
     {

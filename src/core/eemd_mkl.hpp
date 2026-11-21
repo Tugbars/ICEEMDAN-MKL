@@ -118,8 +118,8 @@ inline void eemd_init_low_latency(int n_cores = EEMD_P_CORES, bool verbose = fal
 }
 
 /**
- * Throughput mode: two threads per core (hyperthreading); idle workers sleep
- * after 200 ms.
+ * Throughput mode: two threads per core (hyperthreading); a worker sleeps as
+ * soon as its share is done.
  */
 inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = false)
 {
@@ -128,7 +128,7 @@ inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = fals
     mkl_set_dynamic(0);
     mkl_set_num_threads(1);
     eemd::set_num_threads(n_cores * 2);
-    eemd::set_thread_block_ms(200.0);
+    eemd::set_thread_block_ms(0.0);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);

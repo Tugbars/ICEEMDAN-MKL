@@ -14,3 +14,5 @@ python/*.dll
 python/*.so
 # the VectorFFT release library CMake downloads
 /third_party/
+# clangd index
+/.cache/

@@ -49,6 +49,12 @@ if(NOT MKL_DIR)
     endforeach()
 endif()
 
+# MKL's configuration caches the folder of mkl.h and keeps it when MKL_DIR
+# changes: a build folder first configured against another MKL would go on
+# compiling with that one's headers (and whatever else its include folder
+# holds). Look it up again on every configure.
+unset(MKL_INCLUDE CACHE)
+
 find_package(MKL CONFIG REQUIRED)
 
 message(STATUS "MKL found: ${MKL_ROOT}")
@@ -380,12 +386,19 @@ if(EXISTS "${TEST_DIR}/test_fixes.cpp")
     add_iceemdan_executable(test_fixes ${TEST_DIR}/test_fixes.cpp)
 endif()
 
+if(EXISTS "${TEST_DIR}/test_threads.cpp")
+    add_iceemdan_executable(test_threads ${TEST_DIR}/test_threads.cpp)
+endif()
+
 enable_testing()
 if(TARGET test_fft_hilbert)
     add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
 endif()
 if(TARGET test_fixes)
     add_test(NAME fixes COMMAND test_fixes)
+endif()
+if(TARGET test_threads)
+    add_test(NAME threads COMMAND test_threads)
 endif()
 
 # ============================================================================

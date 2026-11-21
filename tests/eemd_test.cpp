@@ -1,14 +1,8 @@
 /**
  * EEMD Test and Example Usage
  * 
- * Compile:
- *   source /opt/intel/oneapi/setvars.sh  # or equivalent
- *   icpx -O3 -march=native -qopenmp -qmkl eemd_test.cpp -o eemd_test
- * 
- * Or with g++:
- *   g++ -O3 -march=native -fopenmp eemd_test.cpp -o eemd_test \
- *       -I${MKLROOT}/include -L${MKLROOT}/lib/intel64 \
- *       -lmkl_intel_lp64 -lmkl_gnu_thread -lmkl_core -lgomp -lpthread -lm
+ * Build with CMake (the project's CMakeLists.txt): it links MKL's sequential
+ * layer and VectorFFT, and needs no OpenMP.
  */
 
 // Windows compatibility: M_PI is not standard C++

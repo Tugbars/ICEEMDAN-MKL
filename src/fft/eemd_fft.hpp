@@ -115,7 +115,7 @@ namespace eemd
                 c.placement = VFFT_PLACEMENT_OUT;
                 c.order = VFFT_ORDER_NATURAL;
                 c.batch = VFFT_BATCH_CONTIGUOUS;
-                c.nthreads = 1; // called from inside OpenMP regions: no pool of its own
+                c.nthreads = 1; // called from the ensemble's threads: no pool of its own
                 c.flags = VFFT_FLAG_ESTIMATE;
 
                 c.transform = VFFT_R2C;
