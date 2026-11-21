@@ -80,6 +80,9 @@ class LocalMeanMethod(IntEnum):
 # Library Loading
 # ============================================================================
 
+_LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008  # Windows LoadLibraryEx flag
+
+
 def _load_library() -> ctypes.CDLL:
     """Load the ICEEMDAN shared library."""
     
@@ -122,7 +125,15 @@ def _load_library() -> ctypes.CDLL:
                     return ctypes.CDLL(str(lib_path), mode=load_mode)
                 except OSError as e:
                     errors.append(f"{lib_path}: {e}")
-                    continue
+                if system == "Windows":
+                    # Python 3.8+ leaves PATH out when it looks for the DLLs a
+                    # library depends on (MKL, and the compiler's runtime for
+                    # a GCC build). This search takes the library's folder
+                    # first and PATH after it.
+                    try:
+                        return ctypes.CDLL(str(lib_path), winmode=_LOAD_WITH_ALTERED_SEARCH_PATH)
+                    except (OSError, TypeError) as e:
+                        errors.append(f"{lib_path} (PATH searched): {e}")
     
     # Try system paths
     for lib_name in lib_names:
@@ -136,8 +147,9 @@ def _load_library() -> ctypes.CDLL:
     error_msg += f"Searched for {lib_names} in {[str(p) for p in search_paths]}.\n"
     if errors:
         error_msg += "Load errors:\n" + "\n".join(f"  - {e}" for e in errors)
-        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH, and on Windows that"
-        error_msg += "\nlibvfft.dll, libvfft_avx2.dll and libvfft_avx512.dll are beside the ICEEMDAN DLL."
+        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH (for a GCC build on Windows,"
+        error_msg += "\nthe compiler's bin folder as well), and on Windows that libvfft.dll,"
+        error_msg += "\nlibvfft_avx2.dll and libvfft_avx512.dll are beside the ICEEMDAN DLL."
     raise RuntimeError(error_msg)
 
 # Load library

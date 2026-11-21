@@ -14,8 +14,9 @@
 Usage: python make_figures.py <run dir> <image dir> [machine name]
 
 The run dir holds, from make_signals.py: burst.csv, burst_truth.csv; from figure_tool:
-lib_burst_<seed>.csv and lib_times.csv (the lines "figure_tool time" prints); and, optional,
-from run_reference.m: ref_burst_<seed>.csv and ref_times.csv.
+lib_burst_<seed>.csv, lib_times.csv (the lines "figure_tool time" prints) and, optional,
+lib_times_first.csv (the same with --no-keep); and, optional, from run_reference.m:
+ref_burst_<seed>.csv and ref_times.csv.
 """
 import csv
 import glob
@@ -73,10 +74,21 @@ def burst_error(prefix):
     return [round(float(v), 4) for v in np.mean(errors, axis=0)]
 
 
-lib_ms = {}  # (n, threads) -> best median of the passes
-for row in csv.reader(open(f"{run_dir}/lib_times.csv")):
-    key = (int(row[0]), int(row[1]))
-    lib_ms[key] = min(lib_ms.get(key, float("inf")), float(row[2]))
+def read_times(name):
+    """(n, threads) -> best median of the passes, from the lines "figure_tool time" prints."""
+    times = {}
+    if os.path.exists(f"{run_dir}/{name}"):
+        for row in csv.reader(open(f"{run_dir}/{name}")):
+            key = (int(row[0]), int(row[1]))
+            times[key] = min(times.get(key, float("inf")), float(row[2]))
+    return times
+
+
+# The library keeps the decomposed noise between calls. lib_times.csv is timed that way: what
+# every further signal of a length costs. lib_times_first.csv is timed with --no-keep: what the
+# first signal of a length costs, which is the like-for-like time against the reference code.
+lib_ms = read_times("lib_times.csv")
+first_ms = read_times("lib_times_first.csv")
 
 ref_s = {}  # (signal, n) -> best run
 if os.path.exists(f"{run_dir}/ref_times.csv"):
@@ -86,17 +98,22 @@ if os.path.exists(f"{run_dir}/ref_times.csv"):
 
 lengths = [n for n in (1024, 2048, 4096, 8192) if (n, 1) in lib_ms and (n, 8) in lib_ms]
 have_ref_times = all(("tones", n) in ref_s for n in lengths) and bool(lengths)
+have_first = all((n, t) in first_ms for n in lengths for t in (1, 8)) and bool(lengths)
 numbers = {
     "machine": machine,
     "burst": {
         "library_error": burst_error("lib"),
         "reference_error": burst_error("ref"),
+        "library_first_ms_1_thread": first_ms.get((1000, 1)),
+        "library_first_ms_8_threads": first_ms.get((1000, 8)),
         "library_ms_1_thread": lib_ms.get((1000, 1)),
         "library_ms_8_threads": lib_ms.get((1000, 8)),
         "reference_s": ref_s.get(("burst", 1000)),
     },
     "speed": {
         "n": lengths,
+        "library_first_ms_1_thread": [first_ms[(n, 1)] for n in lengths] if have_first else None,
+        "library_first_ms_8_threads": [first_ms[(n, 8)] for n in lengths] if have_first else None,
         "library_ms_1_thread": [lib_ms[(n, 1)] for n in lengths],
         "library_ms_8_threads": [lib_ms[(n, 8)] for n in lengths],
         "reference_s": [ref_s[("tones", n)] for n in lengths] if have_ref_times else None,
@@ -145,8 +162,10 @@ def decomposition(mode):
     if b["reference_error"]:
         columns.append(("Authors' reference code", subtitle(b["reference_error"], b["reference_s"], 0),
                         f"{run_dir}/ref_burst_1.csv", c["ref"]))
+    # one decomposition from nothing: the time of a first signal
+    lib_time = b["library_first_ms_8_threads"] or b["library_ms_8_threads"] or 0
     columns.append(("This library" if columns else "ICEEMDAN of a sinusoid with a short burst",
-                    subtitle(b["library_error"], (b["library_ms_8_threads"] or 0) / 1000, 8),
+                    subtitle(b["library_error"], lib_time / 1000, 8),
                     f"{run_dir}/lib_burst_1.csv", c["lib"]))
 
     ncol = len(columns)
@@ -200,10 +219,13 @@ def speed(mode):
     c = THEMES[mode]
     s = numbers["speed"]
     lengths = s["n"]
+    # like for like: the reference code decomposes its noise on every call, as a first signal here
+    one = s["library_first_ms_1_thread"] or s["library_ms_1_thread"]
+    eight = s["library_first_ms_8_threads"] or s["library_ms_8_threads"]
     series = [
         ("Authors' reference code", s["reference_s"], c["ref"]),
-        ("This library, 1 thread", [v / 1000 for v in s["library_ms_1_thread"]], c["lib_1t"]),
-        ("This library, 8 threads", [v / 1000 for v in s["library_ms_8_threads"]], c["lib_8t"]),
+        ("This library, 1 thread", [v / 1000 for v in one], c["lib_1t"]),
+        ("This library, 8 threads", [v / 1000 for v in eight], c["lib_8t"]),
     ]
 
     fig, ax = plt.subplots(figsize=(8.2, 4.4), facecolor=c["surface"])

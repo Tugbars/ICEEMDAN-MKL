@@ -6,8 +6,10 @@
       0.0425
     ],
     "reference_error": null,
-    "library_ms_1_thread": 114.817,
-    "library_ms_8_threads": 22.052,
+    "library_first_ms_1_thread": 30.34,
+    "library_first_ms_8_threads": 6.342,
+    "library_ms_1_thread": 16.056,
+    "library_ms_8_threads": 3.153,
     "reference_s": null
   },
   "speed": {
@@ -17,17 +19,29 @@
       4096,
       8192
     ],
+    "library_first_ms_1_thread": [
+      36.034,
+      76.775,
+      176.768,
+      467.292
+    ],
+    "library_first_ms_8_threads": [
+      7.154,
+      15.226,
+      36.213,
+      91.773
+    ],
     "library_ms_1_thread": [
-      122.885,
-      260.445,
-      582.343,
-      1529.692
+      20.872,
+      41.711,
+      89.501,
+      211.544
     ],
     "library_ms_8_threads": [
-      24.33,
-      47.511,
-      106.245,
-      274.946
+      4.136,
+      7.483,
+      16.365,
+      44.354
     ],
     "reference_s": null
   }
