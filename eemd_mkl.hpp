@@ -188,6 +188,35 @@ namespace eemd
         return ((u >> 52) & 0x7FFu) != 0x7FFu; // exponent all ones = Inf or NaN
     }
 
+    // ============================================================================
+    // Per-trial random streams
+    //
+    // Trial t of seed s draws its noise from its own Philox4x32-10 stream with
+    // the 64-bit key s + 2^32 t. The noise of a trial therefore depends only on
+    // (s, t): not on the thread that runs it, the number of threads, or the
+    // order trials are scheduled in.
+    // ============================================================================
+
+    inline VSLStreamStatePtr new_trial_stream(uint32_t seed, uint32_t trial)
+    {
+        VSLStreamStatePtr stream = nullptr;
+        const unsigned int params[2] = {seed, trial};
+        if (vslNewStreamEx(&stream, VSL_BRNG_PHILOX4X32X10, 2, params) != VSL_STATUS_OK)
+            return nullptr;
+        return stream;
+    }
+
+    /** Fill out[0..n) with N(mean, sigma) noise of trial `trial` under `seed`. */
+    inline bool trial_gaussian(uint32_t seed, uint32_t trial, int32_t n, double *out,
+                               double mean = 0.0, double sigma = 1.0)
+    {
+        VSLStreamStatePtr stream = new_trial_stream(seed, trial);
+        if (!stream)
+            return false;
+        const int status = vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, out, mean, sigma);
+        vslDeleteStream(&stream);
+        return status == VSL_STATUS_OK;
+    }
 
     // ============================================================================
     // Aligned Buffer - Grow-Only, 64-byte Aligned
@@ -875,23 +904,32 @@ namespace eemd
 
             int32_t global_max_imfs = 0;
 
+            // Per-thread sums, reduced afterwards in thread-id order (not in
+            // the arrival order of a critical section), so a given thread count
+            // always produces the same result bit for bit. Each trial's noise
+            // comes from its own stream (trial_gaussian), so the noise of every
+            // trial is the same at any thread count.
+            const int32_t n_threads_max = omp_get_max_threads();
+            std::vector<std::vector<AlignedBuffer<double>>> thread_sums(n_threads_max);
+            std::vector<int32_t> thread_max_imfs(n_threads_max, 0);
+            int32_t n_threads_used = 1;
+
 #pragma omp parallel
             {
                 const int32_t tid = omp_get_thread_num();
+#pragma omp single
+                n_threads_used = omp_get_num_threads();
 
                 // Thread-local accumulator
-                std::vector<AlignedBuffer<double>> thread_sum(max_imfs);
+                std::vector<AlignedBuffer<double>> &thread_sum = thread_sums[tid];
+                thread_sum.resize(max_imfs);
                 for (auto &buf : thread_sum)
                 {
                     buf.resize(n);
                     buf.zero();
                 }
 
-                int32_t thread_max_imfs = 0;
-
-                // Thread-local RNG
-                VSLStreamStatePtr stream = nullptr;
-                vslNewStream(&stream, VSL_BRNG_MT19937, config_.rng_seed + tid * 1000);
+                int32_t local_max_imfs = 0;
 
                 // Thread-local buffers
                 AlignedBuffer<double> noisy_signal(n);
@@ -907,9 +945,12 @@ namespace eemd
 #pragma omp for schedule(static)
                 for (int32_t trial = 0; trial < config_.ensemble_size; ++trial)
                 {
-                    // Generate noise
-                    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                                  n, noise.data, 0.0, noise_amplitude);
+                    // Generate this trial's noise (depends on seed and trial only)
+                    if (!trial_gaussian(config_.rng_seed, static_cast<uint32_t>(trial),
+                                        n, noise.data, 0.0, noise_amplitude))
+                    {
+                        noise.zero();
+                    }
 
                     // Add noise
                     const double *__restrict sig = signal;
@@ -933,7 +974,7 @@ namespace eemd
                         ++imf_count;
                     }
 
-                    thread_max_imfs = std::max(thread_max_imfs, imf_count);
+                    local_max_imfs = std::max(local_max_imfs, imf_count);
 
                     // Thread-local accumulation
                     for (int32_t k = 0; k < imf_count; ++k)
@@ -949,25 +990,28 @@ namespace eemd
                     }
                 }
 
-                vslDeleteStream(&stream);
+                thread_max_imfs[tid] = local_max_imfs;
 
-// Single critical section per thread
-#pragma omp critical
+                // Ordered reduction: element i sums threads 0, 1, 2, ... in turn
+                for (int32_t k = 0; k < max_imfs; ++k)
                 {
-                    global_max_imfs = std::max(global_max_imfs, thread_max_imfs);
-
-                    for (int32_t k = 0; k < max_imfs; ++k)
+                    double *__restrict gs = global_sum[k].data;
+#pragma omp for schedule(static)
+                    for (int32_t i = 0; i < n; ++i)
                     {
-                        double *__restrict gs = global_sum[k].data;
-                        const double *__restrict ts = thread_sum[k].data;
-
-                        EEMD_OMP_SIMD
-                        for (int32_t i = 0; i < n; ++i)
+                        double acc = 0.0;
+                        for (int32_t t = 0; t < n_threads_used; ++t)
                         {
-                            gs[i] += ts[i];
+                            acc += thread_sums[t][k].data[i];
                         }
+                        gs[i] += acc;
                     }
                 }
+            }
+
+            for (int32_t t = 0; t < n_threads_used; ++t)
+            {
+                global_max_imfs = std::max(global_max_imfs, thread_max_imfs[t]);
             }
 
             n_imfs = global_max_imfs;
