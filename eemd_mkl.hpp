@@ -26,11 +26,17 @@
 #include <omp.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h> // _MM_SET_FLUSH_ZERO_MODE, _MM_SET_DENORMALS_ZERO_MODE
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -38,9 +44,12 @@
 
 // Compiler-aware SIMD pragma
 #if defined(__INTEL_LLVM_COMPILER) || defined(__GNUC__) || defined(__clang__)
-#define EEMD_OMP_SIMD _Pragma("omp simd")
-#define EEMD_OMP_SIMD_REDUCTION(op, var) _Pragma("omp simd reduction(" #op ":" #var ")")
-#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) _Pragma("omp simd reduction(" #op ":" #v1 "," #v2 ")")
+// _Pragma takes ONE string literal (no concatenation), so the clause is
+// stringized as a whole through EEMD_PRAGMA.
+#define EEMD_PRAGMA(x) _Pragma(#x)
+#define EEMD_OMP_SIMD EEMD_PRAGMA(omp simd)
+#define EEMD_OMP_SIMD_REDUCTION(op, var) EEMD_PRAGMA(omp simd reduction(op : var))
+#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) EEMD_PRAGMA(omp simd reduction(op : v1, v2))
 #else
 #define EEMD_OMP_SIMD
 #define EEMD_OMP_SIMD_REDUCTION(op, var)
