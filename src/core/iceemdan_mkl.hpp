@@ -154,6 +154,14 @@ namespace eemd
         // is used instead (multiplier lowered, not below 4); if even that does
         // not fit, decompose() fails instead of exhausting memory.
         size_t noise_bank_max_bytes = size_t(2) << 30; // 2 GiB
+        // The noise bank (the EMD modes of the noise realizations) depends on
+        // the signal length, the seed and the sifting settings, not on the
+        // signal. true: the decomposer keeps it, and the next decomposition of
+        // the same length and settings skips that work, close to half of a
+        // decomposition, with the same result bit for bit. false: it is freed
+        // when decompose() returns. ICEEMDAN::release_noise_bank() frees it at
+        // any time.
+        bool keep_noise_bank = true;
         int32_t spline_fast_threshold = 6; // Linear interp if extrema < this
         
         // Spline method for envelope interpolation
@@ -255,6 +263,7 @@ namespace eemd
         ProcessingMode mode_used = ProcessingMode::Standard;
         LocalMeanMethod local_mean_method_used = LocalMeanMethod::Sifted;
         int32_t noise_bank_multiplier = 0;    // Circular bank length / N (0 = independent realizations)
+        bool noise_bank_reused = false;       // The bank of an earlier call was used (config.keep_noise_bank)
         bool valid = true; // False if decomposition failed
     };
 
@@ -823,16 +832,10 @@ namespace eemd
               ext_y_(max_len + 128),
               ext_x2_(max_len + 128),
               ext_y2_(max_len + 128),
-              eval_sites_(max_len),
               upper_env_(max_len),
               lower_env_(max_len),
               h_(method == LocalMeanMethod::Sifted ? max_len : 0)
         {
-            // Pre-compute evaluation sites [0, 1, 2, ..., max_len-1]
-            for (int32_t i = 0; i < max_len; ++i)
-            {
-                eval_sites_[i] = static_cast<double>(i);
-            }
         }
 
         /**
@@ -863,8 +866,7 @@ namespace eemd
         bool envelope_mean(const double *x, int32_t n, double *out_mean)
         {
             // Find extrema
-            find_maxima_raw(x, n, max_idx_.data(), n_max_);
-            find_minima_raw(x, n, min_idx_.data(), n_min_);
+            find_extrema_raw(x, n, max_idx_.data(), n_max_, min_idx_.data(), n_min_);
 
             if (n_max_ < 2 || n_min_ < 2)
             {
@@ -956,8 +958,7 @@ namespace eemd
 
             for (int32_t iter = 0; iter < sift_.max_iters; ++iter)
             {
-                find_maxima_raw(h, n, max_idx_.data(), n_max_);
-                find_minima_raw(h, n, min_idx_.data(), n_min_);
+                find_extrema_raw(h, n, max_idx_.data(), n_max_, min_idx_.data(), n_min_);
 
                 if (n_max_ < 2 || n_min_ < 2)
                 {
@@ -1178,7 +1179,7 @@ namespace eemd
             // Try primary method (e.g., Akima)
             if (spline_.construct(x_knots, y_knots, n_knots, spline_method_))
             {
-                if (spline_.evaluate(eval_sites_.data(), envelope, n))
+                if (spline_.evaluate_uniform(envelope, n))
                     return true;
             }
 
@@ -1188,7 +1189,7 @@ namespace eemd
             {
                 if (spline_.construct(x_knots, y_knots, n_knots, SplineMethod::Cubic))
                 {
-                    return spline_.evaluate(eval_sites_.data(), envelope, n);
+                    return spline_.evaluate_uniform(envelope, n);
                 }
             }
 
@@ -1212,7 +1213,6 @@ namespace eemd
         std::vector<double> ext_y_;
         std::vector<double> ext_x2_; // second knot set (Symmetric builds both at once)
         std::vector<double> ext_y2_;
-        std::vector<double> eval_sites_;
 
         int32_t n_max_ = 0;
         int32_t n_min_ = 0;
@@ -1221,7 +1221,7 @@ namespace eemd
         AlignedBuffer<double> lower_env_;
         AlignedBuffer<double> h_; // mode being sifted (Sifted mode only)
 
-        MKLSpline spline_;
+        EnvelopeSpline spline_;
     };
 
     // ============================================================================
@@ -1358,6 +1358,14 @@ namespace eemd
         int32_t multiplier() const { return multiplier_; }
         bool is_initialized() const { return initialized_; }
 
+        /** Frees the buffers. */
+        void release()
+        {
+            std::vector<std::vector<double>>().swap(master_imfs_);
+            std::vector<size_t>().swap(offset_table_);
+            initialized_ = false;
+        }
+
     private:
         int32_t n_ = 0;
         int64_t long_n_ = 0;
@@ -1445,6 +1453,14 @@ namespace eemd
         }
 
         bool is_initialized() const { return initialized_; }
+
+        /** Frees the buffers. */
+        void release()
+        {
+            std::vector<std::vector<std::vector<double>>>().swap(noise_imfs_);
+            std::vector<int32_t>().swap(imf_counts_);
+            initialized_ = false;
+        }
 
     private:
         int32_t n_ = 0;
@@ -1570,35 +1586,66 @@ namespace eemd
             // Round UP to avoid silently losing trials with odd ensemble sizes
             const int32_t base_trials = config_.use_antithetic ? (config_.ensemble_size + 1) / 2 : config_.ensemble_size;
 
-            // Initialize noise bank (independent realizations or circular)
-            // Decision made ONCE here, not in hot loop. One realization per
-            // base trial (antithetic pairs share theirs).
-            CircularNoiseBank circular_bank;
-            StandardNoiseBank standard_bank;
+            // Noise bank (independent realizations or circular). One
+            // realization per base trial (antithetic pairs share theirs).
+            // It depends on the key below and on nothing in the signal, so the
+            // bank of the last call is used again when the key is the same.
             const size_t independent_bytes = static_cast<size_t>(base_trials) *
                                              static_cast<size_t>(config_.max_imfs) *
                                              static_cast<size_t>(n) * sizeof(double);
             const bool use_circular = config_.use_circular_bank ||
                                       independent_bytes > config_.noise_bank_max_bytes;
 
-            if (use_circular)
+            NoiseBankKey key;
+            key.n = n;
+            key.ensemble_size = config_.ensemble_size;
+            key.base_trials = base_trials;
+            key.seed = config_.rng_seed;
+            key.circular = use_circular;
+            key.circular_multiplier = config_.circular_multiplier;
+            key.max_bytes = config_.noise_bank_max_bytes;
+            key.sifting = emd_config;
+
+            // Frees the bank on every way out when it is not to be kept
+            struct BankGuard
             {
-                if (!circular_bank.initialize(n, config_.ensemble_size, config_.max_imfs,
-                                              emd_config, config_.rng_seed,
-                                              config_.circular_multiplier,
-                                              config_.noise_bank_max_bytes))
+                ICEEMDAN *self;
+                ~BankGuard()
                 {
-                    return false; // noise bank would not fit in noise_bank_max_bytes
+                    if (!self->config_.keep_noise_bank)
+                        self->release_noise_bank();
                 }
-                last_diag_.noise_bank_multiplier = circular_bank.multiplier();
-            }
-            else
+            } bank_guard{this};
+
+            const bool reuse_bank = bank_valid_ && key == bank_key_;
+            if (!reuse_bank)
             {
-                standard_bank.initialize(n, base_trials, config_.max_imfs,
-                                         emd_config, config_.rng_seed);
+                release_noise_bank();
+                if (use_circular)
+                {
+                    if (!circular_bank_.initialize(n, config_.ensemble_size, config_.max_imfs,
+                                                   emd_config, config_.rng_seed,
+                                                   config_.circular_multiplier,
+                                                   config_.noise_bank_max_bytes))
+                    {
+                        return false; // noise bank would not fit in noise_bank_max_bytes
+                    }
+                }
+                else
+                {
+                    standard_bank_.initialize(n, base_trials, config_.max_imfs,
+                                              emd_config, config_.rng_seed);
+                }
+                bank_key_ = key;
+                bank_valid_ = true;
             }
+            last_diag_.noise_bank_reused = reuse_bank;
+            if (use_circular)
+                last_diag_.noise_bank_multiplier = circular_bank_.multiplier();
 
             // Capture noise bank accessor as lambda (hoisted out of hot loop)
+            const CircularNoiseBank &circular_bank = circular_bank_;
+            const StandardNoiseBank &standard_bank = standard_bank_;
             auto get_noise = [&](int32_t trial, int32_t imf) -> const double *
             {
                 return use_circular ? circular_bank.get_noise_slice(trial, imf) : standard_bank.get_noise_imf(trial, imf);
@@ -2041,10 +2088,55 @@ namespace eemd
         const ICEEMDANConfig &config() const { return config_; }
         ProcessingMode mode() const { return mode_; }
 
+        /**
+         * Frees the noise bank kept from the last decomposition
+         * (config.keep_noise_bank). The next decomposition builds it again.
+         */
+        void release_noise_bank()
+        {
+            circular_bank_.release();
+            standard_bank_.release();
+            bank_valid_ = false;
+        }
+
     private:
+        /** Everything the noise bank depends on. */
+        struct NoiseBankKey
+        {
+            int32_t n = 0;
+            int32_t ensemble_size = 0;
+            int32_t base_trials = 0;
+            uint32_t seed = 0;
+            bool circular = false;
+            int32_t circular_multiplier = 0;
+            size_t max_bytes = 0;
+            EEMDConfig sifting; // the fields decompose() sets, compared below
+
+            bool operator==(const NoiseBankKey &o) const
+            {
+                const EEMDConfig &a = sifting;
+                const EEMDConfig &b = o.sifting;
+                return n == o.n && ensemble_size == o.ensemble_size && base_trials == o.base_trials &&
+                       seed == o.seed && circular == o.circular &&
+                       circular_multiplier == o.circular_multiplier && max_bytes == o.max_bytes &&
+                       a.max_imfs == b.max_imfs && a.max_sift_iters == b.max_sift_iters &&
+                       a.sift_threshold == b.sift_threshold && a.boundary_extend == b.boundary_extend &&
+                       a.s_number == b.s_number && a.spline_method == b.spline_method &&
+                       a.stop_rule == b.stop_rule && a.rilling.theta1 == b.rilling.theta1 &&
+                       a.rilling.theta2 == b.rilling.theta2 && a.rilling.alpha == b.rilling.alpha &&
+                       a.symmetric_boundary == b.symmetric_boundary;
+            }
+        };
+
         ICEEMDANConfig config_;
         ProcessingMode mode_ = ProcessingMode::Standard;
         DecompositionDiagnostics last_diag_;
+
+        // The noise bank of the last decomposition and what it was built for
+        CircularNoiseBank circular_bank_;
+        StandardNoiseBank standard_bank_;
+        NoiseBankKey bank_key_;
+        bool bank_valid_ = false;
     };
 
     // ============================================================================

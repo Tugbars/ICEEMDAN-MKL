@@ -8,6 +8,7 @@
 
 #include "iceemdan_mkl.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -181,6 +182,60 @@ int main()
     }
 
     // ------------------------------------------------------------------
+    std::printf("ICEEMDAN: the noise bank kept between calls\n");
+    {
+        eemd::set_num_threads(2);
+        const std::vector<double> other = test_signal(n, 99); // same length, another signal
+        auto decompose = [&](eemd::ICEEMDAN &d, const std::vector<double> &s)
+        {
+            Run r;
+            r.ok = d.decompose_with_diagnostics(s.data(), static_cast<int>(s.size()), r.imfs, r.residue, r.diag);
+            return r;
+        };
+        auto fresh = [&](const std::vector<double> &s, uint32_t seed)
+        {
+            eemd::ICEEMDAN d;
+            d.config().ensemble_size = 20;
+            d.config().rng_seed = seed;
+            d.config().keep_noise_bank = false;
+            return decompose(d, s);
+        };
+
+        eemd::ICEEMDAN d;
+        d.config().ensemble_size = 20;
+        const Run first = decompose(d, x);
+        const Run second = decompose(d, x);
+        check(first.ok && !first.diag.noise_bank_reused && second.diag.noise_bank_reused &&
+                  bitwise_equal(first, second),
+              "second call: the bank is used again, the result is the same");
+
+        const Run third = decompose(d, other);
+        check(third.diag.noise_bank_reused && bitwise_equal(third, fresh(other, d.config().rng_seed)),
+              "another signal of that length: bank used again, same as a new decomposer");
+
+        d.config().rng_seed = 1234;
+        const Run reseeded = decompose(d, x);
+        check(!reseeded.diag.noise_bank_reused && bitwise_equal(reseeded, fresh(x, 1234)),
+              "another seed: the bank is built again");
+
+        const std::vector<double> shorter(x.begin(), x.begin() + 900);
+        const Run cut = decompose(d, shorter);
+        check(!cut.diag.noise_bank_reused && bitwise_equal(cut, fresh(shorter, 1234)),
+              "another length: the bank is built again");
+
+        d.release_noise_bank();
+        const Run released = decompose(d, shorter);
+        check(!released.diag.noise_bank_reused && bitwise_equal(released, cut),
+              "release_noise_bank(): built again, same result");
+
+        d.config().keep_noise_bank = false;
+        const Run a = decompose(d, shorter); // uses the bank kept so far, then frees it
+        const Run b = decompose(d, shorter);
+        check(a.diag.noise_bank_reused && !b.diag.noise_bank_reused && bitwise_equal(a, cut) && bitwise_equal(b, cut),
+              "keep_noise_bank = false: freed after the call, same result");
+    }
+
+    // ------------------------------------------------------------------
     std::printf("EEMD: repeatable at a fixed thread count, stable across counts\n");
     {
         eemd::EEMDConfig cfg;
@@ -230,6 +285,28 @@ int main()
         std::vector<int32_t> big(400);
         eemd::find_maxima_raw(ticks.data(), 400, big.data(), cnt);
         check(cnt == 8, "tick-quantized sine (8 periods): 8 maxima");
+
+        // find_extrema_raw (both kinds in one pass) against the two separate scans,
+        // on noise, on noise rounded to a grid (flat runs) and at every short length
+        std::mt19937 rng(5);
+        std::normal_distribution<double> g(0.0, 1.0);
+        bool same = true;
+        for (int trial = 0; trial < 400 && same; ++trial)
+        {
+            const int len = trial < 80 ? trial : 80 + static_cast<int>(rng() % 3000);
+            std::vector<double> v(len);
+            for (double &e : v)
+                e = (trial % 3 == 1) ? std::round(2.0 * g(rng)) : g(rng);
+            std::vector<int32_t> mx(len / 2 + 2), mn(len / 2 + 2), mx2(len / 2 + 2), mn2(len / 2 + 2);
+            int32_t n_mx = 0, n_mn = 0, n_mx2 = -1, n_mn2 = -1;
+            eemd::find_maxima_raw(v.data(), len, mx.data(), n_mx);
+            eemd::find_minima_raw(v.data(), len, mn.data(), n_mn);
+            eemd::find_extrema_raw(v.data(), len, mx2.data(), n_mx2, mn2.data(), n_mn2);
+            same = n_mx == n_mx2 && n_mn == n_mn2 &&
+                   std::equal(mx.begin(), mx.begin() + n_mx, mx2.begin()) &&
+                   std::equal(mn.begin(), mn.begin() + n_mn, mn2.begin());
+        }
+        check(same, "find_extrema_raw gives the indices of the two separate scans");
     }
 
     // ------------------------------------------------------------------

@@ -10,8 +10,9 @@
  * - Capacity-aware MKL buffers (grow-only)
  *
  * Dependencies:
- * - MKL Data Fitting (df) for cubic spline interpolation
  * - MKL VSL for Gaussian noise generation
+ * - MKL Data Fitting (df) for the Akima and linear envelopes; the cubic
+ *   envelopes are this library's own (cubic_spline.hpp)
  * - VectorFFT for the FFTs (eemd_fft.hpp)
  *
  * Threads: the ensembles run on this library's own pool (eemd_threads.hpp),
@@ -44,6 +45,7 @@
 #endif
 
 #include "eemd_fft.hpp" // real FFTs (VectorFFT)
+#include "cubic_spline.hpp" // the cubic envelopes
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -468,6 +470,85 @@ namespace eemd
         out_count = detail::scan_extrema<false>(signal, n, out_idx);
     }
 
+    /**
+     * Maxima and minima together, in one pass over the signal (four samples
+     * at a time with AVX2). Gives the same indices as find_maxima_raw and
+     * find_minima_raw, flat extrema included. Each index array must have room
+     * for one entry more than it receives.
+     */
+    inline void find_extrema_raw(
+        const double *__restrict signal,
+        int32_t n,
+        int32_t *__restrict max_idx,
+        int32_t &n_max,
+        int32_t *__restrict min_idx,
+        int32_t &n_min)
+    {
+        n_max = n_min = 0;
+        if (n < 3)
+            return;
+
+        const double *__restrict s = signal;
+        int32_t cmax = 0;
+        int32_t cmin = 0;
+        bool has_tie = false;
+        int32_t i = 1;
+
+#if defined(__AVX2__)
+        // Samples i..i+3 against their left and right neighbours. An index is
+        // stored for every lane and the count moves on only where the lane
+        // holds an extremum, so the loop has no data-dependent branch inside.
+        int tie_mask = 0;
+        for (; i + 4 <= n - 1; i += 4)
+        {
+            const __m256d c = _mm256_loadu_pd(s + i);
+            const __m256d l = _mm256_loadu_pd(s + i - 1);
+            const __m256d r = _mm256_loadu_pd(s + i + 1);
+            const int is_max = _mm256_movemask_pd(
+                _mm256_and_pd(_mm256_cmp_pd(c, l, _CMP_GT_OQ), _mm256_cmp_pd(c, r, _CMP_GT_OQ)));
+            const int is_min = _mm256_movemask_pd(
+                _mm256_and_pd(_mm256_cmp_pd(c, l, _CMP_LT_OQ), _mm256_cmp_pd(c, r, _CMP_LT_OQ)));
+            tie_mask |= _mm256_movemask_pd(_mm256_cmp_pd(c, r, _CMP_EQ_OQ));
+            if (is_max)
+            {
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    max_idx[cmax] = i + lane;
+                    cmax += (is_max >> lane) & 1;
+                }
+            }
+            if (is_min)
+            {
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    min_idx[cmin] = i + lane;
+                    cmin += (is_min >> lane) & 1;
+                }
+            }
+        }
+        has_tie = tie_mask != 0;
+#endif
+        for (; i < n - 1; ++i)
+        {
+            const double c = s[i];
+            has_tie |= (c == s[i + 1]);
+            if ((c > s[i - 1]) & (c > s[i + 1]))
+                max_idx[cmax++] = i;
+            if ((c < s[i - 1]) & (c < s[i + 1]))
+                min_idx[cmin++] = i;
+        }
+
+        if (!has_tie)
+        {
+            n_max = cmax;
+            n_min = cmin;
+            return;
+        }
+        // Equal neighbours somewhere: the plateau-aware scans decide
+        n_max = detail::scan_extrema<true>(s, n, max_idx);
+        n_min = detail::scan_extrema<false>(s, n, min_idx);
+    }
+
     /** Number of local maxima plus minima (plateau-aware, same rule as above). */
     inline int32_t count_extrema_raw(const double *signal, int32_t n)
     {
@@ -800,62 +881,59 @@ namespace eemd
     }
 
     // ============================================================================
-    // MKL Spline - With DF_UNIFORM_PARTITION Optimization
+    // Envelope spline
+    //
+    // Cubic (the default): this library's own spline, cubic_spline.hpp.
+    // Akima and Linear: MKL Data Fitting.
     // ============================================================================
 
-    class MKLSpline
+    class EnvelopeSpline
     {
     public:
-        MKLSpline() = default;
-        ~MKLSpline() { cleanup(); }
+        EnvelopeSpline() = default;
+        ~EnvelopeSpline() { cleanup(); }
 
-        MKLSpline(const MKLSpline &) = delete;
-        MKLSpline &operator=(const MKLSpline &) = delete;
+        EnvelopeSpline(const EnvelopeSpline &) = delete;
+        EnvelopeSpline &operator=(const EnvelopeSpline &) = delete;
 
+        /**
+         * Fits the spline through the knots (x strictly increasing). x and y
+         * must stay as they are until the spline has been evaluated.
+         */
         bool construct(const double *x, const double *y, int32_t n,
                        SplineMethod method = SplineMethod::Cubic)
         {
             cleanup();
+            use_cubic_ = false;
 
             if (n < 2)
                 return false;
 
-            // Akima requires minimum 5 points - fall back to cubic if fewer
-            SplineMethod effective_method = method;
-            if (method == SplineMethod::Akima && n < 5)
+            // Cubic: not-a-knot ends (the default of MATLAB's spline/interp1
+            // and SciPy's CubicSpline, so of the reference ICEEMDAN code);
+            // natural free ends below 4 knots, where not-a-knot is undefined.
+            // Akima needs 5 points and is a cubic spline below that.
+            if (method == SplineMethod::Cubic || (method == SplineMethod::Akima && n < 5))
             {
-                effective_method = SplineMethod::Cubic;
+                use_cubic_ = cubic_.construct(x, y, n);
+                return use_cubic_;
             }
 
-            // Convert SplineMethod to MKL constants
             // dfdEditPPSpline1D signature: (task, s_order, s_type, bc_type, ...)
-            MKL_INT s_order; // Spline order (e.g., DF_PP_CUBIC, DF_PP_AKIMA)
-            MKL_INT s_type;  // Spline type (e.g., DF_PP_NATURAL, DF_PP_AKIMA)
+            MKL_INT s_order; // Spline order (DF_PP_AKIMA, DF_PP_LINEAR)
+            MKL_INT s_type;  // Spline type
             MKL_INT bc_type; // Boundary condition type
-
-            switch (effective_method)
+            if (method == SplineMethod::Akima)
             {
-            case SplineMethod::Akima:
                 s_order = DF_PP_AKIMA;
                 s_type = DF_PP_DEFAULT; // Ignored for Akima per MKL docs
                 bc_type = DF_NO_BC;     // Akima computes locally, no BC needed
-                break;
-            case SplineMethod::Linear:
+            }
+            else
+            {
                 s_order = DF_PP_LINEAR;
                 s_type = DF_PP_DEFAULT;
                 bc_type = DF_NO_BC;
-                break;
-            case SplineMethod::Cubic:
-            default:
-                // Not-a-knot ends (the default of MATLAB's spline/interp1 and
-                // SciPy's CubicSpline, so of the reference ICEEMDAN code);
-                // natural free ends below 4 knots, where not-a-knot is undefined.
-                // Free ends force zero curvature at the outermost knots and
-                // flatten the envelopes near the signal edges.
-                s_order = DF_PP_CUBIC;
-                s_type = DF_PP_NATURAL;
-                bc_type = (n >= 4) ? DF_BC_NOT_A_KNOT : DF_BC_FREE_END;
-                break;
             }
 
             const MKL_INT mkl_n = static_cast<MKL_INT>(n);
@@ -894,12 +972,11 @@ namespace eemd
             return true;
         }
 
-        /**
-         * Evaluate at uniform grid [0, 1, 2, ..., n_sites-1]
-         * Uses DF_UNIFORM_PARTITION for O(1) knot lookup instead of O(log K)
-         */
+        /** results[j] = spline at j, for j = 0 .. n_sites - 1. */
         bool evaluate_uniform(double *results, int32_t n_sites) const
         {
+            if (use_cubic_)
+                return cubic_.evaluate_uniform(results, n_sites);
             if (!spline_valid_)
                 return false;
 
@@ -924,34 +1001,6 @@ namespace eemd
             return (status == DF_STATUS_OK);
         }
 
-        /**
-         * Evaluate at arbitrary sorted sites (fallback)
-         */
-        bool evaluate(const double *sites, double *results, int32_t n_sites) const
-        {
-            if (!spline_valid_)
-                return false;
-
-            const MKL_INT mkl_n = static_cast<MKL_INT>(n_sites);
-            const MKL_INT dorder[] = {1};
-
-            MKL_INT status = dfdInterpolate1D(
-                task_,
-                DF_INTERP,
-                DF_METHOD_PP,
-                mkl_n,
-                sites,
-                DF_SORTED_DATA,
-                1,
-                dorder,
-                nullptr,
-                results,
-                DF_NO_HINT,
-                nullptr);
-
-            return (status == DF_STATUS_OK);
-        }
-
     private:
         void cleanup()
         {
@@ -963,6 +1012,10 @@ namespace eemd
             spline_valid_ = false;
         }
 
+        CubicSpline cubic_;
+        bool use_cubic_ = false;
+
+        // MKL Data Fitting (Akima, Linear)
         DFTaskPtr task_ = nullptr;
         bool task_valid_ = false;
         bool spline_valid_ = false;
@@ -998,8 +1051,7 @@ namespace eemd
             for (int32_t iter = 0; iter < config_.max_sift_iters; ++iter)
             {
                 // Find extrema (raw pointer output)
-                find_maxima_raw(work_.data, n, p_max, scratch_.n_max);
-                find_minima_raw(work_.data, n, p_min, scratch_.n_min);
+                find_extrema_raw(work_.data, n, p_max, scratch_.n_max, p_min, scratch_.n_min);
 
                 const bool rilling = (config_.stop_rule == SiftStopRule::Rilling);
 
@@ -1157,8 +1209,8 @@ namespace eemd
         AlignedBuffer<double> upper_env_;
         AlignedBuffer<double> lower_env_;
 
-        MKLSpline upper_spline_;
-        MKLSpline lower_spline_;
+        EnvelopeSpline upper_spline_;
+        EnvelopeSpline lower_spline_;
     };
 
     // ============================================================================

@@ -110,6 +110,7 @@ target_include_directories(eemd_mkl INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/fft>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/threads>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/spline>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -322,11 +323,13 @@ add_iceemdan_executable(example_finance_csv examples/finance_csv/example_finance
 add_iceemdan_executable(test_fft_hilbert tests/test_fft_hilbert.cpp)
 add_iceemdan_executable(test_fixes tests/test_fixes.cpp)
 add_iceemdan_executable(test_threads tests/test_threads.cpp)
+add_iceemdan_executable(test_spline tests/test_spline.cpp)
 
 enable_testing()
 add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
 add_test(NAME fixes COMMAND test_fixes)
 add_test(NAME threads COMMAND test_threads)
+add_test(NAME spline COMMAND test_spline)
 
 # --- Test programs run by hand ---
 add_eemd_executable(eemd_test tests/eemd_test.cpp)
@@ -343,10 +346,8 @@ add_iceemdan_executable(iceemdan_finance_bench benchmarks/iceemdan_finance_bench
 add_iceemdan_executable(bench_adaptive benchmarks/bench_adaptive.cpp)
 add_iceemdan_executable(bench_snumber benchmarks/bench_snumber.cpp)
 
-# spline_bench compares MKL's splines with the hand-written one in src/spline,
-# which the library itself does not use
+# spline_bench: the library's cubic spline (src/spline) against MKL Data Fitting
 add_eemd_executable(spline_bench benchmarks/spline_bench.cpp)
-target_include_directories(spline_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/spline)
 
 # ============================================================================
 # Validation against the reference code (validation/README.md)
@@ -401,6 +402,7 @@ install(FILES
     src/core/iceemdan_mkl.hpp
     src/fft/eemd_fft.hpp
     src/threads/eemd_threads.hpp
+    src/spline/cubic_spline.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 

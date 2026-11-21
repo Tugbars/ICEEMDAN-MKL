@@ -771,8 +771,8 @@ private:
     AlignedBuffer<double> upper_env_;
     AlignedBuffer<double> lower_env_;
 
-    MKLSpline upper_spline_;
-    MKLSpline lower_spline_;
+    EnvelopeSpline upper_spline_;
+    EnvelopeSpline lower_spline_;
 };
 
 /**
@@ -1194,7 +1194,7 @@ void bench_spline_deep_dive()
     
     // Benchmark spline operations
     const int32_t n_trials = 1000;
-    MKLSpline spline;
+    EnvelopeSpline spline;
     AlignedBuffer<double> result(n);
     
     // Construction
@@ -1216,21 +1216,6 @@ void bench_spline_deep_dive()
     t1 = Clock::now();
     double eval_uniform_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_trials;
     
-    // Evaluation (sorted - for comparison)
-    std::vector<double> sites(n);
-    for (int32_t i = 0; i < n; ++i)
-    {
-        sites[i] = static_cast<double>(i);
-    }
-    
-    t0 = Clock::now();
-    for (int32_t t = 0; t < n_trials; ++t)
-    {
-        spline.evaluate(sites.data(), result.data, n);
-    }
-    t1 = Clock::now();
-    double eval_sorted_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_trials;
-    
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "Operation             Time (μs)    Throughput\n";
     std::cout << std::string(48, '-') << "\n";
@@ -1239,12 +1224,6 @@ void bench_spline_deep_dive()
     std::cout << std::setprecision(2);
     std::cout << "Eval uniform (" << n << ")     " << std::setw(8) << eval_uniform_us 
               << "    " << std::setprecision(1) << n / eval_uniform_us << " Msamples/s\n";
-    std::cout << std::setprecision(2);
-    std::cout << "Eval sorted (" << n << ")      " << std::setw(8) << eval_sorted_us 
-              << "    " << std::setprecision(1) << n / eval_sorted_us << " Msamples/s\n";
-    
-    std::cout << "\nUniform speedup: " << std::setprecision(2) << eval_sorted_us / eval_uniform_us << "x\n";
-    std::cout << "(DF_UNIFORM_PARTITION enables O(1) knot lookup vs O(log K))\n";
     
     // Per-ICEEMDAN-stage estimate
     std::cout << "\n--- Per-ICEEMDAN-Stage Estimate ---\n";
