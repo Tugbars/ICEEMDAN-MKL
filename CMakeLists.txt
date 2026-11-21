@@ -61,6 +61,7 @@ target_include_directories(eemd INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/threads>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/spline>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/rng>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hht>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -269,6 +270,7 @@ add_iceemdan_executable(test_fixes tests/test_fixes.cpp)
 add_iceemdan_executable(test_threads tests/test_threads.cpp)
 add_iceemdan_executable(test_spline tests/test_spline.cpp)
 add_iceemdan_executable(test_rng tests/test_rng.cpp)
+add_iceemdan_executable(test_hht tests/test_hht.cpp)
 
 enable_testing()
 add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
@@ -276,6 +278,7 @@ add_test(NAME fixes COMMAND test_fixes)
 add_test(NAME threads COMMAND test_threads)
 add_test(NAME spline COMMAND test_spline)
 add_test(NAME rng COMMAND test_rng)
+add_test(NAME hht COMMAND test_hht)
 
 # --- Test programs run by hand ---
 add_eemd_executable(eemd_test tests/eemd_test.cpp)
@@ -425,6 +428,7 @@ install(FILES
     src/threads/eemd_threads.hpp
     src/spline/cubic_spline.hpp
     src/rng/eemd_rng.hpp
+    src/hht/eemd_hht.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 

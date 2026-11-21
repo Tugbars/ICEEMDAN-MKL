@@ -92,7 +92,7 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 - **Made for batches**: the decomposed noise of the ensemble is kept between calls, so further signals of the same length take half the time or less.
 - **Speed options** for when exact agreement with the paper matters less than time (among them ± noise pairs, which halve the noise to decompose), and a memory cap for the noise bank.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
-- **Analysis utilities**: Hilbert transform, instantaneous frequency, spectral entropy.
+- **Hilbert–Huang analysis**: the instantaneous amplitude, frequency and phase of every IMF, the Hilbert spectrum (energy over time and frequency) and the marginal spectrum, from C++, C and Python; spectral entropy.
 
 **The library**
 

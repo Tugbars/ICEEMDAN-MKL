@@ -16,6 +16,10 @@ Usage:
     
     # With diagnostics
     imfs, residue, diag = decomposer.decompose(signal, diagnostics=True)
+
+    # Hilbert-Huang analysis of the IMFs (sample rate in Hz)
+    amplitude, frequency, phase = instantaneous(imfs, sample_rate=250.0)
+    hs = hilbert_spectrum(imfs, sample_rate=250.0, fmax=40.0)  # hs.spectrum, hs.frequencies, hs.times, hs.marginal
 """
 
 import ctypes
@@ -23,7 +27,7 @@ import numpy as np
 import sys
 from pathlib import Path
 from enum import IntEnum
-from typing import Tuple, Optional, Union, Dict
+from typing import Tuple, Optional, Union, Dict, NamedTuple
 import platform
 
 # ============================================================================
@@ -232,6 +236,18 @@ _lib.iceemdan_shutdown_threads.restype = None
 
 _lib.iceemdan_compute_energy.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
 _lib.iceemdan_compute_energy.restype = ctypes.c_double
+
+# Hilbert-Huang analysis
+_lib.iceemdan_instantaneous.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+_lib.iceemdan_instantaneous.restype = ctypes.c_int
+_lib.iceemdan_mean_frequency.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_double]
+_lib.iceemdan_mean_frequency.restype = ctypes.c_double
+_lib.iceemdan_spectrum_columns.argtypes = [ctypes.c_int, ctypes.c_int]
+_lib.iceemdan_spectrum_columns.restype = ctypes.c_int
+_lib.iceemdan_hilbert_spectrum.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
+                                           ctypes.c_double, ctypes.c_double, ctypes.c_int, ctypes.c_int,
+                                           ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+_lib.iceemdan_hilbert_spectrum.restype = ctypes.c_int
 
 # ============================================================================
 # Python Wrapper Class
@@ -640,6 +656,131 @@ def fft_backend(n: int = 1024) -> str:
     """Name of the FFT backend the library uses for length n: "VectorFFT", or "none"
     for n < 2 (no transform needed) and when VectorFFT could not be loaded."""
     return _lib.iceemdan_fft_backend(int(n)).decode('utf-8')
+
+
+# ============================================================================
+# Hilbert-Huang analysis of the IMFs
+# ============================================================================
+
+def _imf_rows(imfs) -> np.ndarray:
+    """IMFs as a C-contiguous float64 array of shape (count, n)."""
+    rows = np.ascontiguousarray(imfs, dtype=np.float64)
+    if rows.ndim == 1:
+        rows = rows[None, :]
+    if rows.ndim != 2 or rows.shape[1] < 2:
+        raise ValueError("imfs must be one IMF (n,) or several (count, n), with n >= 2")
+    return rows
+
+
+def _ptr(a: np.ndarray):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+
+def instantaneous(imfs: np.ndarray, sample_rate: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Instantaneous amplitude, frequency and phase of each IMF, from its analytic signal.
+
+    Parameters
+    ----------
+    imfs : np.ndarray
+        One IMF (n,) or several (count, n), as decompose() returns them.
+    sample_rate : float
+        Samples per second. Frequencies are in Hz (cycles per sample for 1).
+
+    Returns
+    -------
+    amplitude, frequency, phase : np.ndarray
+        Each shaped like imfs: the envelope, the frequency in Hz and the
+        phase in radians (unwrapped). Within a period or two of each end of a
+        non-periodic IMF the values are distorted.
+    """
+    rows = _imf_rows(imfs)
+    count, n = rows.shape
+    amp, freq, phase = (np.empty_like(rows) for _ in range(3))
+    for k in range(count):
+        if not _lib.iceemdan_instantaneous(_ptr(rows[k]), n, float(sample_rate),
+                                           _ptr(amp[k]), _ptr(freq[k]), _ptr(phase[k])):
+            raise ValueError("instantaneous(): needs n >= 2 and sample_rate > 0")
+    if np.ndim(imfs) == 1:
+        return amp[0], freq[0], phase[0]
+    return amp, freq, phase
+
+
+def mean_frequency(imfs: np.ndarray, sample_rate: float = 1.0) -> Union[float, np.ndarray]:
+    """Instantaneous frequency of each IMF averaged with its energy as the weight, in Hz:
+    one value for one IMF, an array for several."""
+    rows = _imf_rows(imfs)
+    values = np.array([_lib.iceemdan_mean_frequency(_ptr(r), rows.shape[1], float(sample_rate)) for r in rows])
+    return float(values[0]) if np.ndim(imfs) == 1 else values
+
+
+class HilbertSpectrum(NamedTuple):
+    """The Hilbert spectrum of a set of IMFs (see hilbert_spectrum())."""
+    spectrum: np.ndarray     # (frequency_bins, columns): energy or amplitude per frequency bin and time column
+    frequencies: np.ndarray  # (frequency_bins,): the centre of each frequency bin, Hz
+    times: np.ndarray        # (columns,): the centre of each time column, s
+    marginal: np.ndarray     # (frequency_bins,): the spectrum summed over time
+
+
+def hilbert_spectrum(imfs: np.ndarray, sample_rate: float = 1.0, frequency_bins: int = 128,
+                     fmin: float = 0.0, fmax: Optional[float] = None, time_step: int = 1,
+                     amplitude: bool = False) -> HilbertSpectrum:
+    """
+    The Hilbert spectrum of the IMFs: their energy over time and frequency.
+
+    At every sample, each IMF adds its instantaneous energy (amplitude
+    squared; the amplitude with amplitude=True) to the frequency bin of its
+    instantaneous frequency. Summed over time, that gives the marginal
+    spectrum: how much energy the signal holds at each frequency.
+
+    Parameters
+    ----------
+    imfs : np.ndarray
+        One IMF (n,) or several (count, n), as decompose() returns them. The
+        residue is usually left out.
+    sample_rate : float
+        Samples per second; frequencies and times are in Hz and seconds.
+    frequency_bins : int
+        Bins of equal width from fmin to fmax.
+    fmin, fmax : float
+        The frequency range in Hz; fmax None: sample_rate / 2. Frequencies
+        outside it are left out.
+    time_step : int
+        Samples summed in each time column (1: a column per sample). For
+        long recordings, a step keeps the map small.
+    amplitude : bool
+        Amplitude instead of energy.
+
+    Returns
+    -------
+    HilbertSpectrum
+        spectrum (frequency_bins, columns), frequencies, times, marginal.
+
+    Examples
+    --------
+    >>> imfs, residue = iceemdan.decompose(ecg)
+    >>> hs = iceemdan.hilbert_spectrum(imfs, sample_rate=250.0, fmax=40.0)
+    >>> plt.pcolormesh(hs.times, hs.frequencies, hs.spectrum)
+    """
+    rows = _imf_rows(imfs)
+    count, n = rows.shape
+    fmax_value = 0.0 if fmax is None else float(fmax)
+    step = max(1, int(time_step))
+    cols = _lib.iceemdan_spectrum_columns(n, step)
+    spectrum = np.zeros((int(frequency_bins), cols))
+    marginal = np.zeros(int(frequency_bins))
+    if not _lib.iceemdan_hilbert_spectrum(_ptr(rows), count, n, float(sample_rate), int(frequency_bins),
+                                          float(fmin), fmax_value, step, int(bool(amplitude)),
+                                          _ptr(spectrum), _ptr(marginal)):
+        raise ValueError("hilbert_spectrum(): needs n >= 2, sample_rate > 0, frequency_bins >= 1 "
+                         "and 0 <= fmin < fmax")
+    top = fmax_value if fmax_value > 0 else 0.5 * float(sample_rate)
+    width = (top - float(fmin)) / int(frequency_bins)
+    frequencies = float(fmin) + (np.arange(int(frequency_bins)) + 0.5) * width
+    starts = np.arange(cols) * step
+    ends = np.minimum(starts + step, n) - 1
+    times = 0.5 * (starts + ends) / float(sample_rate)
+    return HilbertSpectrum(spectrum, frequencies, times, marginal)
 
 
 if __name__ == "__main__":

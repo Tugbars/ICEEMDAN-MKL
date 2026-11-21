@@ -495,6 +495,70 @@ ICEEMDAN_API void iceemdan_shutdown_threads()
     eemd::shutdown_threads();
 }
 
+// ============================================================================
+// Hilbert-Huang analysis of the IMFs (eemd_hht.hpp)
+// ============================================================================
+
+/**
+ * Instantaneous attributes of one IMF of n samples (n >= 2) at sample_rate
+ * samples per second, from its analytic signal: amplitude, frequency in Hz
+ * and phase in radians (unwrapped), n values each. Any output may be NULL.
+ * Within a period or two of each end of a non-periodic IMF the values are
+ * distorted. Returns 1, or 0 on bad arguments.
+ */
+ICEEMDAN_API int iceemdan_instantaneous(const double *imf, int n, double sample_rate,
+                                        double *amplitude, double *frequency, double *phase)
+{
+    return eemd::hht::instantaneous(imf, n, sample_rate, amplitude, frequency, phase) ? 1 : 0;
+}
+
+/** Instantaneous frequency of one IMF averaged with its energy as the weight, Hz. */
+ICEEMDAN_API double iceemdan_mean_frequency(const double *imf, int n, double sample_rate)
+{
+    return eemd::hht::mean_frequency(imf, n, sample_rate);
+}
+
+/** Time columns of a Hilbert spectrum of n samples with time_step samples per column. */
+ICEEMDAN_API int iceemdan_spectrum_columns(int n, int time_step)
+{
+    eemd::hht::SpectrumOptions opt;
+    opt.time_step = time_step;
+    return eemd::hht::spectrum_columns(n, opt);
+}
+
+/**
+ * Hilbert spectrum of n_imfs IMFs of n samples each, stored one after
+ * another. spectrum receives frequency_bins rows of
+ * iceemdan_spectrum_columns(n, time_step) values (row-major; row b is the
+ * bin from fmin + b w to fmin + (b + 1) w, w = (fmax - fmin) / frequency_bins);
+ * marginal receives frequency_bins values, each row summed over time. Either
+ * may be NULL. At each sample each IMF adds its energy (amplitude squared;
+ * its amplitude when amplitude != 0) to the bin of its instantaneous
+ * frequency; frequencies outside [fmin, fmax] are left out. fmax <= 0 means
+ * sample_rate / 2. Returns 1, or 0 on bad arguments.
+ */
+ICEEMDAN_API int iceemdan_hilbert_spectrum(const double *imfs, int n_imfs, int n, double sample_rate,
+                                           int frequency_bins, double fmin, double fmax, int time_step,
+                                           int amplitude, double *spectrum, double *marginal)
+{
+    if (!imfs || n_imfs < 1)
+        return 0;
+    eemd::hht::SpectrumOptions opt;
+    opt.frequency_bins = frequency_bins;
+    opt.fmin = fmin;
+    opt.fmax = fmax;
+    opt.time_step = time_step;
+    opt.amplitude = amplitude != 0;
+    try
+    {
+        return eemd::hht::hilbert_spectrum(imfs, n_imfs, n, sample_rate, opt, spectrum, marginal) ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
 /**
  * Compute energy of a signal (sum of squares)
  */
