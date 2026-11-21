@@ -397,65 +397,50 @@ namespace eemd
      * Returns count of sanitized points (for diagnostics)
      *
      * CRITICAL: MKL spline functions crash on NaN/Inf input
+     *
+     * Uses is_finite_bits(), which -ffast-math cannot optimize away (with
+     * std::isfinite the whole check compiled to nothing under the project's
+     * own GCC flags). One pass over each run of bad samples: O(n).
      */
     inline int32_t sanitize_signal(double *signal, int32_t n)
     {
         int32_t nan_count = 0;
+        int32_t prev_good = -1; // index of the last finite sample
 
-        // First pass: identify bad values
-        std::vector<bool> is_bad(n, false);
-        for (int32_t i = 0; i < n; ++i)
+        int32_t i = 0;
+        while (i < n)
         {
-            if (!std::isfinite(signal[i]))
+            if (is_finite_bits(signal[i]))
             {
-                is_bad[i] = true;
-                ++nan_count;
-            }
-        }
-
-        if (nan_count == 0)
-            return 0;
-        if (nan_count == n)
-        {
-            // All bad - fill with zeros
-            std::memset(signal, 0, n * sizeof(double));
-            return nan_count;
-        }
-
-        // Second pass: linear interpolation from nearest good neighbors
-        for (int32_t i = 0; i < n; ++i)
-        {
-            if (!is_bad[i])
+                prev_good = i++;
                 continue;
+            }
 
-            // Find previous good value
-            int32_t prev = i - 1;
-            while (prev >= 0 && is_bad[prev])
-                --prev;
-
-            // Find next good value
-            int32_t next = i + 1;
-            while (next < n && is_bad[next])
+            // Bad run [i, next)
+            int32_t next = i;
+            while (next < n && !is_finite_bits(signal[next]))
                 ++next;
+            nan_count += next - i;
 
-            if (prev < 0 && next >= n)
+            if (prev_good < 0 && next >= n)
             {
-                signal[i] = 0.0; // Should not happen (caught above)
+                std::memset(signal, 0, n * sizeof(double)); // all bad
+                return nan_count;
             }
-            else if (prev < 0)
+
+            for (int32_t j = i; j < next; ++j)
             {
-                signal[i] = signal[next]; // Extrapolate from right
+                if (prev_good < 0)
+                    signal[j] = signal[next]; // extrapolate from the right
+                else if (next >= n)
+                    signal[j] = signal[prev_good]; // extrapolate from the left
+                else
+                {
+                    const double t = static_cast<double>(j - prev_good) / (next - prev_good);
+                    signal[j] = signal[prev_good] + t * (signal[next] - signal[prev_good]);
+                }
             }
-            else if (next >= n)
-            {
-                signal[i] = signal[prev]; // Extrapolate from left
-            }
-            else
-            {
-                // Linear interpolation
-                double t = static_cast<double>(i - prev) / (next - prev);
-                signal[i] = signal[prev] + t * (signal[next] - signal[prev]);
-            }
+            i = next;
         }
 
         return nan_count;

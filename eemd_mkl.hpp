@@ -173,6 +173,21 @@ namespace eemd
         // Spline method for envelope interpolation
         SplineMethod spline_method = SplineMethod::Cubic;
     };
+    // ============================================================================
+    // Finite check that survives -ffast-math
+    //
+    // The project builds with -ffast-math / -fp-model fast / /fp:fast, under
+    // which the compiler may assume no NaN or Inf exists and fold
+    // std::isfinite() to true. Testing the exponent bits cannot be folded.
+    // ============================================================================
+
+    inline bool is_finite_bits(double x)
+    {
+        uint64_t u;
+        std::memcpy(&u, &x, sizeof(u));
+        return ((u >> 52) & 0x7FFu) != 0x7FFu; // exponent all ones = Inf or NaN
+    }
+
 
     // ============================================================================
     // Aligned Buffer - Grow-Only, 64-byte Aligned
