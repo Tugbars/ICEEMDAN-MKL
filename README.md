@@ -19,7 +19,7 @@ The first public C/C++ implementation of Improved Complete Ensemble Empirical Mo
 **ICEEMDAN** improves on CEEMDAN by adding noise in a fundamentally different way:
 - Instead of adding noise to the signal, it computes the **local mean of noise realizations**
 - This yields IMFs with less noise contamination and better spectral separation
-- Reconstruction error drops from ~1% (CEEMDAN) to **machine precision** (~10⁻¹⁵)
+- Reconstruction error drops from ~1% (CEEMDAN) to **floating-point rounding** (~10⁻¹⁴)
 
 For financial and scientific applications, this means cleaner trend extraction, better denoising, and more reliable frequency analysis.
 
@@ -27,24 +27,57 @@ For financial and scientific applications, this means cleaner trend extraction, 
 
 ## Features
 
-- **Complete ICEEMDAN Algorithm** — Full implementation of Colominas et al. (2014)
+- **Complete ICEEMDAN Algorithm** — Full implementation of Colominas et al. (2014), checked against the authors' own reference code (see [Accuracy](#accuracy))
 - **Intel MKL Acceleration** — Spline interpolation via MKL Data Fitting, VSL random number generation
+- **VectorFFT** — FFTs (Hilbert transform, instantaneous frequency, spectral entropy) via [VectorFFT](https://github.com/Tugbars/VectorFFT), with MKL DFTI as fallback
+- **Reproducible** — for a given seed, identical results at any number of threads
 - **Multiple Spline Methods** — Cubic (smooth), Akima (outlier-resistant), Linear (fast)
 - **OpenMP Parallelization** — Scales across CPU cores with lock-free reduction
 - **Multiple Processing Modes** — Standard (audio/seismic), Finance (trading), Scientific (reproducible research)
-- **Header-Only** — Single header file, easy integration
-- **Cross-Platform** — Windows, Linux, macOS
+- **Header-Only** — headers only; link VectorFFT to use it for the FFTs (CMake does this)
+- **Cross-Platform** — Windows, Linux, macOS (GCC, Clang, ICX, MSVC; MSVC builds use MKL DFTI for the FFTs)
+
+## Changes in 1.1
+
+Version 1.1 makes the default decomposition follow the published algorithm and the authors'
+reference code. **Results differ from 1.0**, and the default is slower (see [Performance](#performance)):
+
+| Area | 1.0 | 1.1 default |
+|------|-----|-------------|
+| Local mean M(·) | one envelope mean | first mode sifted to convergence, M(x) = x − E₁(x) |
+| Sifting stop rule | SD < 0.05 (2–3 iterations) | Rilling, Flandrin & Gonçalves (2003), as `emd.m` |
+| Noise amplitude | ε·std(x) at every stage | β₀ = ε·std(x)/std(E₁(w)), β_k = ε·std(r_k) |
+| Noise realizations | windows of one long realization | independent realizations, the same one at every stage |
+| Envelope ends | mirrored extrema + linear end points; natural splines | symmetric extension of `emd.m`; not-a-knot splines |
+| Threads | results depended on the thread count | identical at any thread count |
+| FFT | MKL DFTI | VectorFFT (MKL DFTI fallback) |
+
+The 1.0 behaviour is still available: see [Speed options](#speed-options). Also fixed in 1.1:
+compilation with GCC/Clang, NaN/Inf sanitizing under `-ffast-math`, the Hilbert transform for
+odd lengths, flat extrema (tick-quantized prices), per-IMF convergence diagnostics, a memory cap
+for the noise bank, and loading the Python binding on Linux.
+
+---
 
 ## Performance
 
-| Signal Length | Ensemble Size | Time | Throughput |
-|---------------|---------------|------|------------|
-| 1024 | 100 | 6.6 ms | 15.4 MS/s |
-| 2048 | 100 | 11.3 ms | 18.1 MS/s |
-| 4096 | 100 | 28.4 ms | 14.4 MS/s |
-| 8192 | 100 | 61.6 ms | 13.3 MS/s |
+Time per decomposition, ensemble size 100, sum-of-tones test signal, median of 5 runs, on a
+2-core Intel Xeon @ 2.1 GHz (AVX-512), 2 threads:
 
-*Benchmarked on Intel Core i9-14900KF, 8 threads*
+| Signal Length | Default (paper-exact) | Sifted, SD stop rule | SingleEnvelope, SD | SingleEnvelope, SD, circular bank |
+|---------------|-----------------------|----------------------|--------------------|-----------------------------------|
+| 1024 | 122.5 ms | 16.6 ms | 12.6 ms | 10.9 ms |
+| 2048 | 223.6 ms | 41.4 ms | 28.0 ms | 25.6 ms |
+| 4096 | 566.2 ms | 90.6 ms | 56.5 ms | 46.3 ms |
+| 8192 | 1480.9 ms | 188.7 ms | 124.7 ms | 113.0 ms |
+
+The default follows the published algorithm, whose stop rule typically needs 10–15 sifting
+iterations per local mean. The last column is close to the configuration of versions before
+1.1 (113 ms at N = 8192 on the same machine), which was faster but did not reproduce
+ICEEMDAN (see [Accuracy](#accuracy) and [Speed options](#speed-options)).
+
+*Earlier versions of this README quoted 6.6–61.6 ms on an Intel Core i9-14900KF with 8 threads;
+those numbers were measured with the pre-1.1 algorithm.*
 
 ---
 
@@ -88,7 +121,7 @@ Each IMF captures roughly half the frequency of the previous, octave-spaced band
 
 Proof that ICEEMDAN is a **complete decomposition**: ∑IMFs + Residue = Original Signal.
 
-- **Max error**: 3×10⁻⁸ (machine precision)
+- **Max error**: at floating-point rounding level (about 10⁻¹⁴ relative in the test suite)
 - **No information loss**: Selectively reconstruct using any IMF subset
 
 ---
@@ -113,15 +146,24 @@ Time-frequency energy distribution via Hilbert-Huang Transform.
 - C++17 compiler (GCC 9+, Clang 10+, MSVC 2019+, Intel ICX)
 - Intel oneAPI MKL (free download from Intel)
 - CMake 3.20+
+- Optional: [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs, included as a git
+  submodule in `third_party/vectorfft` (built with GCC or Clang; MinGW on Windows)
 
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/iceemdan-mkl.git
+git clone --recursive --shallow-submodules https://github.com/Tugbars/iceemdan-mkl.git
 cd iceemdan-mkl
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+ctest --test-dir build      # regression tests
 ```
+
+Already cloned without `--recursive`? Run `git submodule update --init --depth 1 third_party/vectorfft`.
+Without the submodule (or with `-DICEEMDAN_USE_VECTORFFT=OFF`, or with MSVC) the FFTs use MKL DFTI;
+everything else is unchanged. To use an installed VectorFFT instead, pass
+`-DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT`. CMake prints the backend it chose
+(`FFT backend: ...`).
 
 ### Basic Usage
 
@@ -161,9 +203,9 @@ eemd::ICEEMDAN decomposer;  // Standard mode by default
 eemd::ICEEMDAN decomposer(eemd::ProcessingMode::Standard);
 ```
 
-- Cubic splines (smooth C² interpolation)
+- Cubic splines (smooth C² interpolation, not-a-knot ends)
 - Global volatility scaling
-- Mirror boundary extension
+- Symmetric boundary extension (as in Rilling & Flandrin's `emd.m`)
 
 ### Scientific Mode
 Best for: Research requiring reproducibility and audit trails
@@ -181,8 +223,8 @@ std::cout << "Orthogonality index: " << diag.orthogonality_index << "\n";
 ```
 
 - Cubic splines
-- No variance reduction tricks (pure algorithm)
-- Full convergence tracking
+- No variance reduction tricks (pure algorithm): independent noise realizations, no antithetic pairs
+- Convergence diagnostics per IMF (see [Diagnostics](#diagnostics))
 
 ### Finance Mode
 Best for: Quantitative trading, real-time analysis
@@ -223,7 +265,7 @@ cfg.noise_std = 0.2;          // Noise amplitude as fraction of signal std (defa
 cfg.max_imfs = 10;            // Maximum IMFs to extract (default: 10)
 cfg.max_sift_iters = 100;     // Sifting iterations per IMF (default: 100)
 cfg.sift_threshold = 0.05;    // Sifting convergence threshold (default: 0.05)
-cfg.rng_seed = 42;            // Random seed for reproducibility (default: 0 = random)
+cfg.rng_seed = 42;            // Random seed for reproducibility (default: 42)
 ```
 
 ### Spline Methods
@@ -265,7 +307,10 @@ cfg.vol_ema_span = 20;  // EMA span
 Controls extrapolation at signal edges:
 
 ```cpp
-// Mirror: Reflects extrema (smooth, slight look-ahead)
+// Symmetric: emd.m's symmetric extension (default for Standard/Scientific)
+cfg.boundary_method = eemd::BoundaryMethod::Symmetric;
+
+// Mirror: Reflects extrema plus a linear end point (the pre-1.1 default)
 cfg.boundary_method = eemd::BoundaryMethod::Mirror;
 
 // AR: Autoregressive extrapolation (causal, no look-ahead)
@@ -275,6 +320,32 @@ cfg.ar_damping = 0.5;  // 0=mean-revert, 1=full AR
 // Linear: Simple linear extrapolation
 cfg.boundary_method = eemd::BoundaryMethod::Linear;
 ```
+
+### Local Mean, Stop Rule and Noise Bank
+
+```cpp
+// The published algorithm (defaults)
+cfg.local_mean_method = eemd::LocalMeanMethod::Sifted;   // M(x) = x - E1(x)
+cfg.sift_stop_rule    = eemd::SiftStopRule::Rilling;     // emd.m criterion
+cfg.rilling           = {0.05, 0.5, 0.05};               // theta1, theta2, alpha (emd.m defaults)
+cfg.use_circular_bank = false;                           // independent noise realizations
+cfg.noise_bank_max_bytes = size_t(2) << 30;              // above it: circular bank, else fail
+```
+
+### Speed Options
+
+Each option trades fidelity to the published algorithm for speed (timings in
+[Performance](#performance)):
+
+```cpp
+cfg.sift_stop_rule    = eemd::SiftStopRule::SD;                // stop at SD < sift_threshold (~2-3 iterations)
+cfg.local_mean_method = eemd::LocalMeanMethod::SingleEnvelope; // one envelope mean per trial
+cfg.use_circular_bank = true;                                  // one long noise decomposition
+cfg.boundary_method   = eemd::BoundaryMethod::Mirror;          // 1.0 envelope ends
+```
+
+All four together reproduce the 1.0 configuration (except for the noise amplitude, which
+follows the paper in every configuration).
 
 ## Algorithm Details
 
@@ -289,9 +360,70 @@ cfg.boundary_method = eemd::BoundaryMethod::Linear;
 
 ICEEMDAN adds noise to the *residue* at each stage (not the original signal), producing cleaner IMFs with better frequency separation.
 
+### Accuracy
+
+The default configuration was compared with the ICEEMDAN code of Colominas et al.
+(`ceemdan.m` with Rilling & Flandrin's `emd.m`, run in GNU Octave, ε = 0.2, 100 realizations;
+3 seeds for the reference, 5 for this library).
+
+**White noise, N = 4096**: mean frequency (cycles/sample) of IMFs 1–6. ICEEMDAN of white noise
+is a dyadic filter bank, so this is the core property to match:
+
+| | IMF 1 | IMF 2 | IMF 3 | IMF 4 | IMF 5 | IMF 6 | mean distance to the reference |
+|---|---|---|---|---|---|---|---|
+| Reference (authors' code) | 0.3421 | 0.1568 | 0.0788 | 0.0422 | 0.0201 | 0.0095 | — |
+| 1.1 default | 0.3421 | 0.1566 | 0.0787 | 0.0424 | 0.0202 | 0.0094 | 0.007 octave |
+| 1.1, SD stop rule | 0.3256 | 0.1157 | 0.0476 | 0.0196 | 0.0074 | 0.0032 | 0.89 octave |
+| 1.0 | 0.3175 | 0.1019 | 0.0395 | 0.0163 | 0.0066 | 0.0027 | 1.09 octave |
+
+**Tones of 128, 32 and 8 cycles plus a trend, N = 2048**: relative error of the IMF that best
+matches each tone (lower = less mode mixing; edges excluded):
+
+| | 128 cycles | 32 cycles | 8 cycles |
+|---|---|---|---|
+| Reference (authors' code) | 0.269 | 0.302 | 0.058 |
+| 1.1 default | 0.260 | 0.323 | 0.086 |
+| 1.0 | 0.405 | 0.519 | 0.210 |
+
+To reproduce: [`validation/README.md`](validation/README.md).
+
+### Reproducibility
+
+For a given `rng_seed` and configuration, `ICEEMDAN::decompose()` returns bit-identical IMFs at
+any number of OpenMP threads (tested at 1–4 threads in every mode): each realization's noise
+comes from its own Philox4x32-10 stream keyed by (seed, trial), and trials are summed in fixed
+blocks in trial order. `EEMD::decompose()` is bit-identical between runs at a fixed thread
+count; across thread counts it differs only by summation rounding.
+
+### Diagnostics
+
+```cpp
+eemd::DecompositionDiagnostics diag;
+decomposer.decompose_with_diagnostics(signal, n, imfs, residue, diag);
+// per IMF k:
+//   diag.sift_iterations[k]       most sifting iterations any trial needed
+//   diag.mean_sift_iterations[k]  mean iterations per trial
+//   diag.nonconverged_trials[k]   trials that hit max_sift_iters
+//   diag.convergence_flags[k]     true if none did
+//   diag.trials_per_imf[k]        local means averaged
+// diag.nan_count, diag.rng_seed_used, diag.orthogonality_index, diag.noise_bank_multiplier
+```
+
+`decomposer.last_diagnostics()` returns the same after a plain `decompose()`.
+
+### FFT Backend
+
+The analysis utilities (`compute_hilbert_transform`, `compute_instantaneous_frequency`,
+`compute_spectral_entropy`) use [VectorFFT](https://github.com/Tugbars/VectorFFT) real
+transforms when the build defines `EEMD_USE_VECTORFFT` (CMake does when `third_party/vectorfft`
+is present) and MKL DFTI otherwise, or for a length VectorFFT does not serve. Plans are made
+once per thread and length, with `VFFT_FLAG_ESTIMATE` (no measuring, no wisdom files written),
+and the caller's floating-point mode (MXCSR) is restored after every VectorFFT call.
+`eemd::fft::backend_for(n)` names the backend used for length `n`.
+
 ### S-Number Sifting Criterion
 
-In addition to the standard SD (stopping difference) criterion, this implementation uses the **S-number criterion** for faster convergence:
+With `sift_stop_rule = SiftStopRule::SD`, the SD (stopping difference) criterion is combined with the **S-number criterion** for faster convergence (the default Rilling rule does not use it):
 
 ```cpp
 cfg.s_number = 6;  // Stop after 6 consecutive iterations with stable extrema count
@@ -427,7 +559,9 @@ Build and run the benchmarks:
 Generate CSV files and visualize with Python:
 
 ```bash
-# 1. Build and run CSV export example
+# 1. Build and run CSV export example (and see python/ for the ctypes binding:
+#    it loads build/libiceemdan.so, or iceemdan.dll on Windows, built by the
+#    iceemdan_shared target)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/example_finance_csv
@@ -454,7 +588,9 @@ The notebook shows:
 
 4. **EMD**: Huang, N. E., et al. (1998). The empirical mode decomposition and the Hilbert spectrum for nonlinear and non-stationary time series analysis. *Proceedings of the Royal Society A*, 454(1971), 903-995.
 
-5. **Akima Splines**: Akima, H. (1970). A new method of interpolation and smooth curve fitting based on local procedures. *Journal of the ACM*, 17(4), 589-602.
+5. **Sifting stop rule and boundary extension**: Rilling, G., Flandrin, P., & Gonçalves, P. (2003). On empirical mode decomposition and its algorithms. *IEEE-EURASIP Workshop on Nonlinear Signal and Image Processing (NSIP-03)*.
+
+6. **Akima Splines**: Akima, H. (1970). A new method of interpolation and smooth curve fitting based on local procedures. *Journal of the ACM*, 17(4), 589-602.
 
 ## Citation
 
@@ -480,5 +616,7 @@ Contributions welcome! Please open an issue or PR.
 ## Acknowledgments
 
 - Intel MKL for high-performance spline fitting
+- [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs
+- Rilling, Flandrin & Gonçalves for `emd.m`, whose stop rule and boundary extension the defaults follow
 - Original ICEEMDAN algorithm by Colominas et al.
 - Akima spline method for robust envelope construction

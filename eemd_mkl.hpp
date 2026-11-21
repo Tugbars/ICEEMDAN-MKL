@@ -26,11 +26,19 @@
 #include <omp.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h> // _MM_SET_FLUSH_ZERO_MODE, _MM_SET_DENORMALS_ZERO_MODE
+#endif
+
+#include "eemd_fft.hpp" // real FFTs: VectorFFT when EEMD_USE_VECTORFFT, else MKL DFTI
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -38,9 +46,12 @@
 
 // Compiler-aware SIMD pragma
 #if defined(__INTEL_LLVM_COMPILER) || defined(__GNUC__) || defined(__clang__)
-#define EEMD_OMP_SIMD _Pragma("omp simd")
-#define EEMD_OMP_SIMD_REDUCTION(op, var) _Pragma("omp simd reduction(" #op ":" #var ")")
-#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) _Pragma("omp simd reduction(" #op ":" #v1 "," #v2 ")")
+// _Pragma takes ONE string literal (no concatenation), so the clause is
+// stringized as a whole through EEMD_PRAGMA.
+#define EEMD_PRAGMA(x) _Pragma(#x)
+#define EEMD_OMP_SIMD EEMD_PRAGMA(omp simd)
+#define EEMD_OMP_SIMD_REDUCTION(op, var) EEMD_PRAGMA(omp simd reduction(op : var))
+#define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2) EEMD_PRAGMA(omp simd reduction(op : v1, v2))
 #else
 #define EEMD_OMP_SIMD
 #define EEMD_OMP_SIMD_REDUCTION(op, var)
@@ -130,7 +141,7 @@ namespace eemd
 
     /**
      * Spline interpolation method for envelope construction
-     * - Cubic: Smooth C2 spline, can overshoot on sharp changes (default)
+     * - Cubic: Smooth C2 spline with not-a-knot ends, can overshoot on sharp changes (default)
      * - Akima: Local C1 spline, resistant to outliers (recommended for finance)
      * - Linear: Simple linear interpolation (fastest, least accurate)
      */
@@ -139,6 +150,32 @@ namespace eemd
         Cubic = 0, // DF_PP_CUBIC - smooth but can overshoot
         Akima = 1, // DF_PP_AKIMA - local, outlier-resistant
         Linear = 2 // DF_PP_LINEAR - fastest, for very few extrema
+    };
+
+    /**
+     * When sifting a mode stops
+     * - SD:      sum(m^2) / sum(h^2) < sift_threshold, plus the S-number and
+     *            extrema/zero-crossing early exits. Cheap; typically stops
+     *            after 2-3 iterations at the default threshold of 0.05.
+     * - Rilling: the criterion of Rilling, Flandrin & Goncalves (2003), as in
+     *            their emd.m that the ICEEMDAN authors' reference code uses:
+     *            with mode amplitude a = (U - L) / 2 and envelope mean m,
+     *            sift while |m| > theta1 * a on more than a fraction alpha of
+     *            the samples or |m| > theta2 * a anywhere, and stop only when
+     *            the extrema and zero-crossing counts differ by at most one.
+     */
+    enum class SiftStopRule : uint8_t
+    {
+        SD = 0,
+        Rilling = 1
+    };
+
+    /** Thresholds of SiftStopRule::Rilling (emd.m defaults [0.05, 0.5, 0.05]). */
+    struct RillingThresholds
+    {
+        double theta1 = 0.05;
+        double theta2 = 0.5;
+        double alpha = 0.05;
     };
 
     // ============================================================================
@@ -162,7 +199,63 @@ namespace eemd
 
         // Spline method for envelope interpolation
         SplineMethod spline_method = SplineMethod::Cubic;
+
+        // Sifting stop rule (see SiftStopRule); sift_threshold and s_number
+        // apply to SD, rilling to Rilling.
+        SiftStopRule stop_rule = SiftStopRule::SD;
+        RillingThresholds rilling;
+
+        // Envelope ends: false = mirror boundary_extend extrema plus a linear
+        // end point (extend_extrema_raw, the original scheme); true = the
+        // symmetric extension of emd.m (extend_extrema_symmetric), which stays
+        // stable when sifting runs for many iterations.
+        bool symmetric_boundary = false;
     };
+
+    // ============================================================================
+    // Finite check that survives -ffast-math
+    //
+    // The project builds with -ffast-math / -fp-model fast / /fp:fast, under
+    // which the compiler may assume no NaN or Inf exists and fold
+    // std::isfinite() to true. Testing the exponent bits cannot be folded.
+    // ============================================================================
+
+    inline bool is_finite_bits(double x)
+    {
+        uint64_t u;
+        std::memcpy(&u, &x, sizeof(u));
+        return ((u >> 52) & 0x7FFu) != 0x7FFu; // exponent all ones = Inf or NaN
+    }
+
+    // ============================================================================
+    // Per-trial random streams
+    //
+    // Trial t of seed s draws its noise from its own Philox4x32-10 stream with
+    // the 64-bit key s + 2^32 t. The noise of a trial therefore depends only on
+    // (s, t): not on the thread that runs it, the number of threads, or the
+    // order trials are scheduled in.
+    // ============================================================================
+
+    inline VSLStreamStatePtr new_trial_stream(uint32_t seed, uint32_t trial)
+    {
+        VSLStreamStatePtr stream = nullptr;
+        const unsigned int params[2] = {seed, trial};
+        if (vslNewStreamEx(&stream, VSL_BRNG_PHILOX4X32X10, 2, params) != VSL_STATUS_OK)
+            return nullptr;
+        return stream;
+    }
+
+    /** Fill out[0..n) with N(mean, sigma) noise of trial `trial` under `seed`. */
+    inline bool trial_gaussian(uint32_t seed, uint32_t trial, int32_t n, double *out,
+                               double mean = 0.0, double sigma = 1.0)
+    {
+        VSLStreamStatePtr stream = new_trial_stream(seed, trial);
+        if (!stream)
+            return false;
+        const int status = vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, out, mean, sigma);
+        vslDeleteStream(&stream);
+        return status == VSL_STATUS_OK;
+    }
 
     // ============================================================================
     // Aligned Buffer - Grow-Only, 64-byte Aligned
@@ -266,21 +359,89 @@ namespace eemd
         int32_t n_ext = 0;
         int32_t ext_start = 0;
 
+        // Second knot buffer pair (symmetric extension builds both envelopes at once)
+        std::vector<double> ext_x2;
+        std::vector<double> ext_y2;
+        int32_t n_ext2 = 0;
+
         explicit ThreadScratchPad(int32_t n)
         {
             const int32_t max_extrema = n / 2 + 2;
-            const int32_t ext_size = n + 20;
+            const int32_t ext_size = n + 128; // extrema + up to 2 x 31 mirrored knots + end points
 
             max_idx.resize(max_extrema);
             min_idx.resize(max_extrema);
             ext_x.resize(ext_size);
             ext_y.resize(ext_size);
+            ext_x2.resize(ext_size);
+            ext_y2.resize(ext_size);
         }
     };
 
     // ============================================================================
     // Peak Finding - Raw Pointer Output (No vector push_back)
+    //
+    // A strict peak (x[i-1] < x[i] > x[i+1]) is the common case and is found
+    // in one pass. Flat extrema - runs of equal samples such as
+    // prices quantized to a tick - have no strict peak, so when the pass sees
+    // two equal neighbours it rescans with plateau handling: a run bounded by
+    // lower (higher) samples on both sides is one maximum (minimum), placed at
+    // the centre of the run. Runs touching either end are not extrema.
     // ============================================================================
+
+    namespace detail
+    {
+        // kMax = true: maxima; false: minima. out_idx may be null (count only).
+        template <bool kMax>
+        inline int32_t scan_extrema(const double *__restrict s, int32_t n, int32_t *__restrict out_idx)
+        {
+            if (n < 3)
+                return 0;
+
+            auto above = [](double a, double b) { return kMax ? (a > b) : (a < b); };
+
+            int32_t count = 0;
+            bool has_tie = false;
+            for (int32_t i = 1; i < n - 1; ++i)
+            {
+                const double c = s[i];
+                has_tie |= (c == s[i + 1]);
+                if (above(c, s[i - 1]) & above(c, s[i + 1]))
+                {
+                    if (out_idx)
+                        out_idx[count] = i;
+                    ++count;
+                }
+            }
+            if (!has_tie)
+                return count;
+
+            // Plateau-aware rescan (same result as above wherever there is no tie)
+            count = 0;
+            int32_t i = 1;
+            while (i < n - 1)
+            {
+                if (above(s[i], s[i - 1]))
+                {
+                    int32_t j = i;
+                    while (j < n - 1 && s[j + 1] == s[i])
+                        ++j; // run [i, j] of equal values
+                    if (j < n - 1 && above(s[i], s[j + 1]))
+                    {
+                        if (out_idx)
+                            out_idx[count] = i + (j - i) / 2;
+                        ++count;
+                    }
+                    i = j + 1;
+                }
+                else
+                {
+                    ++i;
+                }
+            }
+            return count;
+        }
+    } // namespace detail
 
     inline void find_maxima_raw(
         const double *__restrict signal,
@@ -288,21 +449,7 @@ namespace eemd
         int32_t *__restrict out_idx,
         int32_t &out_count)
     {
-        int32_t count = 0;
-
-        if (n >= 3)
-        {
-            for (int32_t i = 1; i < n - 1; ++i)
-            {
-                const bool peak = (signal[i] > signal[i - 1]) & (signal[i] > signal[i + 1]);
-                if (peak)
-                {
-                    out_idx[count++] = i;
-                }
-            }
-        }
-
-        out_count = count;
+        out_count = detail::scan_extrema<true>(signal, n, out_idx);
     }
 
     inline void find_minima_raw(
@@ -311,21 +458,14 @@ namespace eemd
         int32_t *__restrict out_idx,
         int32_t &out_count)
     {
-        int32_t count = 0;
+        out_count = detail::scan_extrema<false>(signal, n, out_idx);
+    }
 
-        if (n >= 3)
-        {
-            for (int32_t i = 1; i < n - 1; ++i)
-            {
-                const bool trough = (signal[i] < signal[i - 1]) & (signal[i] < signal[i + 1]);
-                if (trough)
-                {
-                    out_idx[count++] = i;
-                }
-            }
-        }
-
-        out_count = count;
+    /** Number of local maxima plus minima (plateau-aware, same rule as above). */
+    inline int32_t count_extrema_raw(const double *signal, int32_t n)
+    {
+        return detail::scan_extrema<true>(signal, n, nullptr) +
+               detail::scan_extrema<false>(signal, n, nullptr);
     }
 
     inline int32_t count_zero_crossings(const double *signal, int32_t n)
@@ -336,6 +476,31 @@ namespace eemd
             count += ((signal[i - 1] >= 0.0) != (signal[i] >= 0.0));
         }
         return count;
+    }
+
+    /**
+     * SiftStopRule::Rilling: true when the mode h (with upper/lower
+     * envelopes U, L and n_extrema extrema) should NOT be sifted further.
+     */
+    inline bool rilling_should_stop(const double *__restrict h,
+                                    const double *__restrict upper,
+                                    const double *__restrict lower,
+                                    int32_t n, int32_t n_extrema,
+                                    const RillingThresholds &th)
+    {
+        int64_t over = 0;
+        int32_t big = 0;
+        for (int32_t i = 0; i < n; ++i)
+        {
+            const double m = std::abs(0.5 * (upper[i] + lower[i]));
+            const double a = 0.5 * std::abs(upper[i] - lower[i]);
+            over += (m > th.theta1 * a);
+            big |= (m > th.theta2 * a);
+        }
+        const bool keep_sifting = (static_cast<double>(over) > th.alpha * n || big) && n_extrema > 2;
+        if (keep_sifting)
+            return false;
+        return std::abs(count_zero_crossings(h, n) - n_extrema) <= 1;
     }
 
     // ============================================================================
@@ -444,6 +609,190 @@ namespace eemd
     }
 
     // ============================================================================
+    // Symmetric boundary extension (Rilling, Flandrin & Goncalves 2003; the
+    // boundary_conditions() of emd.m, which the ICEEMDAN authors' reference
+    // code uses). Mirrors nbsym extrema of each kind about the first/last
+    // extremum, or about the end sample when that is the better symmetry
+    // point, so both envelopes are interpolated, never extrapolated, over
+    // [0, n-1]. Writes both envelopes' knots at once (the choice of symmetry
+    // point depends on both kinds of extrema). Knot buffers need
+    // n_max + 2 * nbsym + 2 (resp. n_min + ...) entries.
+    // Returns false when there are not enough extrema (fewer than one of
+    // each kind or fewer than three in total).
+    // ============================================================================
+
+    inline bool extend_extrema_symmetric(
+        const int32_t *__restrict imax, int32_t n_max,
+        const int32_t *__restrict imin, int32_t n_min,
+        const double *__restrict x, int32_t n, int32_t nbsym,
+        double *__restrict tmax, double *__restrict zmax, int32_t &n_tmax,
+        double *__restrict tmin, double *__restrict zmin, int32_t &n_tmin)
+    {
+        n_tmax = n_tmin = 0;
+        if (n_max < 1 || n_min < 1 || n_max + n_min < 3 || n < 3 || nbsym < 1)
+            return false;
+
+        const int32_t last = n - 1;
+        // Index lists of the mirrored knots, in the order emd.m builds them
+        // (fliplr: nearest the boundary last on the left, first on the right)
+        int32_t lmax[64], lmin[64], rmax[64], rmin[64];
+        int32_t n_lmax = 0, n_lmin = 0, n_rmax = 0, n_rmin = 0;
+        nbsym = std::min(nbsym, 30);
+
+        // fliplr(v(a:b)) in 0-based form: v[b], v[b-1], ..., v[a]
+        auto take_rev = [](const int32_t *v, int32_t a, int32_t b, int32_t *out, int32_t &cnt)
+        {
+            for (int32_t i = b; i >= a; --i)
+                out[cnt++] = v[i];
+        };
+
+        int32_t lsym, rsym;
+        // ---- left edge ----
+        if (imax[0] < imin[0])
+        {
+            if (x[0] > x[imin[0]])
+            {
+                take_rev(imax, 1, std::min(n_max - 1, nbsym), lmax, n_lmax);
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+                lsym = imax[0];
+            }
+            else
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+                take_rev(imin, 0, std::min(n_min, nbsym - 1) - 1, lmin, n_lmin);
+                lmin[n_lmin++] = 0;
+                lsym = 0;
+            }
+        }
+        else
+        {
+            if (x[0] < x[imax[0]])
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+                take_rev(imin, 1, std::min(n_min - 1, nbsym), lmin, n_lmin);
+                lsym = imin[0];
+            }
+            else
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym - 1) - 1, lmax, n_lmax);
+                lmax[n_lmax++] = 0;
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+                lsym = 0;
+            }
+        }
+
+        // ---- right edge ----
+        if (imax[n_max - 1] < imin[n_min - 1])
+        {
+            if (x[last] < x[imax[n_max - 1]])
+            {
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym - 1, 0), n_min - 2, rmin, n_rmin);
+                rsym = imin[n_min - 1];
+            }
+            else
+            {
+                rmax[n_rmax++] = last;
+                take_rev(imax, std::max(n_max - nbsym + 1, 0), n_max - 1, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+                rsym = last;
+            }
+        }
+        else
+        {
+            if (x[last] > x[imin[n_min - 1]])
+            {
+                take_rev(imax, std::max(n_max - nbsym - 1, 0), n_max - 2, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+                rsym = imax[n_max - 1];
+            }
+            else
+            {
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+                rmin[n_rmin++] = last;
+                take_rev(imin, std::max(n_min - nbsym + 1, 0), n_min - 1, rmin, n_rmin);
+                rsym = last;
+            }
+        }
+
+        // ---- in case the symmetrized parts do not reach the ends ----
+        auto first_mirror = [](int32_t sym, const int32_t *l, int32_t cnt)
+        { return cnt > 0 ? 2.0 * sym - l[0] : -1.0; };
+        auto last_mirror = [](int32_t sym, const int32_t *r, int32_t cnt)
+        { return cnt > 0 ? 2.0 * sym - r[cnt - 1] : 1e300; };
+
+        if (first_mirror(lsym, lmin, n_lmin) > 0.0 || first_mirror(lsym, lmax, n_lmax) > 0.0)
+        {
+            if (lsym == 0)
+                return false; // emd.m: error('bug')
+            if (lsym == imax[0])
+            {
+                n_lmax = 0;
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+            }
+            else
+            {
+                n_lmin = 0;
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+            }
+            lsym = 0;
+        }
+        if (last_mirror(rsym, rmin, n_rmin) < last || last_mirror(rsym, rmax, n_rmax) < last)
+        {
+            if (rsym == last)
+                return false; // emd.m: error('bug')
+            if (rsym == imax[n_max - 1])
+            {
+                n_rmax = 0;
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+            }
+            else
+            {
+                n_rmin = 0;
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+            }
+            rsym = last;
+        }
+
+        // ---- assemble [mirrored left, extrema, mirrored right] ----
+        auto assemble = [&](const int32_t *l, int32_t nl, const int32_t *mid, int32_t nmid,
+                            const int32_t *r, int32_t nr, double *t, double *z, int32_t &cnt)
+        {
+            cnt = 0;
+            for (int32_t i = 0; i < nl; ++i)
+            {
+                t[cnt] = 2.0 * lsym - l[i];
+                z[cnt++] = x[l[i]];
+            }
+            for (int32_t i = 0; i < nmid; ++i)
+            {
+                t[cnt] = static_cast<double>(mid[i]);
+                z[cnt++] = x[mid[i]];
+            }
+            for (int32_t i = 0; i < nr; ++i)
+            {
+                t[cnt] = 2.0 * rsym - r[i];
+                z[cnt++] = x[r[i]];
+            }
+            // knots must increase strictly (a mirrored end sample can coincide
+            // with the first/last extremum's mirror only in degenerate cases)
+            int32_t w = 1;
+            for (int32_t i = 1; i < cnt; ++i)
+            {
+                if (t[i] > t[w - 1])
+                {
+                    t[w] = t[i];
+                    z[w++] = z[i];
+                }
+            }
+            cnt = (cnt > 0) ? w : 0;
+        };
+        assemble(lmax, n_lmax, imax, n_max, rmax, n_rmax, tmax, zmax, n_tmax);
+        assemble(lmin, n_lmin, imin, n_min, rmin, n_rmin, tmin, zmin, n_tmin);
+        return n_tmax >= 2 && n_tmin >= 2;
+    }
+
+    // ============================================================================
     // MKL Spline - With DF_UNIFORM_PARTITION Optimization
     // ============================================================================
 
@@ -491,9 +840,14 @@ namespace eemd
                 break;
             case SplineMethod::Cubic:
             default:
+                // Not-a-knot ends (the default of MATLAB's spline/interp1 and
+                // SciPy's CubicSpline, so of the reference ICEEMDAN code);
+                // natural free ends below 4 knots, where not-a-knot is undefined.
+                // Free ends force zero curvature at the outermost knots and
+                // flatten the envelopes near the signal edges.
                 s_order = DF_PP_CUBIC;
                 s_type = DF_PP_NATURAL;
-                bc_type = DF_BC_FREE_END;
+                bc_type = (n >= 4) ? DF_BC_NOT_A_KNOT : DF_BC_FREE_END;
                 break;
             }
 
@@ -640,14 +994,20 @@ namespace eemd
                 find_maxima_raw(work_.data, n, p_max, scratch_.n_max);
                 find_minima_raw(work_.data, n, p_min, scratch_.n_min);
 
+                const bool rilling = (config_.stop_rule == SiftStopRule::Rilling);
+
                 if (scratch_.n_max < 2 || scratch_.n_min < 2)
                 {
+                    // Rilling (as emd.m): a mode that runs out of extrema
+                    // mid-sift is kept as it stands
+                    if (rilling && iter > 0)
+                        break;
                     return false;
                 }
 
                 // S-number criterion: track consecutive stable extrema counts
                 const int32_t n_extrema = scratch_.n_max + scratch_.n_min;
-                if (config_.s_number > 0)
+                if (!rilling && config_.s_number > 0)
                 {
                     if (n_extrema == prev_n_extrema)
                     {
@@ -665,41 +1025,76 @@ namespace eemd
                     }
                 }
 
-                // Upper envelope
-                extend_extrema_raw(p_max, scratch_.n_max, work_.data, n,
-                                   config_.boundary_extend, p_ext_x, p_ext_y,
-                                   scratch_.n_ext, scratch_.ext_start);
-
-                if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                if (config_.symmetric_boundary)
                 {
-                    return false;
+                    double *p_ext_x2 = scratch_.ext_x2.data();
+                    double *p_ext_y2 = scratch_.ext_y2.data();
+                    const bool ok =
+                        extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
+                                                 work_.data, n, config_.boundary_extend,
+                                                 p_ext_x, p_ext_y, scratch_.n_ext,
+                                                 p_ext_x2, p_ext_y2, scratch_.n_ext2) &&
+                        upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method) &&
+                        upper_spline_.evaluate_uniform(upper_env_.data, n) &&
+                        lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2, config_.spline_method) &&
+                        lower_spline_.evaluate_uniform(lower_env_.data, n);
+                    if (!ok)
+                    {
+                        if (rilling && iter > 0)
+                            break; // keep the mode as it stands (emd.m)
+                        return false;
+                    }
                 }
-                if (!upper_spline_.evaluate_uniform(upper_env_.data, n))
+                else
                 {
-                    return false;
+                    // Upper envelope
+                    extend_extrema_raw(p_max, scratch_.n_max, work_.data, n,
+                                       config_.boundary_extend, p_ext_x, p_ext_y,
+                                       scratch_.n_ext, scratch_.ext_start);
+
+                    if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                    {
+                        return false;
+                    }
+                    if (!upper_spline_.evaluate_uniform(upper_env_.data, n))
+                    {
+                        return false;
+                    }
+
+                    // Lower envelope (reuse ext buffers)
+                    extend_extrema_raw(p_min, scratch_.n_min, work_.data, n,
+                                       config_.boundary_extend, p_ext_x, p_ext_y,
+                                       scratch_.n_ext, scratch_.ext_start);
+
+                    if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                    {
+                        return false;
+                    }
+                    if (!lower_spline_.evaluate_uniform(lower_env_.data, n))
+                    {
+                        return false;
+                    }
                 }
 
-                // Lower envelope (reuse ext buffers)
-                extend_extrema_raw(p_min, scratch_.n_min, work_.data, n,
-                                   config_.boundary_extend, p_ext_x, p_ext_y,
-                                   scratch_.n_ext, scratch_.ext_start);
+                const double *__restrict upper = upper_env_.data;
+                const double *__restrict lower = lower_env_.data;
+                double *__restrict w = work_.data;
 
-                if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                if (rilling)
                 {
-                    return false;
-                }
-                if (!lower_spline_.evaluate_uniform(lower_env_.data, n))
-                {
-                    return false;
+                    if (rilling_should_stop(w, upper, lower, n, n_extrema, config_.rilling))
+                        break;
+                    EEMD_OMP_SIMD
+                    for (int32_t i = 0; i < n; ++i)
+                    {
+                        w[i] -= 0.5 * (upper[i] + lower[i]);
+                    }
+                    continue;
                 }
 
                 // Fused: compute mean, update work, calculate SD in single pass
                 double sd_num = 0.0;
                 double sd_den = 0.0;
-
-                const double *__restrict upper = upper_env_.data;
-                const double *__restrict lower = lower_env_.data;
-                double *__restrict w = work_.data;
 
                 EEMD_OMP_SIMD_REDUCTION2(+, sd_num, sd_den)
                 for (int32_t i = 0; i < n; ++i)
@@ -810,23 +1205,32 @@ namespace eemd
 
             int32_t global_max_imfs = 0;
 
+            // Per-thread sums, reduced afterwards in thread-id order (not in
+            // the arrival order of a critical section), so a given thread count
+            // always produces the same result bit for bit. Each trial's noise
+            // comes from its own stream (trial_gaussian), so the noise of every
+            // trial is the same at any thread count.
+            const int32_t n_threads_max = omp_get_max_threads();
+            std::vector<std::vector<AlignedBuffer<double>>> thread_sums(n_threads_max);
+            std::vector<int32_t> thread_max_imfs(n_threads_max, 0);
+            int32_t n_threads_used = 1;
+
 #pragma omp parallel
             {
                 const int32_t tid = omp_get_thread_num();
+#pragma omp single
+                n_threads_used = omp_get_num_threads();
 
                 // Thread-local accumulator
-                std::vector<AlignedBuffer<double>> thread_sum(max_imfs);
+                std::vector<AlignedBuffer<double>> &thread_sum = thread_sums[tid];
+                thread_sum.resize(max_imfs);
                 for (auto &buf : thread_sum)
                 {
                     buf.resize(n);
                     buf.zero();
                 }
 
-                int32_t thread_max_imfs = 0;
-
-                // Thread-local RNG
-                VSLStreamStatePtr stream = nullptr;
-                vslNewStream(&stream, VSL_BRNG_MT19937, config_.rng_seed + tid * 1000);
+                int32_t local_max_imfs = 0;
 
                 // Thread-local buffers
                 AlignedBuffer<double> noisy_signal(n);
@@ -842,9 +1246,12 @@ namespace eemd
 #pragma omp for schedule(static)
                 for (int32_t trial = 0; trial < config_.ensemble_size; ++trial)
                 {
-                    // Generate noise
-                    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                                  n, noise.data, 0.0, noise_amplitude);
+                    // Generate this trial's noise (depends on seed and trial only)
+                    if (!trial_gaussian(config_.rng_seed, static_cast<uint32_t>(trial),
+                                        n, noise.data, 0.0, noise_amplitude))
+                    {
+                        noise.zero();
+                    }
 
                     // Add noise
                     const double *__restrict sig = signal;
@@ -868,7 +1275,7 @@ namespace eemd
                         ++imf_count;
                     }
 
-                    thread_max_imfs = std::max(thread_max_imfs, imf_count);
+                    local_max_imfs = std::max(local_max_imfs, imf_count);
 
                     // Thread-local accumulation
                     for (int32_t k = 0; k < imf_count; ++k)
@@ -884,25 +1291,28 @@ namespace eemd
                     }
                 }
 
-                vslDeleteStream(&stream);
+                thread_max_imfs[tid] = local_max_imfs;
 
-// Single critical section per thread
-#pragma omp critical
+                // Ordered reduction: element i sums threads 0, 1, 2, ... in turn
+                for (int32_t k = 0; k < max_imfs; ++k)
                 {
-                    global_max_imfs = std::max(global_max_imfs, thread_max_imfs);
-
-                    for (int32_t k = 0; k < max_imfs; ++k)
+                    double *__restrict gs = global_sum[k].data;
+#pragma omp for schedule(static)
+                    for (int32_t i = 0; i < n; ++i)
                     {
-                        double *__restrict gs = global_sum[k].data;
-                        const double *__restrict ts = thread_sum[k].data;
-
-                        EEMD_OMP_SIMD
-                        for (int32_t i = 0; i < n; ++i)
+                        double acc = 0.0;
+                        for (int32_t t = 0; t < n_threads_used; ++t)
                         {
-                            gs[i] += ts[i];
+                            acc += thread_sums[t][k].data[i];
                         }
+                        gs[i] += acc;
                     }
                 }
+            }
+
+            for (int32_t t = 0; t < n_threads_used; ++t)
+            {
+                global_max_imfs = std::max(global_max_imfs, thread_max_imfs[t]);
             }
 
             n_imfs = global_max_imfs;
@@ -971,79 +1381,39 @@ namespace eemd
     // Hilbert Transform - Instantaneous Frequency
     // ============================================================================
 
+    /**
+     * Hilbert transform y = H{x} (imaginary part of the analytic signal).
+     * Any n >= 1; FFTs through eemd_fft.hpp (VectorFFT or MKL DFTI).
+     */
+    inline bool compute_hilbert_transform(const double *signal, int32_t n, double *hilbert_out)
+    {
+        return fft::hilbert(signal, n, hilbert_out);
+    }
+
+    /**
+     * Instantaneous frequency (cycles per unit of 1/sample_rate) from the
+     * phase increments of the analytic signal x + i H{x}.
+     * inst_freq must hold n values; n >= 3.
+     */
     inline bool compute_instantaneous_frequency(
         const double *imf,
         int32_t n,
         double *inst_freq,
         double sample_rate = 1.0)
     {
-        AlignedBuffer<MKL_Complex16> fft_in(n);
-        AlignedBuffer<MKL_Complex16> fft_out(n);
-        AlignedBuffer<MKL_Complex16> analytic(n);
-
-        for (int32_t i = 0; i < n; ++i)
-        {
-            fft_in[i].real = imf[i];
-            fft_in[i].imag = 0.0;
-        }
-
-        DFTI_DESCRIPTOR_HANDLE desc = nullptr;
-        MKL_LONG status = DftiCreateDescriptor(&desc, DFTI_DOUBLE, DFTI_COMPLEX, 1, n);
-        if (status != DFTI_NO_ERROR)
+        if (n < 3)
             return false;
 
-        DftiSetValue(desc, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-        status = DftiCommitDescriptor(desc);
-        if (status != DFTI_NO_ERROR)
-        {
-            DftiFreeDescriptor(&desc);
-            return false;
-        }
-
-        status = DftiComputeForward(desc, fft_in.data, fft_out.data);
-        if (status != DFTI_NO_ERROR)
-        {
-            DftiFreeDescriptor(&desc);
-            return false;
-        }
-
-        // Hilbert transform
-        analytic[0] = fft_out[0];
-        const int32_t half = n / 2;
-
-        for (int32_t i = 1; i < half; ++i)
-        {
-            analytic[i].real = 2.0 * fft_out[i].real;
-            analytic[i].imag = 2.0 * fft_out[i].imag;
-        }
-
-        if (n % 2 == 0)
-        {
-            analytic[half] = fft_out[half];
-        }
-
-        for (int32_t i = half + 1; i < n; ++i)
-        {
-            analytic[i].real = 0.0;
-            analytic[i].imag = 0.0;
-        }
-
-        status = DftiComputeBackward(desc, analytic.data, fft_in.data);
-        DftiFreeDescriptor(&desc);
-        if (status != DFTI_NO_ERROR)
+        thread_local std::vector<double> h;
+        h.resize(static_cast<size_t>(n));
+        if (!fft::hilbert(imf, n, h.data()))
             return false;
 
-        const double scale = 1.0 / n;
         const double freq_scale = sample_rate / (2.0 * M_PI);
 
         for (int32_t i = 1; i < n - 1; ++i)
         {
-            const double ar = fft_in[i].real * scale;
-            const double ai = fft_in[i].imag * scale;
-            const double ar_next = fft_in[i + 1].real * scale;
-            const double ai_next = fft_in[i + 1].imag * scale;
-
-            double dphase = std::atan2(ai_next, ar_next) - std::atan2(ai, ar);
+            double dphase = std::atan2(h[i + 1], imf[i + 1]) - std::atan2(h[i], imf[i]);
 
             while (dphase > M_PI)
                 dphase -= 2.0 * M_PI;

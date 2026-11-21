@@ -72,6 +72,10 @@ class BoundaryMethod(IntEnum):
     AR = 1
     LINEAR = 2
 
+class LocalMeanMethod(IntEnum):
+    SIFTED = 0           # Colominas et al. (2014): first mode sifted to convergence (default)
+    SINGLE_ENVELOPE = 1  # one envelope mean per trial: faster, not the published algorithm
+
 # ============================================================================
 # Library Loading
 # ============================================================================
@@ -104,13 +108,18 @@ def _load_library() -> ctypes.CDLL:
         Path.cwd() / "build",
     ]
     
+    # MKL loads its CPU-specific kernels (libmkl_avx2.so, ...) at run time and
+    # resolves them against libmkl_core: on Linux/macOS the library must be
+    # loaded with RTLD_GLOBAL, or MKL aborts with "Error on loading function".
+    load_mode = 0 if system == "Windows" else ctypes.RTLD_GLOBAL
+
     errors = []
     for search_path in search_paths:
         for lib_name in lib_names:
             lib_path = search_path / lib_name
             if lib_path.exists():
                 try:
-                    return ctypes.CDLL(str(lib_path))
+                    return ctypes.CDLL(str(lib_path), mode=load_mode)
                 except OSError as e:
                     errors.append(f"{lib_path}: {e}")
                     continue
@@ -118,7 +127,7 @@ def _load_library() -> ctypes.CDLL:
     # Try system paths
     for lib_name in lib_names:
         try:
-            return ctypes.CDLL(lib_name)
+            return ctypes.CDLL(lib_name, mode=load_mode)
         except OSError as e:
             errors.append(f"{lib_name} (system): {e}")
             continue
@@ -161,6 +170,7 @@ _lib.iceemdan_set_s_number.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_spline_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_volatility_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_boundary_method.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_local_mean_method.argtypes = [_HandlePtr, ctypes.c_int]
 
 # Decomposition
 _lib.iceemdan_decompose.argtypes = [_HandlePtr, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
@@ -197,6 +207,17 @@ _lib.iceemdan_get_rng_seed_used.restype = ctypes.c_uint
 
 _lib.iceemdan_get_valid.argtypes = [_HandlePtr]
 _lib.iceemdan_get_valid.restype = ctypes.c_int
+
+for _name, _restype in [('iceemdan_get_imf_sift_iterations', ctypes.c_int),
+                        ('iceemdan_get_imf_mean_sift_iterations', ctypes.c_double),
+                        ('iceemdan_get_imf_nonconverged_trials', ctypes.c_int),
+                        ('iceemdan_get_imf_trials', ctypes.c_int),
+                        ('iceemdan_get_imf_converged', ctypes.c_int)]:
+    getattr(_lib, _name).argtypes = [_HandlePtr, ctypes.c_int]
+    getattr(_lib, _name).restype = _restype
+
+_lib.iceemdan_fft_backend.argtypes = [ctypes.c_int]
+_lib.iceemdan_fft_backend.restype = ctypes.c_char_p
 
 _lib.iceemdan_get_error.argtypes = [_HandlePtr]
 _lib.iceemdan_get_error.restype = ctypes.c_char_p
@@ -351,6 +372,16 @@ class ICEEMDAN:
     def boundary_method(self, value: BoundaryMethod):
         _lib.iceemdan_set_boundary_method(self._handle, int(value))
         self._boundary_method = value
+
+    @property
+    def local_mean_method(self) -> LocalMeanMethod:
+        """Local-mean operator: SIFTED (published algorithm, default) or SINGLE_ENVELOPE (faster)."""
+        return self._local_mean_method if hasattr(self, '_local_mean_method') else LocalMeanMethod.SIFTED
+
+    @local_mean_method.setter
+    def local_mean_method(self, value: LocalMeanMethod):
+        _lib.iceemdan_set_local_mean_method(self._handle, int(value))
+        self._local_mean_method = value
     
     # ========================================================================
     # Decomposition
@@ -384,6 +415,11 @@ class ICEEMDAN:
             - nan_count: Number of NaN/Inf values sanitized
             - rng_seed_used: Actual RNG seed used
             - valid: True if decomposition succeeded
+            - sift_iterations: per IMF, most sifting iterations any trial needed
+            - mean_sift_iterations: per IMF, mean iterations per trial
+            - nonconverged_trials: per IMF, trials that hit max_sift_iters
+            - converged: per IMF, True if no trial hit max_sift_iters
+            - trials_per_imf: per IMF, local means averaged
         
         Examples
         --------
@@ -428,6 +464,11 @@ class ICEEMDAN:
                 'nan_count': _lib.iceemdan_get_nan_count(self._handle),
                 'rng_seed_used': _lib.iceemdan_get_rng_seed_used(self._handle),
                 'valid': bool(_lib.iceemdan_get_valid(self._handle)),
+                'sift_iterations': [_lib.iceemdan_get_imf_sift_iterations(self._handle, k) for k in range(num_imfs)],
+                'mean_sift_iterations': [_lib.iceemdan_get_imf_mean_sift_iterations(self._handle, k) for k in range(num_imfs)],
+                'nonconverged_trials': [_lib.iceemdan_get_imf_nonconverged_trials(self._handle, k) for k in range(num_imfs)],
+                'converged': [bool(_lib.iceemdan_get_imf_converged(self._handle, k)) for k in range(num_imfs)],
+                'trials_per_imf': [_lib.iceemdan_get_imf_trials(self._handle, k) for k in range(num_imfs)],
             }
             return imfs, residue, diag
         
@@ -547,6 +588,12 @@ def decompose(
 # Quick test
 # ============================================================================
 
+
+def fft_backend(n: int = 1024) -> str:
+    """Name of the FFT backend the library uses for length n ("VectorFFT" or "MKL DFTI")."""
+    return _lib.iceemdan_fft_backend(int(n)).decode('utf-8')
+
+
 if __name__ == "__main__":
     print(f"ICEEMDAN version: {version()}")
     
@@ -574,3 +621,4 @@ if __name__ == "__main__":
     snr = decomposer.snr_analysis(signal)
     print(f"SNR: {snr['snr']:.2f}")
     print(f"Noise fraction: {snr['noise_fraction']:.2%}")
+

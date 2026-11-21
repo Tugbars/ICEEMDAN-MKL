@@ -1,8 +1,12 @@
 /**
  * ICEEMDAN-MKL Optimized
  *
- * Optimizations over base implementation:
- * 1. Circular Noise Bank - 1 long decomposition vs M short ones (~5x init speedup)
+ * Algorithm: Colominas, Schlotthauer & Torres (2014). The defaults follow the
+ * authors' reference code: local means from sifting to convergence with the
+ * Rilling stop rule, independent noise realizations, beta_k as in the paper.
+ *
+ * Optional speed-ups (see ICEEMDANConfig):
+ * 1. Circular Noise Bank - 1 long decomposition vs M short ones (off by default)
  * 2. Antithetic Variables - Process ±noise pairs for 2x variance reduction
  * 3. Sorted Spline Evaluation - Faster than uniform for dense extrema (~2.8x)
  * 4. Spline Fast Path - Linear interp for n_extrema < 6
@@ -26,13 +30,14 @@ namespace eemd
     /**
      * Processing modes with automatic defaults for different domains
      *
-     * Standard:   Smooth boundaries (mirror), global volatility, max quality
+     * Standard:   Smooth boundaries (symmetric), global volatility, max quality
      *             Best for: Audio, seismic, general signal processing
      *
      * Finance:    Causal boundaries (AR), EMA volatility, input sanitization
      *             Best for: Trading, HFT, regime-switching data
      *
      * Scientific: Reproducible, no shortcuts, strict convergence tracking
+     *             (symmetric boundaries, independent noise, no antithetic pairs)
      *             Best for: Research, publication, validation
      */
     enum class ProcessingMode : uint8_t
@@ -57,9 +62,29 @@ namespace eemd
      */
     enum class BoundaryMethod : uint8_t
     {
-        Mirror = 0, // Reflect extrema (smooth, slight look-ahead)
-        AR = 1,     // AR(1) extrapolation (causal, no look-ahead)
-        Linear = 2  // Linear extrapolation (simplest)
+        Mirror = 0,   // Reflect extrema + linear end points (original scheme)
+        AR = 1,       // AR(1) extrapolation (causal, no look-ahead)
+        Linear = 2,   // Linear extrapolation (simplest)
+        Symmetric = 3 // Symmetric extension of emd.m (Rilling et al. 2003), as in
+                      // the authors' reference code; stable under long sifting
+    };
+
+    /**
+     * Local-mean operator M(.) of the ICEEMDAN stages
+     *
+     * Sifted:         M(x) = x - E1(x), with E1 the first EMD mode sifted to
+     *                 convergence (SD threshold, S-number, max_sift_iters).
+     *                 This is the operator of Colominas et al. (2014) and of
+     *                 their reference implementation. Default.
+     * SingleEnvelope: M(x) = mean of the upper and lower envelopes of x, i.e.
+     *                 one sifting iteration. Several times faster, but each
+     *                 mode is under-sifted, so the IMFs differ from published
+     *                 ICEEMDAN. For latency-bound uses that accept that.
+     */
+    enum class LocalMeanMethod : uint8_t
+    {
+        Sifted = 0,
+        SingleEnvelope = 1
     };
 
     // ============================================================================
@@ -103,10 +128,31 @@ namespace eemd
         // Set to 0 to disable (use only SD criterion).
         int32_t s_number = 6;
 
+        // Local-mean operator (see LocalMeanMethod). Sifted = the published
+        // algorithm; SingleEnvelope = the faster one-iteration approximation.
+        LocalMeanMethod local_mean_method = LocalMeanMethod::Sifted;
+
+        // When sifting stops, for the local means and for the noise modes
+        // (see SiftStopRule). Rilling = the criterion of the authors'
+        // reference code (default); SD = sift_threshold + s_number, cheaper.
+        SiftStopRule sift_stop_rule = SiftStopRule::Rilling;
+        RillingThresholds rilling;
+
         // === Optimization Flags ===
         bool use_antithetic = true;        // ±noise pairs (2x variance reduction)
-        bool use_circular_bank = true;     // Single long decomposition
+        // Noise modes from windows of ONE long decomposed realization instead
+        // of independent realizations. Off by default: the windows of a long
+        // realization overlap and their low-frequency modes are not those of a
+        // length-N realization, which visibly changes the low-frequency IMFs
+        // (see README, "Accuracy"); with the Rilling stop rule it is also not
+        // faster, since the long sift runs on one thread.
+        bool use_circular_bank = false;
         int32_t circular_multiplier = 20;  // Long buffer = N × multiplier
+        // Memory cap for the noise bank. The independent bank holds
+        // base_trials x max_imfs x N doubles; above the cap the circular bank
+        // is used instead (multiplier lowered, not below 4); if even that does
+        // not fit, decompose() fails instead of exhausting memory.
+        size_t noise_bank_max_bytes = size_t(2) << 30; // 2 GiB
         int32_t spline_fast_threshold = 6; // Linear interp if extrema < this
         
         // Spline method for envelope interpolation
@@ -125,9 +171,12 @@ namespace eemd
 
         // === Mode-Controlled Settings ===
         VolatilityMethod volatility_method = VolatilityMethod::Global;
-        BoundaryMethod boundary_method = BoundaryMethod::Mirror;
+        BoundaryMethod boundary_method = BoundaryMethod::Symmetric;
         bool sanitize_input = false;    // NaN/Inf protection
-        bool track_convergence = false; // Per-IMF iteration tracking
+        // Kept for API compatibility: convergence statistics are now always
+        // collected (the cost is a few integer adds per trial) and returned by
+        // decompose_with_diagnostics() / last_diagnostics().
+        bool track_convergence = false;
 
         // === Volatility Parameters ===
         int32_t vol_window = 50;   // SMA window size
@@ -150,11 +199,11 @@ namespace eemd
             case ProcessingMode::Standard:
                 // Audio/Seismic: prioritize smoothness
                 volatility_method = VolatilityMethod::Global;
-                boundary_method = BoundaryMethod::Mirror;
+                boundary_method = BoundaryMethod::Symmetric;
                 sanitize_input = false;
                 track_convergence = false;
                 use_antithetic = true;
-                use_circular_bank = true;
+                use_circular_bank = false;
                 adaptive_ensemble = false;  // Disabled - marginal benefit
                 break;
 
@@ -165,7 +214,7 @@ namespace eemd
                 sanitize_input = true;
                 track_convergence = true; // For risk engine
                 use_antithetic = true;
-                use_circular_bank = true;
+                use_circular_bank = false;
                 adaptive_ensemble = false;  // Disabled - marginal benefit
                 spline_method = SplineMethod::Akima;  // Outlier-resistant (falls back to Cubic if needed)
                 vol_ema_span = 20;
@@ -176,7 +225,7 @@ namespace eemd
             case ProcessingMode::Scientific:
                 // Research: prioritize reproducibility
                 volatility_method = VolatilityMethod::Global;
-                boundary_method = BoundaryMethod::Mirror;
+                boundary_method = BoundaryMethod::Symmetric;
                 sanitize_input = true;
                 track_convergence = true;
                 use_antithetic = false;    // No variance tricks
@@ -188,18 +237,23 @@ namespace eemd
     };
 
     /**
-     * Diagnostic metadata for SR 11-7 compliance
-     * Must be logged with every trade signal
+     * Diagnostic metadata for audit trails (e.g. model-risk review).
+     * Filled by every decompose(); returned by decompose_with_diagnostics()
+     * and last_diagnostics().
      */
     struct DecompositionDiagnostics
     {
         double orthogonality_index = 0.0;     // IO metric (lower = better)
-        std::vector<int32_t> sift_iterations; // Per-IMF iteration count
-        std::vector<bool> convergence_flags;  // True if converged within max_iters
-        std::vector<int32_t> trials_per_imf;  // Actual trials used per IMF (adaptive)
+        std::vector<int32_t> sift_iterations; // Per-IMF: most sifting iterations any trial needed
+        std::vector<double> mean_sift_iterations; // Per-IMF: mean iterations per trial
+        std::vector<int32_t> nonconverged_trials; // Per-IMF: trials that hit max_sift_iters
+        std::vector<bool> convergence_flags;  // Per-IMF: true if no trial hit max_sift_iters
+        std::vector<int32_t> trials_per_imf;  // Per-IMF: local means averaged (valid trials)
         int32_t nan_count = 0;                // Input NaN/Inf count (sanitized)
         uint32_t rng_seed_used = 0;           // For audit trail reproducibility
         ProcessingMode mode_used = ProcessingMode::Standard;
+        LocalMeanMethod local_mean_method_used = LocalMeanMethod::Sifted;
+        int32_t noise_bank_multiplier = 0;    // Circular bank length / N (0 = independent realizations)
         bool valid = true; // False if decomposition failed
     };
 
@@ -228,20 +282,10 @@ namespace eemd
         return ratio > 0.95;
     }
 
+    /** Local maxima plus minima, plateau-aware (same rule as the sifting). */
     inline int32_t count_extrema(const double *signal, int32_t n)
     {
-        if (n < 3)
-            return 0;
-
-        int32_t count = 0;
-        for (int32_t i = 1; i < n - 1; ++i)
-        {
-            bool is_max = (signal[i] > signal[i - 1]) && (signal[i] > signal[i + 1]);
-            bool is_min = (signal[i] < signal[i - 1]) && (signal[i] < signal[i + 1]);
-            if (is_max || is_min)
-                ++count;
-        }
-        return count;
+        return count_extrema_raw(signal, n);
     }
 
     inline double compute_std(const double *signal, int32_t n)
@@ -397,65 +441,50 @@ namespace eemd
      * Returns count of sanitized points (for diagnostics)
      *
      * CRITICAL: MKL spline functions crash on NaN/Inf input
+     *
+     * Uses is_finite_bits(), which -ffast-math cannot optimize away (with
+     * std::isfinite the whole check compiled to nothing under the project's
+     * own GCC flags). One pass over each run of bad samples: O(n).
      */
     inline int32_t sanitize_signal(double *signal, int32_t n)
     {
         int32_t nan_count = 0;
+        int32_t prev_good = -1; // index of the last finite sample
 
-        // First pass: identify bad values
-        std::vector<bool> is_bad(n, false);
-        for (int32_t i = 0; i < n; ++i)
+        int32_t i = 0;
+        while (i < n)
         {
-            if (!std::isfinite(signal[i]))
+            if (is_finite_bits(signal[i]))
             {
-                is_bad[i] = true;
-                ++nan_count;
-            }
-        }
-
-        if (nan_count == 0)
-            return 0;
-        if (nan_count == n)
-        {
-            // All bad - fill with zeros
-            std::memset(signal, 0, n * sizeof(double));
-            return nan_count;
-        }
-
-        // Second pass: linear interpolation from nearest good neighbors
-        for (int32_t i = 0; i < n; ++i)
-        {
-            if (!is_bad[i])
+                prev_good = i++;
                 continue;
+            }
 
-            // Find previous good value
-            int32_t prev = i - 1;
-            while (prev >= 0 && is_bad[prev])
-                --prev;
-
-            // Find next good value
-            int32_t next = i + 1;
-            while (next < n && is_bad[next])
+            // Bad run [i, next)
+            int32_t next = i;
+            while (next < n && !is_finite_bits(signal[next]))
                 ++next;
+            nan_count += next - i;
 
-            if (prev < 0 && next >= n)
+            if (prev_good < 0 && next >= n)
             {
-                signal[i] = 0.0; // Should not happen (caught above)
+                std::memset(signal, 0, n * sizeof(double)); // all bad
+                return nan_count;
             }
-            else if (prev < 0)
+
+            for (int32_t j = i; j < next; ++j)
             {
-                signal[i] = signal[next]; // Extrapolate from right
+                if (prev_good < 0)
+                    signal[j] = signal[next]; // extrapolate from the right
+                else if (next >= n)
+                    signal[j] = signal[prev_good]; // extrapolate from the left
+                else
+                {
+                    const double t = static_cast<double>(j - prev_good) / (next - prev_good);
+                    signal[j] = signal[prev_good] + t * (signal[next] - signal[prev_good]);
+                }
             }
-            else if (next >= n)
-            {
-                signal[i] = signal[prev]; // Extrapolate from left
-            }
-            else
-            {
-                // Linear interpolation
-                double t = static_cast<double>(i - prev) / (next - prev);
-                signal[i] = signal[prev] + t * (signal[next] - signal[prev]);
-            }
+            i = next;
         }
 
         return nan_count;
@@ -745,7 +774,26 @@ namespace eemd
     // - Uses sorted evaluation (faster for dense extrema)
     // - Falls back to linear interp for sparse extrema
     // - Optional causal right-edge for finance (AR extrapolation)
+    // - Sifted mode: M(x) = x - E1(x), E1 sifted to convergence (the operator
+    //   of Colominas et al. 2014); SingleEnvelope mode: one envelope mean
     // ============================================================================
+
+    /** What one local-mean computation cost. */
+    struct SiftStats
+    {
+        int32_t iterations = 0; // envelope means subtracted
+        bool converged = true;  // false: stopped by max_sift_iters
+    };
+
+    /** Sifting parameters of the Sifted local-mean operator. */
+    struct SiftParams
+    {
+        int32_t max_iters = 100;
+        double threshold = 0.05; // SD rule: sum(m^2) / sum(h^2)
+        int32_t s_number = 6;    // SD rule: stop after S iterations with a stable extrema count (0 = off)
+        SiftStopRule rule = SiftStopRule::Rilling;
+        RillingThresholds rilling;
+    };
 
     class LocalMeanComputer
     {
@@ -755,7 +803,9 @@ namespace eemd
                                    BoundaryMethod boundary_method = BoundaryMethod::Mirror,
                                    int32_t ar_lookback = 5,
                                    double ar_damping = 0.5, double ar_max_slope_atr = 2.0,
-                                   SplineMethod spline_method = SplineMethod::Cubic)
+                                   SplineMethod spline_method = SplineMethod::Cubic,
+                                   LocalMeanMethod method = LocalMeanMethod::Sifted,
+                                   SiftParams sift = SiftParams())
             : max_len_(max_len),
               boundary_extend_(boundary_extend),
               fast_threshold_(fast_threshold),
@@ -764,13 +814,18 @@ namespace eemd
               ar_damping_(ar_damping),
               ar_max_slope_atr_(ar_max_slope_atr),
               spline_method_(spline_method),
+              method_(method),
+              sift_(sift),
               max_idx_(max_len / 2 + 2),
               min_idx_(max_len / 2 + 2),
-              ext_x_(max_len + 20),
-              ext_y_(max_len + 20),
+              ext_x_(max_len + 128),
+              ext_y_(max_len + 128),
+              ext_x2_(max_len + 128),
+              ext_y2_(max_len + 128),
+              eval_sites_(max_len),
               upper_env_(max_len),
               lower_env_(max_len),
-              eval_sites_(max_len)
+              h_(method == LocalMeanMethod::Sifted ? max_len : 0)
         {
             // Pre-compute evaluation sites [0, 1, 2, ..., max_len-1]
             for (int32_t i = 0; i < max_len; ++i)
@@ -779,43 +834,97 @@ namespace eemd
             }
         }
 
-        bool compute(const double *signal, int32_t n, double *local_mean)
+        /**
+         * local_mean = M(signal). Returns false when the signal has too few
+         * extrema to build envelopes (local_mean is then a copy of signal and
+         * the trial should not be averaged).
+         */
+        bool compute(const double *signal, int32_t n, double *local_mean, SiftStats *stats = nullptr)
+        {
+            if (method_ == LocalMeanMethod::Sifted)
+                return compute_sifted(signal, n, local_mean, stats);
+
+            if (stats)
+            {
+                stats->iterations = 1;
+                stats->converged = true;
+            }
+            return envelope_mean(signal, n, local_mean);
+        }
+
+        int32_t get_n_extrema() const { return n_max_ + n_min_; }
+
+    private:
+        /**
+         * Mean of the upper and lower envelopes of x (one sifting step).
+         * Leaves the extrema counts of x in n_max_ / n_min_.
+         */
+        bool envelope_mean(const double *x, int32_t n, double *out_mean)
         {
             // Find extrema
-            find_maxima_raw(signal, n, max_idx_.data(), n_max_);
-            find_minima_raw(signal, n, min_idx_.data(), n_min_);
+            find_maxima_raw(x, n, max_idx_.data(), n_max_);
+            find_minima_raw(x, n, min_idx_.data(), n_min_);
 
             if (n_max_ < 2 || n_min_ < 2)
             {
-                std::memcpy(local_mean, signal, n * sizeof(double));
+                std::memcpy(out_mean, x, n * sizeof(double));
                 return false;
+            }
+            return envelope_mean_from_extrema(x, n, out_mean);
+        }
+
+        bool envelope_mean_from_extrema(const double *x, int32_t n, double *out_mean)
+        {
+            if (boundary_method_ == BoundaryMethod::Symmetric)
+            {
+                int32_t n_up = 0, n_lo = 0;
+                const bool ok =
+                    extend_extrema_symmetric(max_idx_.data(), n_max_, min_idx_.data(), n_min_, x, n,
+                                             boundary_extend_, ext_x_.data(), ext_y_.data(), n_up,
+                                             ext_x2_.data(), ext_y2_.data(), n_lo) &&
+                    compute_envelope(ext_x_.data(), ext_y_.data(), n_up, upper_env_.data, n) &&
+                    compute_envelope(ext_x2_.data(), ext_y2_.data(), n_lo, lower_env_.data, n);
+                if (!ok)
+                {
+                    std::memcpy(out_mean, x, n * sizeof(double));
+                    return false;
+                }
+                const double *__restrict upper = upper_env_.data;
+                const double *__restrict lower = lower_env_.data;
+                double *__restrict out = out_mean;
+                EEMD_OMP_SIMD
+                for (int32_t i = 0; i < n; ++i)
+                {
+                    out[i] = 0.5 * (upper[i] + lower[i]);
+                }
+                return true;
             }
 
             // Upper envelope - dispatch based on boundary method
             int32_t n_ext, ext_start;
-            extend_extrema(max_idx_.data(), n_max_, signal, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
+            extend_extrema(max_idx_.data(), n_max_, x, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
 
             if (!compute_envelope(ext_x_.data(), ext_y_.data(), n_ext,
                                   upper_env_.data, n))
             {
-                std::memcpy(local_mean, signal, n * sizeof(double));
+                std::memcpy(out_mean, x, n * sizeof(double));
                 return false;
             }
 
             // Lower envelope
-            extend_extrema(min_idx_.data(), n_min_, signal, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
+            extend_extrema(min_idx_.data(), n_min_, x, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
 
             if (!compute_envelope(ext_x_.data(), ext_y_.data(), n_ext,
                                   lower_env_.data, n))
             {
-                std::memcpy(local_mean, signal, n * sizeof(double));
+                std::memcpy(out_mean, x, n * sizeof(double));
                 return false;
             }
 
             // Local mean = (upper + lower) / 2
             const double *__restrict upper = upper_env_.data;
             const double *__restrict lower = lower_env_.data;
-            double *__restrict out = local_mean;
+            double *__restrict out = out_mean;
 
             EEMD_OMP_SIMD
             for (int32_t i = 0; i < n; ++i)
@@ -826,9 +935,136 @@ namespace eemd
             return true;
         }
 
-        int32_t get_n_extrema() const { return n_max_ + n_min_; }
+        /**
+         * M(x) = x - E1(x): sift the first mode to convergence and return what
+         * is left. Same stopping rules as Sifter::sift_imf (SiftStopRule: SD
+         * with S-number and extrema ~ zero crossings, or Rilling; max_iters).
+         * A step that cannot build envelopes after the first iteration ends
+         * the sifting and keeps the mode as it stands (as Rilling & Flandrin's
+         * emd.m does); only a first step that cannot is a failure.
+         */
+        bool compute_sifted(const double *signal, int32_t n, double *local_mean, SiftStats *stats)
+        {
+            double *__restrict h = h_.data;
+            std::memcpy(h, signal, n * sizeof(double));
 
-    private:
+            int32_t prev_n_extrema = -1;
+            int32_t s_count = 0;
+            int32_t iterations = 0;
+            bool converged = false;
+
+            for (int32_t iter = 0; iter < sift_.max_iters; ++iter)
+            {
+                find_maxima_raw(h, n, max_idx_.data(), n_max_);
+                find_minima_raw(h, n, min_idx_.data(), n_min_);
+
+                if (n_max_ < 2 || n_min_ < 2)
+                {
+                    if (iter == 0)
+                    {
+                        std::memcpy(local_mean, signal, n * sizeof(double));
+                        return false;
+                    }
+                    converged = true; // nothing left to sift
+                    break;
+                }
+
+                const int32_t n_extrema = n_max_ + n_min_;
+                const bool rilling = (sift_.rule == SiftStopRule::Rilling);
+                if (!rilling && sift_.s_number > 0)
+                {
+                    if (n_extrema == prev_n_extrema)
+                    {
+                        if (++s_count >= sift_.s_number)
+                        {
+                            converged = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        s_count = 0;
+                        prev_n_extrema = n_extrema;
+                    }
+                }
+
+                // local_mean doubles as the envelope-mean scratch here
+                if (!envelope_mean_from_extrema(h, n, local_mean))
+                {
+                    if (iter == 0)
+                    {
+                        std::memcpy(local_mean, signal, n * sizeof(double));
+                        return false;
+                    }
+                    break; // keep the mode as it stands
+                }
+
+                if (rilling)
+                {
+                    if (rilling_should_stop(h, upper_env_.data, lower_env_.data, n, n_extrema, sift_.rilling))
+                    {
+                        converged = true;
+                        break;
+                    }
+                    const double *__restrict m = local_mean;
+                    EEMD_OMP_SIMD
+                    for (int32_t i = 0; i < n; ++i)
+                    {
+                        h[i] -= m[i];
+                    }
+                    ++iterations;
+                    continue;
+                }
+
+                // Fused: SD criterion and h -= m in one pass
+                double sd_num = 0.0;
+                double sd_den = 0.0;
+                const double *__restrict m = local_mean;
+
+                EEMD_OMP_SIMD_REDUCTION2(+, sd_num, sd_den)
+                for (int32_t i = 0; i < n; ++i)
+                {
+                    const double val = h[i];
+                    const double mean = m[i];
+                    sd_num += mean * mean;
+                    sd_den += val * val;
+                    h[i] = val - mean;
+                }
+                ++iterations;
+
+                const double sd = (sd_den > 1e-15) ? sd_num / sd_den : 0.0;
+                if (sd < sift_.threshold)
+                {
+                    converged = true;
+                    break;
+                }
+
+                // Early termination: extrema ~ zero crossings
+                const int32_t n_zero = count_zero_crossings(h, n);
+                if (std::abs(n_extrema - n_zero) <= 1 && sd < sift_.threshold * 10)
+                {
+                    converged = true;
+                    break;
+                }
+            }
+
+            // M(x) = x - E1(x)
+            const double *__restrict x = signal;
+            double *__restrict out = local_mean;
+            EEMD_OMP_SIMD
+            for (int32_t i = 0; i < n; ++i)
+            {
+                out[i] = x[i] - h[i];
+            }
+
+            if (stats)
+            {
+                stats->iterations = iterations;
+                stats->converged = converged;
+            }
+            return true;
+        }
+
         /**
          * Dispatch extrema extension based on boundary method
          */
@@ -966,11 +1202,15 @@ namespace eemd
         double ar_damping_;
         double ar_max_slope_atr_;
         SplineMethod spline_method_;
+        LocalMeanMethod method_;
+        SiftParams sift_;
 
         std::vector<int32_t> max_idx_;
         std::vector<int32_t> min_idx_;
         std::vector<double> ext_x_;
         std::vector<double> ext_y_;
+        std::vector<double> ext_x2_; // second knot set (Symmetric builds both at once)
+        std::vector<double> ext_y2_;
         std::vector<double> eval_sites_;
 
         int32_t n_max_ = 0;
@@ -978,6 +1218,7 @@ namespace eemd
 
         AlignedBuffer<double> upper_env_;
         AlignedBuffer<double> lower_env_;
+        AlignedBuffer<double> h_; // mode being sifted (Sifted mode only)
 
         MKLSpline spline_;
     };
@@ -1005,63 +1246,88 @@ namespace eemd
     public:
         CircularNoiseBank() = default;
 
-        void initialize(int32_t n, int32_t ensemble_size, int32_t max_imfs,
+        /**
+         * Returns false (and stays uninitialized) when even the smallest
+         * buffer (multiplier 4) would exceed max_bytes.
+         */
+        bool initialize(int32_t n, int32_t ensemble_size, int32_t max_imfs,
                         const EEMDConfig &emd_config, uint32_t base_seed,
-                        int32_t multiplier = 20)
+                        int32_t multiplier = 20,
+                        size_t max_bytes = size_t(2) << 30)
         {
             n_ = n;
             max_imfs_ = max_imfs;
+            initialized_ = false;
 
             // Long buffer provides statistical variance without O(M) decomposition cost
             multiplier = std::max(multiplier, ensemble_size / 5);
-            long_n_ = n * multiplier;
-            max_offset_ = long_n_ - n_;
 
-            // Pre-compute all offsets to avoid modulo in hot path
-            // Uses ~80KB for 1000 trials × 10 IMFs (trivial)
+            // Memory cap: max_imfs buffers of N * multiplier doubles
+            const size_t bytes_per_unit = static_cast<size_t>(max_imfs) * static_cast<size_t>(n) * sizeof(double);
+            const size_t affordable = bytes_per_unit > 0 ? max_bytes / bytes_per_unit : 0;
+            if (static_cast<size_t>(multiplier) > affordable)
+            {
+                if (affordable < 4)
+                    return false;
+                multiplier = static_cast<int32_t>(std::min<size_t>(affordable, 1u << 30));
+            }
+            // The long buffer is sifted with int32 indices
+            const int64_t int_limit = (static_cast<int64_t>(INT32_MAX) - 64) / std::max(n, 1);
+            if (multiplier > int_limit)
+            {
+                if (int_limit < 4)
+                    return false;
+                multiplier = static_cast<int32_t>(int_limit);
+            }
+            multiplier_ = multiplier;
+            long_n_ = static_cast<int64_t>(n) * multiplier;
+            max_offset_ = static_cast<size_t>(long_n_ - n_);
+
+            // One window per trial, shared by every stage k: trial t uses the
+            // modes E_1..E_K of the SAME stretch of noise, as ICEEMDAN uses
+            // E_k(w^(t)) of one realization w^(t) at every stage.
             offset_table_.resize(ensemble_size);
             for (int32_t t = 0; t < ensemble_size; ++t)
             {
-                offset_table_[t].resize(max_imfs);
-                for (int32_t k = 0; k < max_imfs; ++k)
-                {
-                    // Deterministic hash using large primes
-                    size_t hash = static_cast<size_t>(t) * 486187739ULL +
-                                  static_cast<size_t>(k) * 2654435761ULL;
-                    offset_table_[t][k] = hash % max_offset_;
-                }
+                // Deterministic hash (splitmix64 finalizer) of the trial index
+                uint64_t z = static_cast<uint64_t>(t) + 0x9E3779B97F4A7C15ULL;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                z ^= z >> 31;
+                offset_table_[t] = static_cast<size_t>(z % max_offset_);
             }
 
             // Allocate master buffers [max_imfs][long_n]
             master_imfs_.resize(max_imfs);
             for (auto &buf : master_imfs_)
             {
-                buf.resize(long_n_);
+                buf.resize(static_cast<size_t>(long_n_));
             }
 
             // Generate ONE long white noise signal
-            AlignedBuffer<double> long_noise(long_n_);
-            AlignedBuffer<double> work(long_n_);
+            AlignedBuffer<double> long_noise(static_cast<size_t>(long_n_));
+            AlignedBuffer<double> work(static_cast<size_t>(long_n_));
 
             VSLStreamStatePtr stream = nullptr;
             vslNewStream(&stream, VSL_BRNG_MT19937, base_seed);
             vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                          long_n_, long_noise.data, 0.0, 1.0);
+                          static_cast<MKL_INT>(long_n_), long_noise.data, 0.0, 1.0);
             vslDeleteStream(&stream);
 
             // Decompose the long signal ONCE
-            Sifter sifter(long_n_, emd_config);
-            std::memcpy(work.data, long_noise.data, long_n_ * sizeof(double));
+            const int32_t long_n32 = static_cast<int32_t>(long_n_);
+            Sifter sifter(long_n32, emd_config);
+            std::memcpy(work.data, long_noise.data, static_cast<size_t>(long_n_) * sizeof(double));
 
             actual_imfs_ = 0;
             for (int32_t k = 0; k < max_imfs; ++k)
             {
-                if (!sifter.sift_imf(work.data, master_imfs_[k].data(), long_n_))
+                if (!sifter.sift_imf(work.data, master_imfs_[k].data(), long_n32))
                 {
                     // Fill remaining with zeros
                     for (int32_t z = k; z < max_imfs; ++z)
                     {
-                        std::memset(master_imfs_[z].data(), 0, long_n_ * sizeof(double));
+                        std::memset(master_imfs_[z].data(), 0, static_cast<size_t>(long_n_) * sizeof(double));
                     }
                     break;
                 }
@@ -1069,6 +1335,7 @@ namespace eemd
             }
 
             initialized_ = true;
+            return true;
         }
 
         /**
@@ -1083,20 +1350,22 @@ namespace eemd
                 return nullptr;
             }
 
-            return &master_imfs_[imf_idx][offset_table_[trial_idx][imf_idx]];
+            return &master_imfs_[imf_idx][offset_table_[trial_idx]];
         }
 
         int32_t get_actual_imfs() const { return actual_imfs_; }
+        int32_t multiplier() const { return multiplier_; }
         bool is_initialized() const { return initialized_; }
 
     private:
         int32_t n_ = 0;
-        int32_t long_n_ = 0;
+        int64_t long_n_ = 0;
         size_t max_offset_ = 0;
         int32_t max_imfs_ = 0;
         int32_t actual_imfs_ = 0;
+        int32_t multiplier_ = 0;
         bool initialized_ = false;
-        std::vector<std::vector<size_t>> offset_table_; // [trial][imf] → offset
+        std::vector<size_t> offset_table_; // [trial] -> offset, same for every stage
         std::vector<std::vector<double>> master_imfs_;
     };
 
@@ -1130,11 +1399,6 @@ namespace eemd
 
 #pragma omp parallel
             {
-                const int32_t tid = omp_get_thread_num();
-
-                VSLStreamStatePtr stream = nullptr;
-                vslNewStream(&stream, VSL_BRNG_MT19937, base_seed + tid * 10000);
-
                 AlignedBuffer<double> noise(n);
                 AlignedBuffer<double> work(n);
 
@@ -1143,8 +1407,11 @@ namespace eemd
 #pragma omp for schedule(static)
                 for (int32_t i = 0; i < ensemble_size; ++i)
                 {
-                    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                                  n, noise.data, 0.0, 1.0);
+                    // Realization i depends on (seed, i) only: the same at any thread count
+                    if (!trial_gaussian(base_seed, static_cast<uint32_t>(i), n, noise.data))
+                    {
+                        noise.zero();
+                    }
 
                     std::memcpy(work.data, noise.data, n * sizeof(double));
 
@@ -1159,8 +1426,6 @@ namespace eemd
                     }
                     imf_counts_[i] = imf_count;
                 }
-
-                vslDeleteStream(&stream);
             }
 
             initialized_ = true;
@@ -1211,10 +1476,19 @@ namespace eemd
         }
 
         /**
-         * Decompose signal into IMFs using optimized ICEEMDAN
+         * Decompose signal into IMFs using ICEEMDAN (Colominas et al. 2014)
+         *
+         *   r_0 = x
+         *   r_k = < M( r_{k-1} + beta_{k-1} E_k(w^(i)) ) >_i     (average over trials)
+         *   IMF_k = r_{k-1} - r_k
+         *   beta_0 = eps * std(x) / std(E_1(w^(i))),  beta_k = eps * std(r_k)  (k >= 1)
+         *
+         * with eps = noise_std (times noise_decay^k), E_k the k-th EMD mode of
+         * white noise and M the local-mean operator (local_mean_method).
          *
          * Optimizations:
-         * - Circular noise bank (optional, default on)
+         * - Circular noise bank (optional, default off; automatic fallback
+         *   when the independent bank exceeds noise_bank_max_bytes)
          * - Antithetic variables (optional, default on)
          * - Sorted spline evaluation
          * - Linear interp fast path for sparse extrema
@@ -1223,6 +1497,11 @@ namespace eemd
          * - Standard: Global volatility, mirror boundaries
          * - Finance:  EMA volatility, AR boundaries, input sanitization
          * - Scientific: Global volatility, mirror boundaries, no shortcuts
+         *
+         * Reproducibility: for a given seed and configuration the result does
+         * not depend on the number of OpenMP threads (bit for bit). Trials are
+         * summed in fixed blocks, in trial order, and the blocks are reduced in
+         * block order; each realization's noise depends on (seed, trial) only.
          */
         bool decompose(
             const double *signal,
@@ -1230,7 +1509,13 @@ namespace eemd
             std::vector<std::vector<double>> &imfs,
             std::vector<double> &residue)
         {
-            if (n < 4)
+            last_diag_ = DecompositionDiagnostics();
+            last_diag_.rng_seed_used = config_.rng_seed;
+            last_diag_.mode_used = mode_;
+            last_diag_.local_mean_method_used = config_.local_mean_method;
+            last_diag_.valid = false;
+
+            if (n < 4 || config_.ensemble_size < 1 || config_.max_imfs < 1)
                 return false;
 
             // Input sanitization (NaN/Inf protection for MKL)
@@ -1242,6 +1527,7 @@ namespace eemd
             {
                 nan_count = sanitize_signal(signal_clean.data, n);
             }
+            last_diag_.nan_count = nan_count;
 
             const double *clean_signal = signal_clean.data;
 
@@ -1259,6 +1545,8 @@ namespace eemd
                 config_.vol_floor,
                 local_vol_array.data); // Only written if SMA/EMA
 
+            const double signal_std = std::max(config_.vol_floor, compute_std(clean_signal, n));
+
             // Build EMD config
             EEMDConfig emd_config;
             emd_config.max_imfs = config_.max_imfs;
@@ -1267,35 +1555,50 @@ namespace eemd
             emd_config.boundary_extend = config_.boundary_extend;
             emd_config.s_number = config_.s_number;
             emd_config.spline_method = config_.spline_method;
-
-            // Initialize noise bank (circular or standard)
-            // Decision made ONCE here, not in hot loop
-            CircularNoiseBank circular_bank;
-            StandardNoiseBank standard_bank;
-            const bool use_circular = config_.use_circular_bank;
-
-            if (use_circular)
-            {
-                circular_bank.initialize(n, config_.ensemble_size, config_.max_imfs,
-                                         emd_config, config_.rng_seed,
-                                         config_.circular_multiplier);
-            }
-            else
-            {
-                standard_bank.initialize(n, config_.ensemble_size, config_.max_imfs,
-                                         emd_config, config_.rng_seed);
-            }
-
-            // Capture noise bank accessor as lambda (hoisted out of hot loop)
-            // Eliminates branch inside inner loop
-            auto get_noise = [&](int32_t trial, int32_t imf) -> const double *
-            {
-                return use_circular ? circular_bank.get_noise_slice(trial, imf) : standard_bank.get_noise_imf(trial, imf);
-            };
+            emd_config.stop_rule = config_.sift_stop_rule;
+            emd_config.rilling = config_.rilling;
+            // Noise modes are synthetic (causality does not apply to them):
+            // use the stable symmetric ends whenever sifting runs long
+            emd_config.symmetric_boundary = (config_.sift_stop_rule == SiftStopRule::Rilling) ||
+                                            (config_.boundary_method == BoundaryMethod::Symmetric);
 
             // Effective ensemble size (halved if using antithetic)
             // Round UP to avoid silently losing trials with odd ensemble sizes
             const int32_t base_trials = config_.use_antithetic ? (config_.ensemble_size + 1) / 2 : config_.ensemble_size;
+
+            // Initialize noise bank (independent realizations or circular)
+            // Decision made ONCE here, not in hot loop. One realization per
+            // base trial (antithetic pairs share theirs).
+            CircularNoiseBank circular_bank;
+            StandardNoiseBank standard_bank;
+            const size_t independent_bytes = static_cast<size_t>(base_trials) *
+                                             static_cast<size_t>(config_.max_imfs) *
+                                             static_cast<size_t>(n) * sizeof(double);
+            const bool use_circular = config_.use_circular_bank ||
+                                      independent_bytes > config_.noise_bank_max_bytes;
+
+            if (use_circular)
+            {
+                if (!circular_bank.initialize(n, config_.ensemble_size, config_.max_imfs,
+                                              emd_config, config_.rng_seed,
+                                              config_.circular_multiplier,
+                                              config_.noise_bank_max_bytes))
+                {
+                    return false; // noise bank would not fit in noise_bank_max_bytes
+                }
+                last_diag_.noise_bank_multiplier = circular_bank.multiplier();
+            }
+            else
+            {
+                standard_bank.initialize(n, base_trials, config_.max_imfs,
+                                         emd_config, config_.rng_seed);
+            }
+
+            // Capture noise bank accessor as lambda (hoisted out of hot loop)
+            auto get_noise = [&](int32_t trial, int32_t imf) -> const double *
+            {
+                return use_circular ? circular_bank.get_noise_slice(trial, imf) : standard_bank.get_noise_imf(trial, imf);
+            };
 
             // Prepare output
             imfs.clear();
@@ -1315,47 +1618,59 @@ namespace eemd
             int32_t actual_imf_count = 0;
             bool stop_decomposition = false;
 
-            // Pre-compute volatility scaling factor for scalar mode
-            const double base_scalar_vol = vol_result.is_scalar ? config_.noise_std * vol_result.scalar : 0.0;
             const bool use_scalar_vol = vol_result.is_scalar;
 
             // Noise decay multiplier (decreases each IMF)
             double decay_factor = 1.0;
 
+            // Stage amplitude of the noise mode (see the formula above)
+            double stage_scale = 0.0;
+
             // Adaptive ensemble tracking
             AlignedBuffer<double> prev_mean_estimate(n);
-            int32_t adaptive_trials_used = 0;  // Track actual trials used (for diagnostics)
-            
+
             // Heuristic: disable adaptive for short signals (overhead > benefit)
-            const bool effective_adaptive = config_.adaptive_ensemble && 
-                                           (n >= config_.adaptive_min_signal_len);
+            const bool effective_adaptive = config_.adaptive_ensemble &&
+                                            (n >= config_.adaptive_min_signal_len);
 
             // =================================================================
-            // PARALLEL REGION (Lock-Free Reduction)
+            // Deterministic reduction layout: trials are summed in blocks of
+            // block_trials (in trial order), blocks are reduced in block order.
+            // Nothing here depends on the number of threads.
             // =================================================================
-            const int32_t n_threads_max = omp_get_max_threads();
+            const int32_t batch_max = effective_adaptive
+                                          ? std::max(1, std::min(config_.adaptive_check_interval, base_trials))
+                                          : base_trials;
+            const int32_t block_trials = std::max(4, (batch_max + 63) / 64); // at most 64 blocks
+            const int32_t n_blocks_max = (batch_max + block_trials - 1) / block_trials;
 
-            // Pre-allocate thread accumulators OUTSIDE parallel region
-            std::vector<AlignedBuffer<double>> thread_accs(n_threads_max);
-            for (auto &acc : thread_accs)
+            std::vector<AlignedBuffer<double>> block_accs(n_blocks_max);
+            for (auto &acc : block_accs)
             {
                 acc.resize(n);
             }
-            // Use cache-line padded counters to prevent false sharing
-            std::vector<PaddedCounter> thread_valid_counts(n_threads_max);
-            
+            struct BlockStats
+            {
+                int32_t valid = 0;
+                int32_t attempted = 0;
+                int64_t iterations = 0;
+                int32_t max_iterations = 0;
+                int32_t nonconverged = 0;
+            };
+            std::vector<BlockStats> block_stats(n_blocks_max);
+
             // Batch processing state (shared across threads)
             int32_t batch_start = 0;
             int32_t batch_end = 0;
+            int32_t n_blocks_batch = 0;
             bool ensemble_converged = false;
-            int32_t total_valid_this_imf = 0;
-            int32_t cumulative_valid_trials = 0;  // Accumulates across batches
+            BlockStats stage_total;
+
+            const SiftParams sift_params{config_.max_sift_iters, config_.sift_threshold, config_.s_number,
+                                         config_.sift_stop_rule, config_.rilling};
 
 #pragma omp parallel
             {
-                const int32_t tid = omp_get_thread_num();
-                const int32_t n_threads = omp_get_num_threads();
-
                 // Thread-local resources with mode-specific boundary handling
                 LocalMeanComputer lm_computer(n, config_.boundary_extend,
                                               config_.spline_fast_threshold,
@@ -1363,13 +1678,11 @@ namespace eemd
                                               config_.ar_lookback,
                                               config_.ar_damping,
                                               config_.ar_max_slope_atr,
-                                              config_.spline_method);
+                                              config_.spline_method,
+                                              config_.local_mean_method,
+                                              sift_params);
                 AlignedBuffer<double> tl_perturbed(n);
                 AlignedBuffer<double> tl_local_mean(n);
-
-                // For antithetic: second perturbed buffer
-                AlignedBuffer<double> tl_perturbed_neg(n);
-                AlignedBuffer<double> tl_local_mean_neg(n);
 
                 // =============================================================
                 // IMF EXTRACTION LOOP
@@ -1387,186 +1700,153 @@ namespace eemd
                         batch_start = 0;
                         batch_end = 0;
                         ensemble_converged = false;
-                        total_valid_this_imf = 0;
-                        cumulative_valid_trials = 0;  // Reset for new IMF
+                        stage_total = BlockStats();
                         mean_accumulator.zero();
                         prev_mean_estimate.zero();
-                    }
+
+                        // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
+                        // per-trial factor std(x) / std(E_1(w)) is applied below
+                        stage_scale = (k == 0)
+                                          ? decay_factor * config_.noise_std * signal_std
+                                          : decay_factor * config_.noise_std * compute_std(r_current.data, n);
+                    } // implicit barrier
 
                     // =============================================================
-                    // BATCH PROCESSING LOOP (for adaptive ensemble)
+                    // BATCH PROCESSING LOOP (one batch unless adaptive)
                     // =============================================================
-                    while (!ensemble_converged)
+                    while (true)
                     {
-#pragma omp barrier
-
-                        // Single thread updates batch boundaries
 #pragma omp single
                         {
                             batch_start = batch_end;
-                            if (effective_adaptive)
-                            {
-                                batch_end = std::min(batch_start + config_.adaptive_check_interval, base_trials);
-                            }
-                            else
-                            {
-                                batch_end = base_trials; // Process all at once
-                            }
-                        }
+                            batch_end = effective_adaptive
+                                            ? std::min(batch_start + config_.adaptive_check_interval, base_trials)
+                                            : base_trials;
+                            n_blocks_batch = (batch_end - batch_start + block_trials - 1) / block_trials;
+                        } // implicit barrier
 
-#pragma omp barrier
-
-                        // Check if we're done
                         if (batch_start >= base_trials)
                             break;
-                            
-                        // Reset thread accumulators for THIS BATCH only
-                        // (cumulative sum is in mean_accumulator)
-                        thread_accs[tid].zero();
-                        thread_valid_counts[tid].value = 0;
 
-                        // Process this batch of trials using static scheduling
-#pragma omp for schedule(static)
-                        for (int32_t i = batch_start; i < batch_end; ++i)
+#pragma omp for schedule(dynamic, 1)
+                        for (int32_t b = 0; b < n_blocks_batch; ++b)
                         {
-                            // Get noise IMF slice
-                            const double *noise_imf = get_noise(i, k);
+                            double *__restrict acc = block_accs[b].data;
+                            std::memset(acc, 0, n * sizeof(double));
+                            BlockStats st;
 
-                            // --- POSITIVE BRANCH ---
-                            if (!noise_imf)
+                            const int32_t t_begin = batch_start + b * block_trials;
+                            const int32_t t_end = std::min(batch_end, t_begin + block_trials);
+
+                            for (int32_t i = t_begin; i < t_end; ++i)
                             {
-                                std::memcpy(tl_perturbed.data, r_current.data, n * sizeof(double));
-                            }
-                            else
-                            {
-                                const double *__restrict r = r_current.data;
-                                const double *__restrict nz = noise_imf;
-                                double *__restrict p = tl_perturbed.data;
+                                const double *noise_imf = get_noise(i, k);
 
-                                if (use_scalar_vol)
+                                // Amplitude of this trial's noise mode
+                                double amp = stage_scale;
+                                if (noise_imf && k == 0)
                                 {
-                                    const double scaled_vol = decay_factor * base_scalar_vol;
-                                    EEMD_OMP_SIMD
-                                    for (int32_t j = 0; j < n; ++j)
+                                    // beta_0 = eps * std(x) / std(E_1(w^(i)))
+                                    const double sw = compute_std(noise_imf, n);
+                                    amp = (sw > 1e-300) ? stage_scale / sw : 0.0;
+                                }
+                                // Local-volatility modes keep their time profile,
+                                // scaled to the stage level: lv[j] / std(x) * amp
+                                const double lv_scale = use_scalar_vol ? 0.0 : amp / signal_std;
+
+                                const int32_t n_branches = (config_.use_antithetic && noise_imf) ? 2 : 1;
+                                for (int32_t branch = 0; branch < n_branches; ++branch)
+                                {
+                                    const double sign = (branch == 0) ? 1.0 : -1.0;
+                                    const double *__restrict r = r_current.data;
+                                    double *__restrict p = tl_perturbed.data;
+
+                                    if (!noise_imf)
                                     {
-                                        p[j] = r[j] + scaled_vol * nz[j];
+                                        std::memcpy(p, r, n * sizeof(double));
                                     }
-                                }
-                                else
-                                {
-                                    const double *__restrict lv = local_vol_array.data;
-                                    const double scaled_noise_std = decay_factor * config_.noise_std;
-                                    EEMD_OMP_SIMD
-                                    for (int32_t j = 0; j < n; ++j)
+                                    else if (use_scalar_vol)
                                     {
-                                        p[j] = r[j] + scaled_noise_std * lv[j] * nz[j];
+                                        const double a = sign * amp;
+                                        const double *__restrict nz = noise_imf;
+                                        EEMD_OMP_SIMD
+                                        for (int32_t j = 0; j < n; ++j)
+                                        {
+                                            p[j] = r[j] + a * nz[j];
+                                        }
                                     }
-                                }
-                            }
-
-                            if (lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data))
-                            {
-                                ++thread_valid_counts[tid].value;
-
-                                double *__restrict acc = thread_accs[tid].data;
-                                const double *__restrict lm = tl_local_mean.data;
-
-                                EEMD_OMP_SIMD
-                                for (int32_t j = 0; j < n; ++j)
-                                {
-                                    acc[j] += lm[j];
-                                }
-                            }
-
-                            // --- NEGATIVE BRANCH (Antithetic) ---
-                            if (config_.use_antithetic && noise_imf)
-                            {
-                                const double *__restrict r = r_current.data;
-                                const double *__restrict nz = noise_imf;
-                                double *__restrict p = tl_perturbed_neg.data;
-
-                                if (use_scalar_vol)
-                                {
-                                    const double scaled_vol = decay_factor * base_scalar_vol;
-                                    EEMD_OMP_SIMD
-                                    for (int32_t j = 0; j < n; ++j)
+                                    else
                                     {
-                                        p[j] = r[j] - scaled_vol * nz[j];
+                                        const double a = sign * lv_scale;
+                                        const double *__restrict nz = noise_imf;
+                                        const double *__restrict lv = local_vol_array.data;
+                                        EEMD_OMP_SIMD
+                                        for (int32_t j = 0; j < n; ++j)
+                                        {
+                                            p[j] = r[j] + a * lv[j] * nz[j];
+                                        }
                                     }
-                                }
-                                else
-                                {
-                                    const double *__restrict lv = local_vol_array.data;
-                                    const double scaled_noise_std = decay_factor * config_.noise_std;
-                                    EEMD_OMP_SIMD
-                                    for (int32_t j = 0; j < n; ++j)
+
+                                    SiftStats ss;
+                                    ++st.attempted;
+                                    if (lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data, &ss))
                                     {
-                                        p[j] = r[j] - scaled_noise_std * lv[j] * nz[j];
-                                    }
-                                }
+                                        ++st.valid;
+                                        st.iterations += ss.iterations;
+                                        st.max_iterations = std::max(st.max_iterations, ss.iterations);
+                                        st.nonconverged += ss.converged ? 0 : 1;
 
-                                if (lm_computer.compute(tl_perturbed_neg.data, n, tl_local_mean_neg.data))
-                                {
-                                    ++thread_valid_counts[tid].value;
-
-                                    double *__restrict acc = thread_accs[tid].data;
-                                    const double *__restrict lm = tl_local_mean_neg.data;
-
-                                    EEMD_OMP_SIMD
-                                    for (int32_t j = 0; j < n; ++j)
-                                    {
-                                        acc[j] += lm[j];
+                                        const double *__restrict lm = tl_local_mean.data;
+                                        EEMD_OMP_SIMD
+                                        for (int32_t j = 0; j < n; ++j)
+                                        {
+                                            acc[j] += lm[j];
+                                        }
                                     }
                                 }
                             }
-                        } // end omp for
+                            block_stats[b] = st;
+                        } // end omp for (implicit barrier)
 
-// =========================================================
-// BATCH REDUCTION AND CONVERGENCE CHECK
-// =========================================================
-#pragma omp barrier
-
-// Parallel sum across threads - ADD to cumulative mean_accumulator
-#pragma omp for
+                        // =========================================================
+                        // BATCH REDUCTION (block order) AND CONVERGENCE CHECK
+                        // =========================================================
+#pragma omp for schedule(static)
                         for (int32_t j = 0; j < n; ++j)
                         {
                             double sum = 0.0;
-                            for (int32_t t = 0; t < n_threads; ++t)
+                            for (int32_t b = 0; b < n_blocks_batch; ++b)
                             {
-                                sum += thread_accs[t].data[j];
+                                sum += block_accs[b].data[j];
                             }
-                            mean_accumulator.data[j] += sum;  // ACCUMULATE, not overwrite
-                        }
+                            mean_accumulator.data[j] += sum;
+                        } // implicit barrier
 
-// Single thread: update cumulative count and check convergence
 #pragma omp single
                         {
-                            // Sum valid counts for THIS BATCH
-                            int32_t batch_valid_count = 0;
-                            for (int32_t t = 0; t < n_threads; ++t)
+                            for (int32_t b = 0; b < n_blocks_batch; ++b)
                             {
-                                batch_valid_count += thread_valid_counts[t].value;
+                                const BlockStats &st = block_stats[b];
+                                stage_total.valid += st.valid;
+                                stage_total.attempted += st.attempted;
+                                stage_total.iterations += st.iterations;
+                                stage_total.max_iterations = std::max(stage_total.max_iterations, st.max_iterations);
+                                stage_total.nonconverged += st.nonconverged;
                             }
-                            cumulative_valid_trials += batch_valid_count;
-                            total_valid_this_imf = cumulative_valid_trials;  // Update shared var
 
-                            // Check if we should stop (adaptive ensemble)
                             if (batch_end >= base_trials)
                             {
-                                // Reached max trials
-                                ensemble_converged = true;
+                                ensemble_converged = true; // all trials done
                             }
-                            else if (effective_adaptive && 
+                            else if (effective_adaptive &&
                                      batch_end >= config_.adaptive_min_trials &&
-                                     cumulative_valid_trials > 0)
+                                     stage_total.valid > 0)
                             {
-                                // Compute current mean estimate
-                                const double inv_valid = 1.0 / cumulative_valid_trials;
-                                
-                                // Compute relative L2 change from previous estimate
+                                // Relative L2 change of the running mean estimate
+                                const double inv_valid = 1.0 / stage_total.valid;
                                 double diff_sq = 0.0;
                                 double curr_sq = 0.0;
-                                
+
                                 for (int32_t j = 0; j < n; ++j)
                                 {
                                     double curr = mean_accumulator.data[j] * inv_valid;
@@ -1575,36 +1855,35 @@ namespace eemd
                                     diff_sq += d * d;
                                     curr_sq += curr * curr;
                                 }
-                                
-                                double rel_change = (curr_sq > 1e-20) ? 
-                                    std::sqrt(diff_sq / curr_sq) : 0.0;
-                                
+
+                                double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
+
                                 if (rel_change < config_.adaptive_rel_tol)
                                 {
                                     ensemble_converged = true;
-                                    adaptive_trials_used = batch_end;
                                 }
                                 else
                                 {
-                                    // Save current estimate for next comparison
                                     for (int32_t j = 0; j < n; ++j)
                                     {
-                                        prev_mean_estimate.data[j] = 
-                                            mean_accumulator.data[j] * inv_valid;
+                                        prev_mean_estimate.data[j] = mean_accumulator.data[j] * inv_valid;
                                     }
                                 }
                             }
-                        } // end omp single
-                    } // end while (!ensemble_converged)
+                        } // implicit barrier
 
-// =========================================================
-// FINALIZE IMF (after all batches complete)
-// =========================================================
+                        if (ensemble_converged)
+                            break;
+                    } // end batch loop
+
+                    // =========================================================
+                    // FINALIZE IMF (after all batches complete)
+                    // =========================================================
 #pragma omp single
                     {
-                        if (total_valid_this_imf > 0)
+                        if (stage_total.valid > 0)
                         {
-                            const double scale = 1.0 / total_valid_this_imf;
+                            const double scale = 1.0 / stage_total.valid;
                             double *__restrict acc = mean_accumulator.data;
 
                             EEMD_OMP_SIMD
@@ -1626,6 +1905,14 @@ namespace eemd
 
                             ++actual_imf_count;
 
+                            // Diagnostics for this IMF
+                            last_diag_.sift_iterations.push_back(stage_total.max_iterations);
+                            last_diag_.mean_sift_iterations.push_back(
+                                static_cast<double>(stage_total.iterations) / stage_total.valid);
+                            last_diag_.nonconverged_trials.push_back(stage_total.nonconverged);
+                            last_diag_.convergence_flags.push_back(stage_total.nonconverged == 0);
+                            last_diag_.trials_per_imf.push_back(stage_total.valid);
+
                             // Update residue
                             std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
 
@@ -1642,13 +1929,6 @@ namespace eemd
                         {
                             stop_decomposition = true;
                         }
-                        
-                        // Reset thread accumulators for next IMF
-                        for (int32_t t = 0; t < n_threads; ++t)
-                        {
-                            thread_accs[t].zero();
-                            thread_valid_counts[t].value = 0;
-                        }
                     }
                 } // end IMF loop
             } // end omp parallel
@@ -1664,6 +1944,7 @@ namespace eemd
             residue.resize(n);
             std::memcpy(residue.data(), r_current.data, n * sizeof(double));
 
+            last_diag_.valid = true;
             return true;
         }
 
@@ -1690,8 +1971,9 @@ namespace eemd
         }
 
         /**
-         * Decompose with SR 11-7 compliant diagnostics
-         * Returns metadata for audit trail and risk engine
+         * Decompose and return the run's diagnostics: per-IMF sifting
+         * iterations and convergence, trials used, NaN count, seed, and the
+         * orthogonality index of the IMFs.
          */
         bool decompose_with_diagnostics(
             const double *signal,
@@ -1700,66 +1982,43 @@ namespace eemd
             std::vector<double> &residue,
             DecompositionDiagnostics &diag)
         {
-            // Record seed for reproducibility
-            diag.rng_seed_used = config_.rng_seed;
-            diag.valid = false;
-
-            // Check for NaN/Inf before decomposition
-            diag.nan_count = 0;
-            if (config_.sanitize_input)
+            const bool ok = decompose(signal, n, imfs, residue);
+            if (ok)
             {
-                for (int32_t i = 0; i < n; ++i)
+                // Orthogonality index (lower = better)
+                // IO = sum(|<IMF_i, IMF_j>|) / sum(<IMF_i, IMF_i>)
+                double cross_sum = 0.0;
+                double auto_sum = 0.0;
+
+                for (size_t i = 0; i < imfs.size(); ++i)
                 {
-                    if (!std::isfinite(signal[i]))
-                    {
-                        ++diag.nan_count;
-                    }
-                }
-            }
-
-            // Perform decomposition
-            if (!decompose(signal, n, imfs, residue))
-            {
-                return false;
-            }
-
-            // Compute orthogonality index (lower = better)
-            // IO = sum(|<IMF_i, IMF_j>|) / sum(<IMF_i, IMF_i>)
-            double cross_sum = 0.0;
-            double auto_sum = 0.0;
-
-            for (size_t i = 0; i < imfs.size(); ++i)
-            {
-                double norm_i = 0.0;
-                for (int32_t k = 0; k < n; ++k)
-                {
-                    norm_i += imfs[i][k] * imfs[i][k];
-                }
-                auto_sum += norm_i;
-
-                for (size_t j = i + 1; j < imfs.size(); ++j)
-                {
-                    double inner = 0.0;
+                    double norm_i = 0.0;
                     for (int32_t k = 0; k < n; ++k)
                     {
-                        inner += imfs[i][k] * imfs[j][k];
+                        norm_i += imfs[i][k] * imfs[i][k];
                     }
-                    cross_sum += std::abs(inner);
+                    auto_sum += norm_i;
+
+                    for (size_t j = i + 1; j < imfs.size(); ++j)
+                    {
+                        double inner = 0.0;
+                        for (int32_t k = 0; k < n; ++k)
+                        {
+                            inner += imfs[i][k] * imfs[j][k];
+                        }
+                        cross_sum += std::abs(inner);
+                    }
                 }
+
+                last_diag_.orthogonality_index = (auto_sum > 1e-10) ? cross_sum / auto_sum : 0.0;
             }
-
-            diag.orthogonality_index = (auto_sum > 1e-10) ? cross_sum / auto_sum : 0.0;
-
-            // Sift iterations and convergence flags would require modifying
-            // the internal decompose to track per-IMF metrics
-            // For now, initialize with placeholder values
-            diag.sift_iterations.resize(imfs.size(), -1);     // -1 = not tracked
-            diag.convergence_flags.resize(imfs.size(), true); // Assume converged
-
-            diag.valid = true;
-            diag.mode_used = mode_;
-            return true;
+            diag = last_diag_;
+            return ok;
         }
+
+        /** Diagnostics of the most recent decompose() (orthogonality index only
+         *  from decompose_with_diagnostics()). */
+        const DecompositionDiagnostics &last_diagnostics() const { return last_diag_; }
 
         ICEEMDANConfig &config() { return config_; }
         const ICEEMDANConfig &config() const { return config_; }
@@ -1768,6 +2027,7 @@ namespace eemd
     private:
         ICEEMDANConfig config_;
         ProcessingMode mode_ = ProcessingMode::Standard;
+        DecompositionDiagnostics last_diag_;
     };
 
     // ============================================================================
@@ -1846,46 +2106,32 @@ namespace eemd
         return std::max(0.0, std::min(1.0, H));
     }
 
+    /**
+     * Normalized spectral entropy of the one-sided power spectrum (bins
+     * 0..n/2) of the mean-removed signal: 0 = a single tone, 1 = flat.
+     */
     inline double compute_spectral_entropy(const double *signal, int32_t n)
     {
         if (n < 4)
             return 1.0;
-
-        AlignedBuffer<MKL_Complex16> fft_in(n);
-        AlignedBuffer<MKL_Complex16> fft_out(n);
 
         double mean = 0.0;
         for (int32_t i = 0; i < n; ++i)
             mean += signal[i];
         mean /= n;
 
+        std::vector<double> centered(n);
         for (int32_t i = 0; i < n; ++i)
-        {
-            fft_in[i].real = signal[i] - mean;
-            fft_in[i].imag = 0.0;
-        }
+            centered[i] = signal[i] - mean;
 
-        DFTI_DESCRIPTOR_HANDLE desc = nullptr;
-        MKL_LONG status = DftiCreateDescriptor(&desc, DFTI_DOUBLE, DFTI_COMPLEX, 1, n);
-        if (status != DFTI_NO_ERROR)
+        const int32_t n_freq = n / 2 + 1;
+        std::vector<double> psd(n_freq);
+        if (!fft::power_spectrum(centered.data(), n, psd.data()))
             return 1.0;
 
-        DftiSetValue(desc, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-        DftiCommitDescriptor(desc);
-        DftiComputeForward(desc, fft_in.data, fft_out.data);
-        DftiFreeDescriptor(&desc);
-
-        int32_t n_freq = n / 2 + 1;
-        std::vector<double> psd(n_freq);
         double total_power = 0.0;
-
         for (int32_t i = 0; i < n_freq; ++i)
-        {
-            double re = fft_out[i].real;
-            double im = fft_out[i].imag;
-            psd[i] = re * re + im * im;
             total_power += psd[i];
-        }
 
         if (total_power < 1e-15)
             return 1.0;

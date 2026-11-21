@@ -193,6 +193,17 @@ ICEEMDAN_API void iceemdan_set_boundary_method(ICEEMDANHandle *h, int method)
     }
 }
 
+/**
+ * Local-mean operator: 0 = Sifted (Colominas et al. 2014, default),
+ * 1 = SingleEnvelope (one envelope mean per trial: faster, not the published algorithm)
+ */
+ICEEMDAN_API void iceemdan_set_local_mean_method(ICEEMDANHandle *h, int method)
+{
+    if (h && h->decomposer)
+        h->decomposer->config().local_mean_method =
+            (method == 1) ? eemd::LocalMeanMethod::SingleEnvelope : eemd::LocalMeanMethod::Sifted;
+}
+
 // ============================================================================
 // Decomposition
 // ============================================================================
@@ -215,7 +226,16 @@ ICEEMDAN_API int iceemdan_decompose(ICEEMDANHandle *h, const double *signal, int
 
     try
     {
-        h->decomposer->decompose(signal, n, h->imfs, h->residue);
+        const bool ok = h->decomposer->decompose(signal, n, h->imfs, h->residue);
+        h->diagnostics = h->decomposer->last_diagnostics();
+        if (!ok)
+        {
+            h->imfs.clear();
+            h->residue.clear();
+            snprintf(h->error_msg, sizeof(h->error_msg),
+                     "Decomposition failed (noise bank larger than noise_bank_max_bytes?)");
+            return 0;
+        }
         return static_cast<int>(h->imfs.size());
     }
     catch (const std::exception &e)
@@ -245,7 +265,15 @@ ICEEMDAN_API int iceemdan_decompose_with_diagnostics(ICEEMDANHandle *h, const do
 
     try
     {
-        h->decomposer->decompose_with_diagnostics(signal, n, h->imfs, h->residue, h->diagnostics);
+        const bool ok = h->decomposer->decompose_with_diagnostics(signal, n, h->imfs, h->residue, h->diagnostics);
+        if (!ok)
+        {
+            h->imfs.clear();
+            h->residue.clear();
+            snprintf(h->error_msg, sizeof(h->error_msg),
+                     "Decomposition failed (noise bank larger than noise_bank_max_bytes?)");
+            return 0;
+        }
         return static_cast<int>(h->imfs.size());
     }
     catch (const std::exception &e)
@@ -357,6 +385,38 @@ ICEEMDAN_API int iceemdan_get_valid(ICEEMDANHandle *h)
     return h ? (h->diagnostics.valid ? 1 : 0) : 0;
 }
 
+// Per-IMF convergence diagnostics (index 0 = first IMF). -1 / -1.0 when out of range.
+
+static bool iceemdan_valid_imf(ICEEMDANHandle *h, int k)
+{
+    return h && k >= 0 && k < static_cast<int>(h->diagnostics.sift_iterations.size());
+}
+
+ICEEMDAN_API int iceemdan_get_imf_sift_iterations(ICEEMDANHandle *h, int imf_index)
+{
+    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.sift_iterations[imf_index] : -1;
+}
+
+ICEEMDAN_API double iceemdan_get_imf_mean_sift_iterations(ICEEMDANHandle *h, int imf_index)
+{
+    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.mean_sift_iterations[imf_index] : -1.0;
+}
+
+ICEEMDAN_API int iceemdan_get_imf_nonconverged_trials(ICEEMDANHandle *h, int imf_index)
+{
+    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.nonconverged_trials[imf_index] : -1;
+}
+
+ICEEMDAN_API int iceemdan_get_imf_trials(ICEEMDANHandle *h, int imf_index)
+{
+    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.trials_per_imf[imf_index] : -1;
+}
+
+ICEEMDAN_API int iceemdan_get_imf_converged(ICEEMDANHandle *h, int imf_index)
+{
+    return iceemdan_valid_imf(h, imf_index) ? (h->diagnostics.convergence_flags[imf_index] ? 1 : 0) : -1;
+}
+
 ICEEMDAN_API const char *iceemdan_get_error(ICEEMDANHandle *h)
 {
     return h ? h->error_msg : "Null handle";
@@ -371,7 +431,16 @@ ICEEMDAN_API const char *iceemdan_get_error(ICEEMDANHandle *h)
  */
 ICEEMDAN_API const char *iceemdan_version()
 {
-    return "1.0.0";
+    return "1.1.0";
+}
+
+/**
+ * Name of the FFT backend that serves length n on the calling thread
+ * ("VectorFFT", "MKL DFTI" or "none"). Used by the analysis utilities.
+ */
+ICEEMDAN_API const char *iceemdan_fft_backend(int n)
+{
+    return eemd::fft::backend_name(eemd::fft::backend_for(n));
 }
 
 /**

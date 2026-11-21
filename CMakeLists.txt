@@ -78,6 +78,45 @@ target_compile_definitions(eemd_mkl INTERFACE
 )
 
 # ============================================================================
+# FFT backend: VectorFFT (third_party/vectorfft, a git submodule)
+#
+# The Hilbert transform, instantaneous frequency and spectral entropy run on
+# VectorFFT when it is available, on MKL DFTI otherwise (and for any length
+# VectorFFT refuses). Fetch it with:
+#   git submodule update --init --depth 1 third_party/vectorfft
+# or point CMake at an installed copy: -DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT
+# VectorFFT builds with GCC or Clang (MinGW on Windows), not with MSVC.
+# ============================================================================
+
+option(ICEEMDAN_USE_VECTORFFT "Use VectorFFT for the FFTs (Hilbert transform, spectral entropy)" ON)
+set(ICEEMDAN_FFT_BACKEND "MKL DFTI")
+
+if(ICEEMDAN_USE_VECTORFFT)
+    find_package(VectorFFT CONFIG QUIET)
+    if(TARGET VectorFFT::vfft)
+        set(ICEEMDAN_FFT_BACKEND "VectorFFT (installed: ${VectorFFT_DIR})")
+    elseif(MSVC)
+        message(WARNING "VectorFFT is built with GCC or Clang, not MSVC: using MKL DFTI. "
+                        "To use VectorFFT here, install a MinGW/Clang build and set VectorFFT_DIR.")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vectorfft/CMakeLists.txt")
+        # The Python binding is a shared library: build libvfft.a as PIC
+        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+        add_subdirectory(third_party/vectorfft EXCLUDE_FROM_ALL)
+        set(ICEEMDAN_FFT_BACKEND "VectorFFT (third_party/vectorfft)")
+    else()
+        message(WARNING "third_party/vectorfft is missing: using MKL DFTI. Run "
+                        "'git submodule update --init --depth 1 third_party/vectorfft' to use VectorFFT.")
+    endif()
+
+    if(TARGET VectorFFT::vfft)
+        # BUILD_INTERFACE: an installed copy of these headers is configured for
+        # MKL DFTI (it does not export the bundled VectorFFT).
+        target_link_libraries(eemd_mkl INTERFACE $<BUILD_INTERFACE:VectorFFT::vfft>)
+        target_compile_definitions(eemd_mkl INTERFACE $<BUILD_INTERFACE:EEMD_USE_VECTORFFT=1>)
+    endif()
+endif()
+
+# ============================================================================
 # ICEEMDAN Interface Library (extends EEMD)
 # ============================================================================
 
@@ -185,6 +224,28 @@ if(EXISTS "${TEST_DIR}/spline_bench.cpp")
     add_eemd_executable(spline_bench ${TEST_DIR}/spline_bench.cpp)
 endif()
 
+# --- Validation against the reference code (validation/README.md) ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/validation/decompose_csv.cpp")
+    add_iceemdan_executable(decompose_csv ${CMAKE_CURRENT_SOURCE_DIR}/validation/decompose_csv.cpp)
+endif()
+
+# --- Regression tests (exit code != 0 on failure) ---
+if(EXISTS "${TEST_DIR}/test_fft_hilbert.cpp")
+    add_iceemdan_executable(test_fft_hilbert ${TEST_DIR}/test_fft_hilbert.cpp)
+endif()
+
+if(EXISTS "${TEST_DIR}/test_fixes.cpp")
+    add_iceemdan_executable(test_fixes ${TEST_DIR}/test_fixes.cpp)
+endif()
+
+enable_testing()
+if(TARGET test_fft_hilbert)
+    add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
+endif()
+if(TARGET test_fixes)
+    add_test(NAME fixes COMMAND test_fixes)
+endif()
+
 # ============================================================================
 # Python Bindings (Shared Library)
 # ============================================================================
@@ -224,8 +285,8 @@ install(TARGETS eemd_mkl iceemdan_mkl
 
 install(FILES 
     eemd_mkl.hpp 
+    eemd_fft.hpp
     iceemdan_mkl.hpp
-    iceemdan_mkl_opt.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
@@ -245,4 +306,5 @@ message(STATUS "  MKL interface: ${MKL_INTERFACE}")
 message(STATUS "  MKL threading: ${MKL_THREADING}")
 message(STATUS "  EEMD header: eemd_mkl.hpp")
 message(STATUS "  ICEEMDAN header: iceemdan_mkl.hpp")
+message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")
 message(STATUS "")

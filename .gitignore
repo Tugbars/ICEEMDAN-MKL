@@ -6,3 +6,9 @@ ICEEMDAN_DENOISING.png
 ICEEMDAN_HILBERT.png
 ICEEMDAN_RECONSTRUCTION.png
 jupyter/.ipynb_checkpoints/iceemdan_visualization-checkpoint.ipynb
+__pycache__/
+*.pyc
+/build*/
+/validation/run/
+python/*.dll
+python/*.so

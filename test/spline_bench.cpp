@@ -5,6 +5,7 @@
  */
 
 #define _USE_MATH_DEFINES
+#include <algorithm>
 #include <cmath>
 
 #include "cubic_spline_avx2.hpp"
