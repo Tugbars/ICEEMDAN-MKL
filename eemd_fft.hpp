@@ -1,15 +1,14 @@
 /**
- * Real FFT backend for the EEMD/ICEEMDAN analysis utilities
+ * Real FFTs for the EEMD/ICEEMDAN analysis utilities
  * (Hilbert transform, instantaneous frequency, spectral entropy).
  *
- * Backends:
- *   - VectorFFT (https://github.com/Tugbars/VectorFFT), when the build defines
- *     EEMD_USE_VECTORFFT and links VectorFFT::vfft (CMake does both by default
- *     when third_party/vectorfft is present).
- *   - Intel MKL DFTI otherwise, and for any length VectorFFT refuses.
+ * The transforms are VectorFFT's (https://github.com/Tugbars/VectorFFT): link
+ * VectorFFT::vfft (CMake does, from the ready-built release library). It
+ * serves every real length from 2 up; a single sample needs no transform and
+ * is computed here.
  *
  * Plans are created once per (thread, length) and cached, so repeated calls on
- * the same length cost one transform each. VectorFFT plans are made with
+ * the same length cost one transform each. They are made with
  * VFFT_FLAG_ESTIMATE: nothing is measured and no wisdom file is read or
  * written from inside this library.
  *
@@ -25,16 +24,12 @@
 #ifndef EEMD_FFT_HPP
 #define EEMD_FFT_HPP
 
-#include <mkl_dfti.h>
+#include "vfft.h"
 
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <vector>
-
-#ifdef EEMD_USE_VECTORFFT
-#include "vfft.h"
-#endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
@@ -77,29 +72,20 @@ namespace eemd
         enum class Backend : uint8_t
         {
             None = 0,
-            VectorFFT = 1,
-            MKL = 2
+            VectorFFT = 1
         };
 
         inline const char *backend_name(Backend b)
         {
-            switch (b)
-            {
-            case Backend::VectorFFT:
-                return "VectorFFT";
-            case Backend::MKL:
-                return "MKL DFTI";
-            default:
-                return "none";
-            }
+            return b == Backend::VectorFFT ? "VectorFFT" : "none";
         }
 
         /**
          * One real transform length, forward (R2C) and backward (C2R).
          *
-         * Spectrum format (both backends): bins 0..n/2, n/2 + 1 complex values
-         * stored as interleaved (re, im) doubles. backward() is the
-         * unnormalized inverse: backward(forward(x)) == n * x.
+         * Spectrum format: bins 0..n/2, n/2 + 1 complex values stored as
+         * interleaved (re, im) doubles. backward() is the unnormalized
+         * inverse: backward(forward(x)) == n * x.
          */
         class RealFFT
         {
@@ -109,83 +95,21 @@ namespace eemd
             RealFFT(const RealFFT &) = delete;
             RealFFT &operator=(const RealFFT &) = delete;
 
-            /** Plan length n. Tries VectorFFT first (when built in), then MKL. */
+            /**
+             * Plan length n (2 or more). False when VectorFFT refuses the
+             * length or could not be loaded; vfft_error() says which.
+             */
             bool init(int32_t n)
             {
                 release();
-                if (n < 1)
+                if (n < 2)
                     return false;
-                n_ = n;
-#ifdef EEMD_USE_VECTORFFT
-                if (init_vectorfft())
-                {
-                    backend_ = Backend::VectorFFT;
-                    return true;
-                }
-#endif
-                if (init_mkl())
-                {
-                    backend_ = Backend::MKL;
-                    return true;
-                }
-                n_ = 0;
-                return false;
-            }
 
-            int32_t size() const { return n_; }
-            int32_t bins() const { return n_ / 2 + 1; }
-            Backend backend() const { return backend_; }
-
-            /** x: n reals -> X: (n/2 + 1) complex bins, interleaved. */
-            bool forward(const double *x, double *X)
-            {
-                switch (backend_)
-                {
-#ifdef EEMD_USE_VECTORFFT
-                case Backend::VectorFFT:
-                {
-                    FpEnvGuard env;
-                    return vfft_execute(r2c_, VFFT_FORWARD, x, X) == 0;
-                }
-#endif
-                case Backend::MKL:
-                    return DftiComputeForward(dfti_, const_cast<double *>(x), X) == DFTI_NO_ERROR;
-                default:
-                    return false;
-                }
-            }
-
-            /**
-             * X: (n/2 + 1) complex bins -> x: n reals, times n. The imaginary
-             * parts of bin 0 and (even n) bin n/2 must be zero.
-             */
-            bool backward(const double *X, double *x)
-            {
-                switch (backend_)
-                {
-#ifdef EEMD_USE_VECTORFFT
-                case Backend::VectorFFT:
-                {
-                    FpEnvGuard env;
-                    return vfft_execute(c2r_, VFFT_BACKWARD, X, x) == 0;
-                }
-#endif
-                case Backend::MKL:
-                    return DftiComputeBackward(dfti_, const_cast<double *>(X), x) == DFTI_NO_ERROR;
-                default:
-                    return false;
-                }
-            }
-
-        private:
-#ifdef EEMD_USE_VECTORFFT
-            bool init_vectorfft()
-            {
                 FpEnvGuard env; // vfft_create sets FTZ/DAZ; keep it out of the caller's thread state
                 vfft_config_t c;
                 std::memset(&c, 0, sizeof(c));
                 c.rank = 1;
-                c.n[0] = n_;
+                c.n[0] = n;
                 c.howmany = 1;
                 c.layout = VFFT_LAYOUT_INTERLEAVED;
                 c.placement = VFFT_PLACEMENT_OUT;
@@ -206,58 +130,56 @@ namespace eemd
                     r2c_ = nullptr;
                     return false;
                 }
+                n_ = n;
                 return true;
             }
-#endif
 
-            bool init_mkl()
+            int32_t size() const { return n_; }
+            int32_t bins() const { return n_ / 2 + 1; }
+            Backend backend() const { return n_ ? Backend::VectorFFT : Backend::None; }
+
+            /** x: n reals -> X: (n/2 + 1) complex bins, interleaved. */
+            bool forward(const double *x, double *X)
             {
-                if (DftiCreateDescriptor(&dfti_, DFTI_DOUBLE, DFTI_REAL, 1, static_cast<MKL_LONG>(n_)) != DFTI_NO_ERROR)
-                {
-                    dfti_ = nullptr;
+                if (!r2c_)
                     return false;
-                }
-                bool ok = DftiSetValue(dfti_, DFTI_PLACEMENT, DFTI_NOT_INPLACE) == DFTI_NO_ERROR &&
-                          DftiSetValue(dfti_, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX) == DFTI_NO_ERROR &&
-                          DftiCommitDescriptor(dfti_) == DFTI_NO_ERROR;
-                if (!ok)
-                {
-                    DftiFreeDescriptor(&dfti_);
-                    dfti_ = nullptr;
-                }
-                return ok;
+                FpEnvGuard env;
+                return vfft_execute(r2c_, VFFT_FORWARD, x, X) == 0;
             }
 
+            /**
+             * X: (n/2 + 1) complex bins -> x: n reals, times n. The imaginary
+             * parts of bin 0 and (even n) bin n/2 must be zero.
+             */
+            bool backward(const double *X, double *x)
+            {
+                if (!c2r_)
+                    return false;
+                FpEnvGuard env;
+                return vfft_execute(c2r_, VFFT_BACKWARD, X, x) == 0;
+            }
+
+        private:
             void release()
             {
-#ifdef EEMD_USE_VECTORFFT
                 if (r2c_)
                     vfft_destroy(r2c_);
                 if (c2r_)
                     vfft_destroy(c2r_);
                 r2c_ = nullptr;
                 c2r_ = nullptr;
-#endif
-                if (dfti_)
-                    DftiFreeDescriptor(&dfti_);
-                dfti_ = nullptr;
-                backend_ = Backend::None;
                 n_ = 0;
             }
 
             int32_t n_ = 0;
-            Backend backend_ = Backend::None;
-            DFTI_DESCRIPTOR_HANDLE dfti_ = nullptr;
-#ifdef EEMD_USE_VECTORFFT
             vfft_plan r2c_ = nullptr;
             vfft_plan c2r_ = nullptr;
-#endif
         };
 
         /**
          * The calling thread's plan for length n (created on first use, kept
          * for the thread's lifetime; the 8 most recent lengths are cached).
-         * Returns nullptr when no backend serves n.
+         * Returns nullptr when n < 2 or VectorFFT does not serve n.
          */
         inline RealFFT *thread_plan(int32_t n)
         {
@@ -281,7 +203,12 @@ namespace eemd
             return cache.plans.back().get();
         }
 
-        /** Which backend serves length n on this thread (for logs and tests). */
+        /**
+         * Which backend transforms length n on this thread (for logs and
+         * tests): VectorFFT, or None when there is no plan for n. That is the
+         * case for n = 1, which hilbert() and power_spectrum() compute
+         * without a transform, and when VectorFFT could not be loaded.
+         */
         inline Backend backend_for(int32_t n)
         {
             RealFFT *p = thread_plan(n);
@@ -298,6 +225,11 @@ namespace eemd
         {
             if (n < 1)
                 return false;
+            if (n == 1)
+            {
+                y[0] = 0.0; // one sample is its own mean: no quadrature part
+                return true;
+            }
             RealFFT *plan = thread_plan(n);
             if (!plan)
                 return false;
@@ -342,6 +274,13 @@ namespace eemd
          */
         inline bool power_spectrum(const double *x, int32_t n, double *psd)
         {
+            if (n < 1)
+                return false;
+            if (n == 1)
+            {
+                psd[0] = x[0] * x[0]; // the only bin is the sample itself
+                return true;
+            }
             RealFFT *plan = thread_plan(n);
             if (!plan)
                 return false;

@@ -78,42 +78,125 @@ target_compile_definitions(eemd_mkl INTERFACE
 )
 
 # ============================================================================
-# FFT backend: VectorFFT (third_party/vectorfft, a git submodule)
+# FFT: VectorFFT (https://github.com/Tugbars/VectorFFT), required
 #
 # The Hilbert transform, instantaneous frequency and spectral entropy run on
-# VectorFFT when it is available, on MKL DFTI otherwise (and for any length
-# VectorFFT refuses). Fetch it with:
-#   git submodule update --init --depth 1 third_party/vectorfft
-# or point CMake at an installed copy: -DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT
-# VectorFFT builds with GCC or Clang (MinGW on Windows), not with MSVC.
+# VectorFFT's ready-built release library: libvfft.dll / libvfft.so, the two
+# kernel libraries it loads from (AVX2, AVX-512) and vfft.h. It has a C
+# interface and needs only the system's C runtime, so every compiler links it.
+# CMake takes it from, in this order:
+#   -DVECTORFFT_ROOT=<folder>   an unpacked release you already have
+#   -DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT   a VectorFFT built from source
+#   a download of the release pinned below (Windows x64, Linux x64), unpacked
+#   under the build folder and checked against its SHA-256
 # ============================================================================
 
-option(ICEEMDAN_USE_VECTORFFT "Use VectorFFT for the FFTs (Hilbert transform, spectral entropy)" ON)
-set(ICEEMDAN_FFT_BACKEND "MKL DFTI")
+set(ICEEMDAN_VECTORFFT_VERSION "0.8.1")
+set(ICEEMDAN_VECTORFFT_SHA256_WINDOWS "321212b19d091c14ef648e1d1620e4d6e0508b484bbd16cbc48f5ac2c339a57d")
+set(ICEEMDAN_VECTORFFT_SHA256_LINUX "08ea56906ec5ea409f7bf44c72391551f7adcde652ae9c247c30beb16e9cdf60")
 
-if(ICEEMDAN_USE_VECTORFFT)
-    find_package(VectorFFT CONFIG QUIET)
-    if(TARGET VectorFFT::vfft)
-        set(ICEEMDAN_FFT_BACKEND "VectorFFT (installed: ${VectorFFT_DIR})")
-    elseif(MSVC)
-        message(WARNING "VectorFFT is built with GCC or Clang, not MSVC: using MKL DFTI. "
-                        "To use VectorFFT here, install a MinGW/Clang build and set VectorFFT_DIR.")
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vectorfft/CMakeLists.txt")
-        # The Python binding is a shared library: build libvfft.a as PIC
-        set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-        add_subdirectory(third_party/vectorfft EXCLUDE_FROM_ALL)
-        set(ICEEMDAN_FFT_BACKEND "VectorFFT (third_party/vectorfft)")
+set(VECTORFFT_ROOT "" CACHE PATH
+    "Folder of an unpacked VectorFFT release (vfft.h, libvfft.dll or libvfft.so). Empty: download it")
+set(ICEEMDAN_VECTORFFT_RUNTIME "")   # Windows: the DLLs a program needs beside it
+
+if(NOT VECTORFFT_ROOT AND VectorFFT_DIR)
+    find_package(VectorFFT CONFIG REQUIRED)
+    set(ICEEMDAN_FFT_BACKEND "VectorFFT (installed: ${VectorFFT_DIR})")
+else()
+    set(_vfft_root "${VECTORFFT_ROOT}")
+    if(NOT _vfft_root)
+        if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
+            set(_vfft_file "vectorfft-${ICEEMDAN_VECTORFFT_VERSION}-windows-x64.zip")
+            set(_vfft_sha256 "${ICEEMDAN_VECTORFFT_SHA256_WINDOWS}")
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
+            set(_vfft_file "vectorfft-${ICEEMDAN_VECTORFFT_VERSION}-linux-x64.tar.gz")
+            set(_vfft_sha256 "${ICEEMDAN_VECTORFFT_SHA256_LINUX}")
+        else()
+            message(FATAL_ERROR
+                "VectorFFT has no ready-built library for ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}. "
+                "Build it from source (https://github.com/Tugbars/VectorFFT) and pass "
+                "-DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT.")
+        endif()
+
+        set(_vfft_url
+            "https://github.com/Tugbars/VectorFFT/releases/download/v${ICEEMDAN_VECTORFFT_VERSION}/${_vfft_file}")
+        set(_vfft_unpacked "${CMAKE_BINARY_DIR}/_deps/vectorfft-${ICEEMDAN_VECTORFFT_VERSION}")
+        set(_vfft_root "${_vfft_unpacked}/vectorfft")   # the archive's only top-level folder
+
+        if(NOT EXISTS "${_vfft_root}/vfft.h")
+            set(_vfft_archive "${CMAKE_BINARY_DIR}/_deps/${_vfft_file}")
+            set(_vfft_by_hand "Or download and unpack it yourself, then pass -DVECTORFFT_ROOT=<its vectorfft folder>.")
+            message(STATUS "Downloading VectorFFT ${ICEEMDAN_VECTORFFT_VERSION}: ${_vfft_url}")
+            file(DOWNLOAD "${_vfft_url}" "${_vfft_archive}" STATUS _vfft_status TLS_VERIFY ON)
+            list(GET _vfft_status 0 _vfft_code)
+            if(NOT _vfft_code EQUAL 0)
+                list(GET _vfft_status 1 _vfft_why)
+                file(REMOVE "${_vfft_archive}")
+                message(FATAL_ERROR "Could not download ${_vfft_url}: ${_vfft_why}. ${_vfft_by_hand}")
+            endif()
+            file(SHA256 "${_vfft_archive}" _vfft_got)
+            if(NOT _vfft_got STREQUAL _vfft_sha256)
+                file(REMOVE "${_vfft_archive}")
+                message(FATAL_ERROR
+                    "${_vfft_url}: SHA-256 is ${_vfft_got}, expected ${_vfft_sha256}. "
+                    "Configure again to download it again. ${_vfft_by_hand}")
+            endif()
+            file(REMOVE_RECURSE "${_vfft_unpacked}")
+            file(ARCHIVE_EXTRACT INPUT "${_vfft_archive}" DESTINATION "${_vfft_unpacked}")
+            file(REMOVE "${_vfft_archive}")
+        endif()
+        set(ICEEMDAN_FFT_BACKEND "VectorFFT ${ICEEMDAN_VECTORFFT_VERSION} release library (${_vfft_root})")
     else()
-        message(WARNING "third_party/vectorfft is missing: using MKL DFTI. Run "
-                        "'git submodule update --init --depth 1 third_party/vectorfft' to use VectorFFT.")
+        set(ICEEMDAN_FFT_BACKEND "VectorFFT release library (${_vfft_root})")
     endif()
 
-    if(TARGET VectorFFT::vfft)
-        # BUILD_INTERFACE: an installed copy of these headers is configured for
-        # MKL DFTI (it does not export the bundled VectorFFT).
-        target_link_libraries(eemd_mkl INTERFACE $<BUILD_INTERFACE:VectorFFT::vfft>)
-        target_compile_definitions(eemd_mkl INTERFACE $<BUILD_INTERFACE:EEMD_USE_VECTORFFT=1>)
+    if(WIN32)
+        set(_vfft_library "${_vfft_root}/libvfft.dll")
+    else()
+        set(_vfft_library "${_vfft_root}/libvfft.so")
     endif()
+    if(NOT EXISTS "${_vfft_root}/vfft.h" OR NOT EXISTS "${_vfft_library}")
+        message(FATAL_ERROR
+            "${_vfft_root} is not an unpacked VectorFFT release: vfft.h or ${_vfft_library} is missing.")
+    endif()
+
+    # VFFT_SHARED: vfft.h declares the functions as imported from a DLL
+    add_library(VectorFFT::vfft SHARED IMPORTED GLOBAL)
+    set_target_properties(VectorFFT::vfft PROPERTIES
+        IMPORTED_LOCATION "${_vfft_library}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_vfft_root}"
+        INTERFACE_COMPILE_DEFINITIONS "VFFT_SHARED"
+    )
+    if(WIN32)
+        set_target_properties(VectorFFT::vfft PROPERTIES IMPORTED_IMPLIB "${_vfft_root}/libvfft.dll.a")
+        # libvfft.dll loads one of the two kernel libraries from its own folder
+        set(ICEEMDAN_VECTORFFT_RUNTIME
+            "${_vfft_root}/libvfft.dll"
+            "${_vfft_root}/libvfft_avx2.dll"
+            "${_vfft_root}/libvfft_avx512.dll"
+        )
+    endif()
+endif()
+
+# An installed copy of these headers needs VectorFFT::vfft (and MKL::MKL) from
+# whoever uses them: neither is installed with them.
+target_link_libraries(eemd_mkl INTERFACE VectorFFT::vfft)
+
+# Windows: put the VectorFFT DLLs beside the programs. On Linux the programs
+# find libvfft.so through their build RPATH.
+if(ICEEMDAN_VECTORFFT_RUNTIME)
+    get_property(_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_multi_config)
+        set(_programs_dir "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>")
+    else()
+        set(_programs_dir "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
+    add_custom_target(vectorfft_runtime
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_programs_dir}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ICEEMDAN_VECTORFFT_RUNTIME} "${_programs_dir}"
+        COMMENT "Copying the VectorFFT DLLs beside the programs"
+        VERBATIM
+    )
 endif()
 
 # ============================================================================
@@ -139,9 +222,12 @@ macro(add_eemd_executable name source)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE eemd_mkl)
     if(USE_IPO)
-        set_target_properties(${name} PROPERTIES 
+        set_target_properties(${name} PROPERTIES
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
         )
+    endif()
+    if(TARGET vectorfft_runtime)
+        add_dependencies(${name} vectorfft_runtime)
     endif()
 endmacro()
 
@@ -149,9 +235,12 @@ macro(add_iceemdan_executable name source)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE iceemdan_mkl)
     if(USE_IPO)
-        set_target_properties(${name} PROPERTIES 
+        set_target_properties(${name} PROPERTIES
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
         )
+    endif()
+    if(TARGET vectorfft_runtime)
+        add_dependencies(${name} vectorfft_runtime)
     endif()
 endmacro()
 
@@ -262,11 +351,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_c.cpp")
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
         )
     endif()
+    if(TARGET vectorfft_runtime)
+        add_dependencies(iceemdan_shared vectorfft_runtime)
+    endif()
     if(WIN32)
-        # Copy DLL to python folder for easy testing
+        # Copy the DLL, and the VectorFFT DLLs it loads, to the python folder for easy testing
         add_custom_command(TARGET iceemdan_shared POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:iceemdan_shared>
+            ${ICEEMDAN_VECTORFFT_RUNTIME}
             ${CMAKE_CURRENT_SOURCE_DIR}/python/
         )
     endif()
