@@ -894,7 +894,7 @@ namespace eemd
             const bool enough = (boundary_method_ == BoundaryMethod::Symmetric)
                                     ? (n_max_ >= 1 && n_min_ >= 1 && n_max_ + n_min_ >= 3)
                                     : (n_max_ >= 2 && n_min_ >= 2);
-            if (!enough || !envelope_mean_from_extrema(x, n, h_.data))
+            if (!enough || !build_envelopes(x, n))
                 return false;
             if (sift_.rule != SiftStopRule::Rilling)
                 return true;
@@ -921,64 +921,45 @@ namespace eemd
 
         bool envelope_mean_from_extrema(const double *x, int32_t n, double *out_mean)
         {
-            if (boundary_method_ == BoundaryMethod::Symmetric)
-            {
-                int32_t n_up = 0, n_lo = 0;
-                const bool ok =
-                    extend_extrema_symmetric(max_idx_.data(), n_max_, min_idx_.data(), n_min_, x, n,
-                                             boundary_extend_, ext_x_.data(), ext_y_.data(), n_up,
-                                             ext_x2_.data(), ext_y2_.data(), n_lo) &&
-                    compute_envelope(ext_x_.data(), ext_y_.data(), n_up, upper_env_.data, n) &&
-                    compute_envelope(ext_x2_.data(), ext_y2_.data(), n_lo, lower_env_.data, n);
-                if (!ok)
-                {
-                    std::memcpy(out_mean, x, n * sizeof(double));
-                    return false;
-                }
-                const double *__restrict upper = upper_env_.data;
-                const double *__restrict lower = lower_env_.data;
-                double *__restrict out = out_mean;
-                EEMD_OMP_SIMD
-                for (int32_t i = 0; i < n; ++i)
-                {
-                    out[i] = 0.5 * (upper[i] + lower[i]);
-                }
-                return true;
-            }
-
-            // Upper envelope - dispatch based on boundary method
-            int32_t n_ext, ext_start;
-            extend_extrema(max_idx_.data(), n_max_, x, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
-
-            if (!compute_envelope(ext_x_.data(), ext_y_.data(), n_ext,
-                                  upper_env_.data, n))
+            if (!build_envelopes(x, n))
             {
                 std::memcpy(out_mean, x, n * sizeof(double));
                 return false;
             }
-
-            // Lower envelope
-            extend_extrema(min_idx_.data(), n_min_, x, n, ext_x_.data(), ext_y_.data(), n_ext, ext_start);
-
-            if (!compute_envelope(ext_x_.data(), ext_y_.data(), n_ext,
-                                  lower_env_.data, n))
-            {
-                std::memcpy(out_mean, x, n * sizeof(double));
-                return false;
-            }
-
             // Local mean = (upper + lower) / 2
             const double *__restrict upper = upper_env_.data;
             const double *__restrict lower = lower_env_.data;
             double *__restrict out = out_mean;
-
             EEMD_OMP_SIMD
             for (int32_t i = 0; i < n; ++i)
             {
                 out[i] = 0.5 * (upper[i] + lower[i]);
             }
-
             return true;
+        }
+
+        /**
+         * The upper and lower envelopes of x, from its extrema in max_idx_ /
+         * min_idx_, into upper_env_ / lower_env_. False when they cannot be
+         * built.
+         */
+        bool build_envelopes(const double *x, int32_t n)
+        {
+            int32_t n_up = 0, n_lo = 0;
+            if (boundary_method_ == BoundaryMethod::Symmetric)
+            {
+                if (!extend_extrema_symmetric(max_idx_.data(), n_max_, min_idx_.data(), n_min_, x, n,
+                                              boundary_extend_, ext_x_.data(), ext_y_.data(), n_up,
+                                              ext_x2_.data(), ext_y2_.data(), n_lo))
+                    return false;
+            }
+            else
+            {
+                int32_t ext_start;
+                extend_extrema(max_idx_.data(), n_max_, x, n, ext_x_.data(), ext_y_.data(), n_up, ext_start);
+                extend_extrema(min_idx_.data(), n_min_, x, n, ext_x2_.data(), ext_y2_.data(), n_lo, ext_start);
+            }
+            return compute_envelopes(ext_x_.data(), ext_y_.data(), n_up, ext_x2_.data(), ext_y2_.data(), n_lo, n);
         }
 
         /**
@@ -991,7 +972,11 @@ namespace eemd
          */
         bool compute_sifted(const double *signal, int32_t n, double *local_mean, SiftStats *stats)
         {
-            double *__restrict h = h_.data;
+            // The mode being sifted. With the Rilling rule a step writes the
+            // next mode to the other buffer (local_mean, free until the end),
+            // and the two change places.
+            double *h = h_.data;
+            double *h_next = local_mean;
             std::memcpy(h, signal, n * sizeof(double));
 
             int32_t prev_n_extrema = -1;
@@ -1042,8 +1027,9 @@ namespace eemd
                     }
                 }
 
-                // local_mean doubles as the envelope-mean scratch here
-                if (!envelope_mean_from_extrema(h, n, local_mean))
+                // The envelopes; for the SD rule also their mean, into
+                // local_mean (scratch here)
+                if (!(rilling ? build_envelopes(h, n) : envelope_mean_from_extrema(h, n, local_mean)))
                 {
                     if (iter == 0)
                     {
@@ -1057,19 +1043,15 @@ namespace eemd
 
                 if (rilling)
                 {
-                    if (rilling_should_stop(h, upper_env_.data, lower_env_.data, n, n_extrema, sift_.rilling))
+                    // stop test, zero crossings and the next mode in one pass
+                    if (rilling_step(h, upper_env_.data, lower_env_.data, n, n_extrema, sift_.rilling, h_next))
                     {
                         if (stats && iter == 0)
                             stats->unsifted = true;
                         converged = true;
                         break;
                     }
-                    const double *__restrict m = local_mean;
-                    EEMD_OMP_SIMD
-                    for (int32_t i = 0; i < n; ++i)
-                    {
-                        h[i] -= m[i];
-                    }
+                    std::swap(h, h_next);
                     ++iterations;
                     continue;
                 }
@@ -1078,15 +1060,16 @@ namespace eemd
                 double sd_num = 0.0;
                 double sd_den = 0.0;
                 const double *__restrict m = local_mean;
+                double *__restrict hs = h; // h_ itself: the SD rule does not swap
 
                 EEMD_OMP_SIMD_REDUCTION2(+, sd_num, sd_den)
                 for (int32_t i = 0; i < n; ++i)
                 {
-                    const double val = h[i];
+                    const double val = hs[i];
                     const double mean = m[i];
                     sd_num += mean * mean;
                     sd_den += val * val;
-                    h[i] = val - mean;
+                    hs[i] = val - mean;
                 }
                 ++iterations;
 
@@ -1106,13 +1089,15 @@ namespace eemd
                 }
             }
 
-            // M(x) = x - E1(x)
+            // M(x) = x - E1(x). The mode may be in local_mean itself: each
+            // sample is read before it is written.
             const double *__restrict x = signal;
-            double *__restrict out = local_mean;
+            double *out = local_mean;
+            const double *mode = h;
             EEMD_OMP_SIMD
             for (int32_t i = 0; i < n; ++i)
             {
-                out[i] = x[i] - h[i];
+                out[i] = x[i] - mode[i];
             }
 
             if (stats)
@@ -1252,6 +1237,22 @@ namespace eemd
             return false;
         }
 
+        /**
+         * Both envelopes, the same as compute_envelope() for the upper and
+         * then the lower one. Two cubic splines are built together
+         * (EnvelopeSpline::construct_pair).
+         */
+        bool compute_envelopes(const double *xu, const double *yu, int32_t ku,
+                               const double *xl, const double *yl, int32_t kl, int32_t n)
+        {
+            if (spline_method_ == SplineMethod::Cubic && ku >= fast_threshold_ && kl >= fast_threshold_ &&
+                EnvelopeSpline::construct_pair(spline_, xu, yu, ku, spline2_, xl, yl, kl) &&
+                spline_.evaluate_uniform(upper_env_.data, n) && spline2_.evaluate_uniform(lower_env_.data, n))
+                return true;
+            // otherwise, and should that fail, one after the other as before
+            return compute_envelope(xu, yu, ku, upper_env_.data, n) && compute_envelope(xl, yl, kl, lower_env_.data, n);
+        }
+
         int32_t max_len_;
         int32_t boundary_extend_;
         int32_t fast_threshold_;
@@ -1277,7 +1278,8 @@ namespace eemd
         AlignedBuffer<double> lower_env_;
         AlignedBuffer<double> h_; // mode being sifted (Sifted mode only)
 
-        EnvelopeSpline spline_;
+        EnvelopeSpline spline_;  // the upper envelope (and both, one after the other)
+        EnvelopeSpline spline2_; // the lower envelope when the two are built together
     };
 
     // ============================================================================

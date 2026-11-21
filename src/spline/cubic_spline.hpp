@@ -21,8 +21,10 @@
  * thousands of times per decomposition, so both are written for that case:
  * the slopes at the knots come from one tridiagonal solve, each piece keeps
  * its four coefficients, and the evaluation walks the pieces once, four
- * samples at a time where AVX2 and FMA are there. No memory is allocated
- * after the buffers have grown to the largest knot count seen.
+ * samples at a time where AVX2 and FMA are there. construct_pair() builds a
+ * sifting step's two cubic envelopes with their two solves in one loop. No
+ * memory is allocated after the buffers have grown to the largest knot count
+ * seen.
  *
  * License: MIT
  */
@@ -81,37 +83,68 @@ namespace eemd
                 // from the first row down (cp, dp), then substitution back up.
                 double *cp = cp_.data();
                 double *dp = dp_.data();
-
-                // not-a-knot: the third derivative is continuous at the second knot
-                const double span0 = h[0] + h[1];
-                const double b0 = h[1];
-                const double c0 = span0;
-                const double d0 = ((3.0 * h[0] + 2.0 * h[1]) * h[1] * delta[0] + h[0] * h[0] * delta[1]) / span0;
-                cp[0] = c0 / b0;
-                dp[0] = d0 / b0;
-
+                first_row(h, delta, cp, dp);
                 for (int32_t i = 1; i < k - 1; ++i)
-                {
-                    const double a = h[i];
-                    const double c = h[i - 1];
-                    const double d = 3.0 * (h[i] * delta[i - 1] + h[i - 1] * delta[i]);
-                    const double denom = 2.0 * (h[i - 1] + h[i]) - a * cp[i - 1];
-                    cp[i] = c / denom;
-                    dp[i] = (d - a * dp[i - 1]) / denom;
-                }
-
-                // and at the last but one
-                const double span1 = h[k - 3] + h[k - 2];
-                const double a_last = span1;
-                const double b_last = h[k - 3];
-                const double d_last = (h[k - 2] * h[k - 2] * delta[k - 3] +
-                                       (2.0 * h[k - 3] + 3.0 * h[k - 2]) * h[k - 3] * delta[k - 2]) /
-                                      span1;
-                s[k - 1] = (d_last - a_last * dp[k - 2]) / (b_last - a_last * cp[k - 2]);
+                    eliminate_row(h, delta, cp, dp, i);
+                last_row(h, delta, cp, dp, s, k);
                 for (int32_t i = k - 2; i >= 0; --i)
-                    s[i] = dp[i] - cp[i] * s[i + 1];
+                    substitute_row(cp, dp, s, i);
             }
             finish_hermite(x, y, k);
+            return true;
+        }
+
+        /**
+         * construct() for two splines at once, as the upper and the lower
+         * envelope of a sifting step are: each gets the same result, bit for
+         * bit, as construct() gives it alone. Each row of the solve waits on a
+         * division from the row before; solving the two systems in one loop
+         * fills that wait with the other system's row. False when either
+         * cannot be built (see construct()).
+         */
+        static bool construct_pair(CubicSpline &a, const double *xa, const double *ya, int32_t ka,
+                                   CubicSpline &b, const double *xb, const double *yb, int32_t kb)
+        {
+            if (ka < 4 || kb < 4)
+                return a.construct(xa, ya, ka) && b.construct(xb, yb, kb);
+            if (!a.prepare(xa, ya, ka) || !b.prepare(xb, yb, kb))
+                return false;
+            const double *ha = a.h_.data(), *da = a.delta_.data();
+            const double *hb = b.h_.data(), *db = b.delta_.data();
+            double *cpa = a.cp_.data(), *dpa = a.dp_.data(), *sa = a.slope_.data();
+            double *cpb = b.cp_.data(), *dpb = b.dp_.data(), *sb = b.slope_.data();
+
+            // elimination down: rows 1 .. k - 2, both while both have them
+            const int32_t shorter = ka < kb ? ka : kb;
+            first_row(ha, da, cpa, dpa);
+            first_row(hb, db, cpb, dpb);
+            int32_t i = 1;
+            for (; i < shorter - 1; ++i)
+            {
+                eliminate_row(ha, da, cpa, dpa, i);
+                eliminate_row(hb, db, cpb, dpb, i);
+            }
+            for (int32_t j = i; j < ka - 1; ++j)
+                eliminate_row(ha, da, cpa, dpa, j);
+            for (int32_t j = i; j < kb - 1; ++j)
+                eliminate_row(hb, db, cpb, dpb, j);
+            last_row(ha, da, cpa, dpa, sa, ka);
+            last_row(hb, db, cpb, dpb, sb, kb);
+
+            // substitution up, both from their own last row
+            int32_t ia = ka - 2, ib = kb - 2;
+            for (; ia >= 0 && ib >= 0; --ia, --ib)
+            {
+                substitute_row(cpa, dpa, sa, ia);
+                substitute_row(cpb, dpb, sb, ib);
+            }
+            for (; ia >= 0; --ia)
+                substitute_row(cpa, dpa, sa, ia);
+            for (; ib >= 0; --ib)
+                substitute_row(cpb, dpb, sb, ib);
+
+            a.finish_hermite(xa, ya, ka);
+            b.finish_hermite(xb, yb, kb);
             return true;
         }
 
@@ -264,6 +297,50 @@ namespace eemd
         }
 
     private:
+        // The steps of the not-a-knot solve (k >= 4 knots), shared by
+        // construct() and construct_pair() so that both compute the same.
+
+        /** Row 0, not-a-knot: the third derivative is continuous at the second knot. */
+        static inline void first_row(const double *h, const double *delta, double *cp, double *dp)
+        {
+            const double span0 = h[0] + h[1];
+            const double b0 = h[1];
+            const double c0 = span0;
+            const double d0 = ((3.0 * h[0] + 2.0 * h[1]) * h[1] * delta[0] + h[0] * h[0] * delta[1]) / span0;
+            cp[0] = c0 / b0;
+            dp[0] = d0 / b0;
+        }
+
+        /** Interior row i: eliminated with row i - 1. */
+        static inline void eliminate_row(const double *h, const double *delta, double *cp, double *dp, int32_t i)
+        {
+            const double a = h[i];
+            const double c = h[i - 1];
+            const double d = 3.0 * (h[i] * delta[i - 1] + h[i - 1] * delta[i]);
+            const double denom = 2.0 * (h[i - 1] + h[i]) - a * cp[i - 1];
+            cp[i] = c / denom;
+            dp[i] = (d - a * dp[i - 1]) / denom;
+        }
+
+        /** Row k - 1, not-a-knot at the last but one knot: gives s[k - 1]. */
+        static inline void last_row(const double *h, const double *delta, const double *cp, const double *dp,
+                                    double *s, int32_t k)
+        {
+            const double span1 = h[k - 3] + h[k - 2];
+            const double a_last = span1;
+            const double b_last = h[k - 3];
+            const double d_last = (h[k - 2] * h[k - 2] * delta[k - 3] +
+                                   (2.0 * h[k - 3] + 3.0 * h[k - 2]) * h[k - 3] * delta[k - 2]) /
+                                  span1;
+            s[k - 1] = (d_last - a_last * dp[k - 2]) / (b_last - a_last * cp[k - 2]);
+        }
+
+        /** Back substitution: s[i] from s[i + 1]. */
+        static inline void substitute_row(const double *cp, const double *dp, double *s, int32_t i)
+        {
+            s[i] = dp[i] - cp[i] * s[i + 1];
+        }
+
         /** Spacing and chord slopes; false for fewer than 2 knots or x not increasing. */
         bool prepare(const double *x, const double *y, int32_t k)
         {

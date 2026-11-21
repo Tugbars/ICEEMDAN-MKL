@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -399,6 +400,50 @@ int main()
             }
         }
         check(worst < 1e-13, "2000 random knot sets against exact straight lines", worst, 1e-13);
+    }
+
+    std::printf("Two splines built together (construct_pair)\n");
+    {
+        // the upper and lower envelope of a sifting step: knot counts equal or a few apart
+        eemd::CubicSpline a, b, a1, b1;
+        const auto knots = [&](int k, std::vector<double> &x, std::vector<double> &y)
+        {
+            x.resize(k);
+            y.resize(k);
+            double pos = static_cast<double>(static_cast<int>(rng() % 9) - 6);
+            for (int i = 0; i < k; ++i)
+            {
+                x[i] = pos;
+                pos += 1 + static_cast<double>(rng() % 5);
+                y[i] = u(rng);
+            }
+        };
+        bool same = true, built = true;
+        for (int trial = 0; trial < 2000; ++trial)
+        {
+            const int ka = 2 + static_cast<int>(rng() % 60);
+            const int kb = std::max(2, ka + static_cast<int>(rng() % 7) - 3);
+            std::vector<double> xa, ya, xb, yb;
+            knots(ka, xa, ya);
+            knots(kb, xb, yb);
+            const int n = 1 + static_cast<int>(std::max(xa[ka - 1], xb[kb - 1])) + static_cast<int>(rng() % 5);
+            std::vector<double> pa(n), pb(n), sa(n), sb(n);
+            const bool ok = eemd::CubicSpline::construct_pair(a, xa.data(), ya.data(), ka, b, xb.data(), yb.data(), kb) &&
+                            a.evaluate_uniform(pa.data(), n) && b.evaluate_uniform(pb.data(), n);
+            const bool ok1 = a1.construct(xa.data(), ya.data(), ka) && b1.construct(xb.data(), yb.data(), kb) &&
+                             a1.evaluate_uniform(sa.data(), n) && b1.evaluate_uniform(sb.data(), n);
+            built = built && ok && ok1;
+            same = same && std::memcmp(pa.data(), sa.data(), n * sizeof(double)) == 0 &&
+                   std::memcmp(pb.data(), sb.data(), n * sizeof(double)) == 0;
+        }
+        check(built, "2000 random pairs (2 to 64 knots, counts up to 3 apart) build and evaluate");
+        check(same, "each spline of a pair equals construct() alone, bit for bit");
+
+        const double xg[] = {0, 2, 4, 7, 9}, yg[] = {1, -1, 2, 0, 1};
+        const double xbad[] = {0, 2, 2, 5, 8}, ybad[] = {0, 1, 2, 3, 4};
+        check(!eemd::CubicSpline::construct_pair(a, xg, yg, 5, b, xbad, ybad, 5) &&
+                  !eemd::CubicSpline::construct_pair(a, xbad, ybad, 5, b, xg, yg, 5),
+              "a pair with knots that do not increase in either is refused");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures,
