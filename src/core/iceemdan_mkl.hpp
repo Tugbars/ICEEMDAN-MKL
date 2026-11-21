@@ -1,5 +1,5 @@
 /**
- * ICEEMDAN-MKL Optimized
+ * ICEEMDAN (Improved Complete Ensemble EMD with Adaptive Noise)
  *
  * Algorithm: Colominas, Schlotthauer & Torres (2014). The defaults follow the
  * authors' reference code: local means from sifting to convergence with the
@@ -8,8 +8,7 @@
  * Optional speed-ups (see ICEEMDANConfig):
  * 1. Circular Noise Bank - 1 long decomposition vs M short ones (off by default)
  * 2. Antithetic Variables - Process ±noise pairs for 2x variance reduction
- * 3. Sorted Spline Evaluation - Faster than uniform for dense extrema (~2.8x)
- * 4. Spline Fast Path - Linear interp for n_extrema < 6
+ * 3. Spline Fast Path - Linear interp for n_extrema < 6 (single-envelope local mean)
  *
  * License: MIT
  */
@@ -112,7 +111,10 @@ namespace eemd
     struct ICEEMDANConfig
     {
         // === Core EMD Parameters ===
-        int32_t max_imfs = 10;
+        // At most this many IMFs. The authors' code has no limit: it stops when
+        // the residue needs no sifting, after about log2(N) modes; 32 is a
+        // safety net that a signal does not reach in practice.
+        int32_t max_imfs = 32;
         int32_t max_sift_iters = 100;
         double sift_threshold = 0.05;
         int32_t ensemble_size = 100;
@@ -140,7 +142,10 @@ namespace eemd
         RillingThresholds rilling;
 
         // === Optimization Flags ===
-        bool use_antithetic = true;        // ±noise pairs (2x variance reduction)
+        // ±noise pairs: ensemble_size / 2 realizations, each used with both
+        // signs. Off by default: the published algorithm and the authors' code
+        // draw ensemble_size independent realizations.
+        bool use_antithetic = false;
         // Noise modes from windows of ONE long decomposed realization instead
         // of independent realizations. Off by default: the windows of a long
         // realization overlap and their low-frequency modes are not those of a
@@ -206,12 +211,12 @@ namespace eemd
             switch (mode)
             {
             case ProcessingMode::Standard:
-                // Audio/Seismic: prioritize smoothness
+                // The published algorithm, as the authors' code computes it
                 volatility_method = VolatilityMethod::Global;
                 boundary_method = BoundaryMethod::Symmetric;
                 sanitize_input = false;
                 track_convergence = false;
-                use_antithetic = true;
+                use_antithetic = false;
                 use_circular_bank = false;
                 adaptive_ensemble = false;  // Disabled - marginal benefit
                 break;
@@ -317,6 +322,12 @@ namespace eemd
         }
 
         return std::sqrt(var / n);
+    }
+
+    /** Standard deviation with n - 1 in the denominator (MATLAB's std). */
+    inline double compute_sample_std(const double *signal, int32_t n)
+    {
+        return n > 1 ? compute_std(signal, n) * std::sqrt(static_cast<double>(n) / (n - 1)) : 0.0;
     }
 
     // ============================================================================
@@ -450,7 +461,7 @@ namespace eemd
      * Sanitize input signal: replace NaN/Inf with interpolated values
      * Returns count of sanitized points (for diagnostics)
      *
-     * CRITICAL: MKL spline functions crash on NaN/Inf input
+     * The envelopes and the sifting assume finite input
      *
      * Uses is_finite_bits(), which -ffast-math cannot optimize away (with
      * std::isfinite the whole check compiled to nothing under the project's
@@ -793,6 +804,10 @@ namespace eemd
     {
         int32_t iterations = 0; // envelope means subtracted
         bool converged = true;  // false: stopped by max_sift_iters
+        // Rilling only: the input was not sifted at all, because it has too
+        // few extrema for envelopes or already passes the stop rule as it
+        // stands. emd.m then returns one row, the input itself.
+        bool unsifted = false;
     };
 
     /** Sifting parameters of the Sifted local-mean operator. */
@@ -857,6 +872,25 @@ namespace eemd
         }
 
         int32_t get_n_extrema() const { return n_max_ + n_min_; }
+
+        /**
+         * Whether sifting x would change it: false when x has too few extrema
+         * for envelopes or already passes the Rilling stop rule as it stands.
+         * emd(x, 'MAXMODES', 1) returns exactly one row then, and the authors'
+         * ceemdan.m stops the decomposition. Sifted method only.
+         */
+        bool sifting_needed(const double *x, int32_t n)
+        {
+            find_extrema_raw(x, n, max_idx_.data(), n_max_, min_idx_.data(), n_min_);
+            const bool enough = (boundary_method_ == BoundaryMethod::Symmetric)
+                                    ? (n_max_ >= 1 && n_min_ >= 1 && n_max_ + n_min_ >= 3)
+                                    : (n_max_ >= 2 && n_min_ >= 2);
+            if (!enough || !envelope_mean_from_extrema(x, n, h_.data))
+                return false;
+            if (sift_.rule != SiftStopRule::Rilling)
+                return true;
+            return !rilling_should_stop(x, upper_env_.data, lower_env_.data, n, n_max_ + n_min_, sift_.rilling);
+        }
 
     private:
         /**
@@ -956,14 +990,23 @@ namespace eemd
             int32_t iterations = 0;
             bool converged = false;
 
+            if (stats)
+                stats->unsifted = false;
             for (int32_t iter = 0; iter < sift_.max_iters; ++iter)
             {
                 find_extrema_raw(h, n, max_idx_.data(), n_max_, min_idx_.data(), n_min_);
 
-                if (n_max_ < 2 || n_min_ < 2)
+                // Enough extrema for envelopes: with the symmetric ends, three
+                // in all (emd.m); otherwise two of each kind
+                const bool enough = (boundary_method_ == BoundaryMethod::Symmetric)
+                                        ? (n_max_ >= 1 && n_min_ >= 1 && n_max_ + n_min_ >= 3)
+                                        : (n_max_ >= 2 && n_min_ >= 2);
+                if (!enough)
                 {
                     if (iter == 0)
                     {
+                        if (stats)
+                            stats->unsifted = true;
                         std::memcpy(local_mean, signal, n * sizeof(double));
                         return false;
                     }
@@ -995,6 +1038,8 @@ namespace eemd
                 {
                     if (iter == 0)
                     {
+                        if (stats)
+                            stats->unsifted = true;
                         std::memcpy(local_mean, signal, n * sizeof(double));
                         return false;
                     }
@@ -1005,6 +1050,8 @@ namespace eemd
                 {
                     if (rilling_should_stop(h, upper_env_.data, lower_env_.data, n, n_extrema, sift_.rilling))
                     {
+                        if (stats && iter == 0)
+                            stats->unsifted = true;
                         converged = true;
                         break;
                     }
@@ -1309,11 +1356,8 @@ namespace eemd
             AlignedBuffer<double> long_noise(static_cast<size_t>(long_n_));
             AlignedBuffer<double> work(static_cast<size_t>(long_n_));
 
-            VSLStreamStatePtr stream = nullptr;
-            vslNewStream(&stream, VSL_BRNG_MT19937, base_seed);
-            vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                          static_cast<MKL_INT>(long_n_), long_noise.data, 0.0, 1.0);
-            vslDeleteStream(&stream);
+            // its own stream of the seed, apart from the trials' streams
+            rng::gaussian(base_seed, rng::circular_stream, long_n_, long_noise.data);
 
             // Decompose the long signal ONCE
             const int32_t long_n32 = static_cast<int32_t>(long_n_);
@@ -1387,24 +1431,21 @@ namespace eemd
     public:
         StandardNoiseBank() = default;
 
-        void initialize(int32_t n, int32_t ensemble_size, int32_t max_imfs,
+        /**
+         * The modes of each noise realization as the authors' code takes them
+         * (ceemdan.m uses the rows of emd.m's output): the IMFs, then the
+         * residue as one more mode unless it is all zero. At most max_modes
+         * in all; each realization keeps only the modes it has.
+         */
+        void initialize(int32_t n, int32_t ensemble_size, int32_t max_modes,
                         const EEMDConfig &emd_config, uint32_t base_seed)
         {
             n_ = n;
             ensemble_size_ = ensemble_size;
-            max_imfs_ = max_imfs;
+            max_imfs_ = max_modes;
 
-            noise_imfs_.resize(ensemble_size);
-            imf_counts_.resize(ensemble_size);
-
-            for (int32_t i = 0; i < ensemble_size; ++i)
-            {
-                noise_imfs_[i].resize(max_imfs);
-                for (int32_t k = 0; k < max_imfs; ++k)
-                {
-                    noise_imfs_[i][k].resize(n);
-                }
-            }
+            noise_imfs_.assign(ensemble_size, {});
+            imf_counts_.assign(ensemble_size, 0);
 
             threads::for_static(threads::team_size(), ensemble_size,
                                 [&](int32_t i_begin, int32_t i_end, int)
@@ -1412,31 +1453,32 @@ namespace eemd
                 if (i_begin == i_end)
                     return;
 
-                AlignedBuffer<double> noise(n);
                 AlignedBuffer<double> work(n);
-
                 Sifter sifter(n, emd_config);
 
                 for (int32_t i = i_begin; i < i_end; ++i)
                 {
                     // Realization i depends on (seed, i) only: the same at any thread count
-                    if (!trial_gaussian(base_seed, static_cast<uint32_t>(i), n, noise.data))
+                    if (!trial_gaussian(base_seed, static_cast<uint32_t>(i), n, work.data))
                     {
-                        noise.zero();
+                        work.zero();
                     }
 
-                    std::memcpy(work.data, noise.data, n * sizeof(double));
-
-                    int32_t imf_count = 0;
-                    for (int32_t k = 0; k < max_imfs; ++k)
+                    std::vector<std::vector<double>> &modes = noise_imfs_[i];
+                    while (static_cast<int32_t>(modes.size()) < max_modes)
                     {
-                        if (!sifter.sift_imf(work.data, noise_imfs_[i][k].data(), n))
-                        {
+                        std::vector<double> imf(n);
+                        if (!sifter.sift_imf(work.data, imf.data(), n))
                             break;
-                        }
-                        ++imf_count;
+                        modes.push_back(std::move(imf));
                     }
-                    imf_counts_[i] = imf_count;
+                    // the residue, as emd.m returns it: when not all zero
+                    bool any = false;
+                    for (int32_t j = 0; j < n && !any; ++j)
+                        any = work.data[j] != 0.0;
+                    if (any && static_cast<int32_t>(modes.size()) < max_modes)
+                        modes.emplace_back(work.data, work.data + n);
+                    imf_counts_[i] = static_cast<int32_t>(modes.size());
                 }
             });
 
@@ -1510,7 +1552,6 @@ namespace eemd
          * - Circular noise bank (optional, default off; automatic fallback
          *   when the independent bank exceeds noise_bank_max_bytes)
          * - Antithetic variables (optional, default on)
-         * - Sorted spline evaluation
          * - Linear interp fast path for sparse extrema
          *
          * Mode-specific behavior:
@@ -1538,7 +1579,7 @@ namespace eemd
             if (n < 4 || config_.ensemble_size < 1 || config_.max_imfs < 1)
                 return false;
 
-            // Input sanitization (NaN/Inf protection for MKL)
+            // Input sanitization (NaN/Inf protection)
             AlignedBuffer<double> signal_clean(n);
             std::memcpy(signal_clean.data, signal, n * sizeof(double));
 
@@ -1566,6 +1607,16 @@ namespace eemd
                 local_vol_array.data); // Only written if SMA/EMA
 
             const double signal_std = std::max(config_.vol_floor, compute_std(clean_signal, n));
+            // The noise amplitudes beta_k use the standard deviation with n - 1,
+            // as ceemdan.m (MATLAB's std) does
+            const double signal_sample_std = std::max(config_.vol_floor, compute_sample_std(clean_signal, n));
+
+            // The published algorithm (Rilling stop rule, sifted local means)
+            // follows the authors' ceemdan.m also where the paper leaves
+            // details open: a trial whose input is not sifted at all, and when
+            // the decomposition stops (see below)
+            const bool reference_path = config_.sift_stop_rule == SiftStopRule::Rilling &&
+                                        config_.local_mean_method == LocalMeanMethod::Sifted;
 
             // Build EMD config
             EEMDConfig emd_config;
@@ -1590,8 +1641,14 @@ namespace eemd
             // realization per base trial (antithetic pairs share theirs).
             // It depends on the key below and on nothing in the signal, so the
             // bank of the last call is used again when the key is the same.
+            // A realization of length n has about log2(n) modes, so the bank
+            // never holds more than this many per realization
+            int32_t bank_modes = 2;
+            for (int32_t len = n; len > 1; len >>= 1)
+                ++bank_modes;
+            bank_modes = std::min(bank_modes, config_.max_imfs);
             const size_t independent_bytes = static_cast<size_t>(base_trials) *
-                                             static_cast<size_t>(config_.max_imfs) *
+                                             static_cast<size_t>(bank_modes) *
                                              static_cast<size_t>(n) * sizeof(double);
             const bool use_circular = config_.use_circular_bank ||
                                       independent_bytes > config_.noise_bank_max_bytes;
@@ -1623,7 +1680,7 @@ namespace eemd
                 release_noise_bank();
                 if (use_circular)
                 {
-                    if (!circular_bank_.initialize(n, config_.ensemble_size, config_.max_imfs,
+                    if (!circular_bank_.initialize(n, config_.ensemble_size, bank_modes,
                                                    emd_config, config_.rng_seed,
                                                    config_.circular_multiplier,
                                                    config_.noise_bank_max_bytes))
@@ -1633,7 +1690,7 @@ namespace eemd
                 }
                 else
                 {
-                    standard_bank_.initialize(n, base_trials, config_.max_imfs,
+                    standard_bank_.initialize(n, base_trials, bank_modes,
                                               emd_config, config_.rng_seed);
                 }
                 bank_key_ = key;
@@ -1748,6 +1805,12 @@ namespace eemd
                 const int32_t n_threads = threads::team_size();
                 std::vector<std::unique_ptr<ThreadState>> thread_states(n_threads);
 
+                // The stop test of the published path, on the calling thread
+                LocalMeanComputer stop_test(n, config_.boundary_extend, config_.spline_fast_threshold,
+                                            config_.boundary_method, config_.ar_lookback, config_.ar_damping,
+                                            config_.ar_max_slope_atr, config_.spline_method,
+                                            config_.local_mean_method, sift_params);
+
                 // =============================================================
                 // IMF EXTRACTION LOOP (on the calling thread; the trials of a
                 // stage and their reduction are forked to the pool)
@@ -1768,8 +1831,8 @@ namespace eemd
                     // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
                     // per-trial factor std(x) / std(E_1(w)) is applied below
                     stage_scale = (k == 0)
-                                      ? decay_factor * config_.noise_std * signal_std
-                                      : decay_factor * config_.noise_std * compute_std(r_current.data, n);
+                                      ? decay_factor * config_.noise_std * signal_sample_std
+                                      : decay_factor * config_.noise_std * compute_sample_std(r_current.data, n);
 
                     // =============================================================
                     // BATCH PROCESSING LOOP (one batch unless adaptive)
@@ -1811,7 +1874,7 @@ namespace eemd
                                 if (noise_imf && k == 0)
                                 {
                                     // beta_0 = eps * std(x) / std(E_1(w^(i)))
-                                    const double sw = compute_std(noise_imf, n);
+                                    const double sw = compute_sample_std(noise_imf, n);
                                     amp = (sw > 1e-300) ? stage_scale / sw : 0.0;
                                 }
                                 // Local-volatility modes keep their time profile,
@@ -1853,7 +1916,26 @@ namespace eemd
 
                                     SiftStats ss;
                                     ++st.attempted;
-                                    if (lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data, &ss))
+                                    const bool lm_ok = lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data, &ss);
+                                    if (reference_path && ss.unsifted)
+                                    {
+                                        // emd.m returned one row, the input itself:
+                                        // ceemdan.m's first stage takes the input
+                                        // minus that row (a local mean of 0), the
+                                        // later stages that row (the input)
+                                        ++st.valid;
+                                        if (k > 0)
+                                        {
+                                            const double *__restrict pin = tl_perturbed.data;
+                                            EEMD_OMP_SIMD
+                                            for (int32_t j = 0; j < n; ++j)
+                                            {
+                                                acc[j] += pin[j];
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    if (lm_ok)
                                     {
                                         ++st.valid;
                                         st.iterations += ss.iterations;
@@ -1984,8 +2066,16 @@ namespace eemd
                         decay_factor *= config_.noise_decay;
 
                         // Check stopping criteria
-                        if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||
-                            count_extrema(r_current.data, n) < config_.min_extrema)
+                        if (reference_path)
+                        {
+                            // ceemdan.m goes on while emd(r, 'MAXMODES', 1) gives a
+                            // mode and a residue: r has enough extrema and is not
+                            // already a mode as it stands
+                            if (!stop_test.sifting_needed(r_current.data, n))
+                                stop_decomposition = true;
+                        }
+                        else if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||
+                                 count_extrema(r_current.data, n) < config_.min_extrema)
                         {
                             stop_decomposition = true;
                         }

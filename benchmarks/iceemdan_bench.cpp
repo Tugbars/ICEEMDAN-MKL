@@ -100,20 +100,18 @@ void generate_synthetic_signal(double *signal, int32_t n, double dt)
 // Simulated financial returns (regime switching + noise)
 void generate_financial_signal(double *signal, int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
-    // Generate base noise
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, signal, 0.0, 1.0);
-    
+    // Generate base noise, and the uniforms of the regime switches from another stream
+    eemd::rng::gaussian(seed, 0, n, signal);
+    std::vector<uint32_t> words(n);
+    eemd::rng::philox_words(seed, 1, 0, n, words.data());
+
     // Add regime-dependent volatility
     double vol = 0.01;
     for (int32_t i = 1; i < n; ++i)
     {
         // Regime switch probability
         double regime_prob = 0.02;
-        double u;
-        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, 1, &u, 0.0, 1.0);
+        const double u = eemd::rng::uniform(words[i]);
         
         if (u < regime_prob)
         {
@@ -131,8 +129,6 @@ void generate_financial_signal(double *signal, int32_t n, uint32_t seed)
     {
         signal[i] += signal[i - 1];
     }
-    
-    vslDeleteStream(&stream);
 }
 
 // ============================================================================
@@ -363,7 +359,6 @@ void bench_thread_scaling()
     for (int32_t threads = 1; threads <= max_threads; threads *= 2)
     {
         eemd::set_num_threads(threads);
-        mkl_set_num_threads(1);
         
         // Warm up the thread pool
         eemd::threads::run(eemd::threads::team_size(), [](int) {});
@@ -385,7 +380,6 @@ void bench_thread_scaling()
     }
     
     eemd::set_num_threads(max_threads);
-    mkl_set_num_threads(1);
 }
 
 void bench_eemd_vs_iceemdan()
@@ -806,18 +800,11 @@ CycleBreakdown profile_noise_bank(int32_t n, int32_t ensemble_size, int32_t max_
     }
     
     eemd::threads::for_static(eemd::threads::team_size(), ensemble_size,
-                              [&](int32_t i_begin, int32_t i_end, int tid)
+                              [&](int32_t i_begin, int32_t i_end, int)
     {
-        VSLStreamStatePtr stream = nullptr;
-        vslNewStream(&stream, VSL_BRNG_MT19937, seed + tid * 10000);
-        
+        // one stream per realization, as the library draws them
         for (int32_t i = i_begin; i < i_end; ++i)
-        {
-            vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
-                          n, all_noise[i].data, 0.0, 1.0);
-        }
-        
-        vslDeleteStream(&stream);
+            eemd::trial_gaussian(seed, static_cast<uint32_t>(i), n, all_noise[i].data);
     });
     
     auto t_gen_end = Clock::now();
@@ -1335,10 +1322,9 @@ int main()
 {
     eemd_init_low_latency(8, true);
     
-    std::cout << "\nICEEMDAN-MKL Performance Benchmark\n";
-    std::cout << "===================================\n";
+    std::cout << "\nICEEMDAN Performance Benchmark\n";
+    std::cout << "==============================\n";
     std::cout << "Max threads: " << eemd::get_num_threads() << "\n";
-    std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential for ICEEMDAN)\n";
     
     bench_signal_length();
     bench_ensemble_size();

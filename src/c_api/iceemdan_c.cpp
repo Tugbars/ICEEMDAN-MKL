@@ -2,7 +2,7 @@
  * C API wrapper for ICEEMDAN - Python ctypes bindings
  *
  * CMake builds it as the shared library "iceemdan" (target iceemdan_shared),
- * linked with MKL's sequential layer and VectorFFT.
+ * linked with VectorFFT, its only dependency.
  */
 
 #include "iceemdan_mkl.hpp"

@@ -135,7 +135,6 @@ void bench_thread_scaling()
     for (int32_t threads = 1; threads <= max_threads; threads *= 2)
     {
         eemd::set_num_threads(threads);
-        mkl_set_num_threads(1); // CRITICAL: MKL sequential to avoid N² threads!
 
         // Warm up the thread pool
         eemd::threads::run(eemd::threads::team_size(), [](int) {});
@@ -158,7 +157,6 @@ void bench_thread_scaling()
 
     // Restore defaults
     eemd::set_num_threads(max_threads);
-    mkl_set_num_threads(1); // Keep MKL sequential for EEMD workloads
 }
 
 void bench_emd_vs_eemd()
@@ -209,10 +207,9 @@ int main()
     // Initialize with low-latency settings
     eemd_init_low_latency(8, true); // Adjust core count for your CPU
 
-    std::cout << "\nEEMD-MKL Performance Benchmark\n";
-    std::cout << "==============================\n";
+    std::cout << "\nEEMD Performance Benchmark\n";
+    std::cout << "==========================\n";
     std::cout << "Max threads: " << eemd::get_num_threads() << "\n";
-    std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential for EEMD)\n";
 
     bench_signal_length();
     bench_ensemble_size();

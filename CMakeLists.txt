@@ -3,62 +3,11 @@ cmake_minimum_required(VERSION 3.20)
 project(eemd_mkl 
     VERSION 1.0.0
     LANGUAGES CXX
-    DESCRIPTION "EEMD/ICEEMDAN with Intel MKL"
+    DESCRIPTION "EEMD and ICEEMDAN (Improved Complete Ensemble EMD with Adaptive Noise)"
 )
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# ============================================================================
-# MKL Configuration
-# ============================================================================
-
-# CRITICAL: Force LP64 (32-bit integers)
-set(MKL_INTERFACE "lp64" CACHE STRING "MKL interface (lp64 or ilp64)" FORCE)
-# Sequential MKL: the library runs its own threads (src/threads) and calls
-# MKL from each of them, so MKL needs no threads of its own and no OpenMP runtime.
-set(MKL_THREADING "sequential" CACHE STRING "MKL threading" FORCE)
-
-# MinGW cannot link MKL's layered libraries, import or static (they hold
-# objects built for the MSVC runtime): it links MKL's single dynamic library,
-# mkl_rt. FORCE: MKL's own configuration caches "dynamic" when it runs first.
-if(MINGW)
-    set(MKL_LINK "sdl" CACHE STRING "MKL linking: static, dynamic or sdl" FORCE)
-endif()
-
-# Where MKL comes from, first hit:
-#   -DMKL_DIR=<folder of MKLConfig.cmake>
-#   MKLROOT in the environment (oneAPI's setvars sets it)
-#   oneAPI's standard install folder
-#   CMake's own search (CMAKE_PREFIX_PATH, ...)
-if(NOT MKL_DIR)
-    set(_mkl_roots "")
-    if(DEFINED ENV{MKLROOT})
-        list(APPEND _mkl_roots "$ENV{MKLROOT}")
-    endif()
-    if(DEFINED ENV{ONEAPI_ROOT})
-        list(APPEND _mkl_roots "$ENV{ONEAPI_ROOT}/mkl/latest")
-    endif()
-    list(APPEND _mkl_roots "C:/Program Files (x86)/Intel/oneAPI/mkl/latest" "/opt/intel/oneapi/mkl/latest")
-    foreach(_mkl_root IN LISTS _mkl_roots)
-        if(EXISTS "${_mkl_root}/lib/cmake/mkl/MKLConfig.cmake")
-            file(TO_CMAKE_PATH "${_mkl_root}/lib/cmake/mkl" _mkl_dir)
-            set(MKL_DIR "${_mkl_dir}" CACHE PATH "Folder of MKLConfig.cmake")
-            break()
-        endif()
-    endforeach()
-endif()
-
-# MKL's configuration caches the folder of mkl.h and keeps it when MKL_DIR
-# changes: a build folder first configured against another MKL would go on
-# compiling with that one's headers (and whatever else its include folder
-# holds). Look it up again on every configure.
-unset(MKL_INCLUDE CACHE)
-
-find_package(MKL CONFIG REQUIRED)
-
-message(STATUS "MKL found: ${MKL_ROOT}")
-message(STATUS "MKL interface: ${MKL_INTERFACE}")
 
 # ============================================================================
 # Threads: the C++ standard library's (std::thread). No OpenMP runtime.
@@ -111,6 +60,7 @@ target_include_directories(eemd_mkl INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/fft>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/threads>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/spline>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/rng>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -119,21 +69,15 @@ target_compile_options(eemd_mkl INTERFACE
     ${CXX_FLAGS_SIMD}
 )
 
-target_link_libraries(eemd_mkl INTERFACE 
-    MKL::MKL 
+# The library needs nothing else: its splines, random numbers and threads are
+# its own, and the FFTs are VectorFFT's (below).
+target_link_libraries(eemd_mkl INTERFACE
     Threads::Threads
 )
 
-target_compile_definitions(eemd_mkl INTERFACE 
-    MKL_LP64 
+target_compile_definitions(eemd_mkl INTERFACE
     _USE_MATH_DEFINES
 )
-
-# mkl_rt picks its threading layer at run time: the headers ask for the
-# sequential one (with the layered libraries, MKL_THREADING above links it)
-if(MKL_LINK STREQUAL "sdl")
-    target_compile_definitions(eemd_mkl INTERFACE EEMD_MKL_SINGLE_DYNAMIC_LIBRARY=1)
-endif()
 
 # ============================================================================
 # FFT: VectorFFT (https://github.com/Tugbars/VectorFFT), required
@@ -243,8 +187,8 @@ else()
     endif()
 endif()
 
-# An installed copy of these headers needs VectorFFT::vfft (and MKL::MKL) from
-# whoever uses them: neither is installed with them.
+# An installed copy of these headers needs VectorFFT::vfft from whoever uses
+# them: it is not installed with them.
 target_link_libraries(eemd_mkl INTERFACE VectorFFT::vfft)
 
 # Windows: put the VectorFFT DLLs beside the programs. On Linux the programs
@@ -324,17 +268,18 @@ add_iceemdan_executable(test_fft_hilbert tests/test_fft_hilbert.cpp)
 add_iceemdan_executable(test_fixes tests/test_fixes.cpp)
 add_iceemdan_executable(test_threads tests/test_threads.cpp)
 add_iceemdan_executable(test_spline tests/test_spline.cpp)
+add_iceemdan_executable(test_rng tests/test_rng.cpp)
 
 enable_testing()
 add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
 add_test(NAME fixes COMMAND test_fixes)
 add_test(NAME threads COMMAND test_threads)
 add_test(NAME spline COMMAND test_spline)
+add_test(NAME rng COMMAND test_rng)
 
 # --- Test programs run by hand ---
 add_eemd_executable(eemd_test tests/eemd_test.cpp)
 add_iceemdan_executable(accuracy_test tests/iceemdan_accuracy_test.cpp)
-add_iceemdan_executable(test_akima tests/test_akima.cpp)
 
 # ============================================================================
 # Benchmarks (benchmarks/)
@@ -346,8 +291,81 @@ add_iceemdan_executable(iceemdan_finance_bench benchmarks/iceemdan_finance_bench
 add_iceemdan_executable(bench_adaptive benchmarks/bench_adaptive.cpp)
 add_iceemdan_executable(bench_snumber benchmarks/bench_snumber.cpp)
 
-# spline_bench: the library's cubic spline (src/spline) against MKL Data Fitting
-add_eemd_executable(spline_bench benchmarks/spline_bench.cpp)
+# ============================================================================
+# Intel MKL: optional, for two comparison programs only
+#
+# The library uses no MKL. benchmarks/spline_bench.cpp and
+# benchmarks/rng_bench.cpp set the library's splines and random numbers
+# against MKL's; they are built with -DEEMD_MKL_COMPARISONS=ON when MKL is
+# found.
+# ============================================================================
+
+option(EEMD_MKL_COMPARISONS "Build the programs that compare the library with Intel MKL (needs MKL)" OFF)
+
+if(EEMD_MKL_COMPARISONS)
+    # 32-bit integers (LP64), and MKL's sequential layer: the programs call
+    # MKL from one thread and need no OpenMP runtime
+    set(MKL_INTERFACE "lp64" CACHE STRING "MKL interface (lp64 or ilp64)" FORCE)
+    set(MKL_THREADING "sequential" CACHE STRING "MKL threading" FORCE)
+
+    # MinGW cannot link MKL's layered libraries, import or static (they hold
+    # objects built for the MSVC runtime): it links MKL's single dynamic library,
+    # mkl_rt. FORCE: MKL's own configuration caches "dynamic" when it runs first.
+    if(MINGW)
+        set(MKL_LINK "sdl" CACHE STRING "MKL linking: static, dynamic or sdl" FORCE)
+    endif()
+
+    # Where MKL comes from, first hit:
+    #   -DMKL_DIR=<folder of MKLConfig.cmake>
+    #   MKLROOT in the environment (oneAPI's setvars sets it)
+    #   oneAPI's standard install folder
+    #   CMake's own search (CMAKE_PREFIX_PATH, ...)
+    if(NOT MKL_DIR)
+        set(_mkl_roots "")
+        if(DEFINED ENV{MKLROOT})
+            list(APPEND _mkl_roots "$ENV{MKLROOT}")
+        endif()
+        if(DEFINED ENV{ONEAPI_ROOT})
+            list(APPEND _mkl_roots "$ENV{ONEAPI_ROOT}/mkl/latest")
+        endif()
+        list(APPEND _mkl_roots "C:/Program Files (x86)/Intel/oneAPI/mkl/latest" "/opt/intel/oneapi/mkl/latest")
+        foreach(_mkl_root IN LISTS _mkl_roots)
+            if(EXISTS "${_mkl_root}/lib/cmake/mkl/MKLConfig.cmake")
+                file(TO_CMAKE_PATH "${_mkl_root}/lib/cmake/mkl" _mkl_dir)
+                set(MKL_DIR "${_mkl_dir}" CACHE PATH "Folder of MKLConfig.cmake")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    # MKL's configuration caches the folder of mkl.h and keeps it when MKL_DIR
+    # changes: a build folder first configured against another MKL would go on
+    # compiling with that one's headers (and whatever else its include folder
+    # holds). Look it up again on every configure.
+    unset(MKL_INCLUDE CACHE)
+
+    find_package(MKL CONFIG QUIET)
+    if(MKL_FOUND)
+        message(STATUS "MKL found, for the comparison programs: ${MKL_ROOT}")
+    else()
+        message(WARNING "EEMD_MKL_COMPARISONS is ON but MKL was not found: the comparison programs are skipped")
+    endif()
+
+    if(MKL_FOUND)
+        # spline_bench: the library's envelope splines against MKL Data Fitting
+        # rng_bench: the library's random numbers against MKL's, which it used before
+        foreach(_cmp spline_bench rng_bench)
+            add_eemd_executable(${_cmp} benchmarks/${_cmp}.cpp)
+            target_link_libraries(${_cmp} PRIVATE MKL::MKL)
+            target_compile_definitions(${_cmp} PRIVATE MKL_LP64)
+            if(MKL_LINK STREQUAL "sdl")
+                # mkl_rt picks its threading layer at run time: the programs ask for the sequential one
+                target_compile_definitions(${_cmp} PRIVATE EEMD_MKL_SINGLE_DYNAMIC_LIBRARY=1)
+            endif()
+        endforeach()
+    endif()
+endif()
+
 
 # ============================================================================
 # Validation against the reference code (validation/README.md)
@@ -357,6 +375,9 @@ add_iceemdan_executable(decompose_csv validation/decompose_csv.cpp)
 
 # Data for the README figures and timings (validation/figures/README.md)
 add_iceemdan_executable(figure_tool validation/figures/figure_tool.cpp)
+
+# The library and the authors' code on the same noise (validation/same_noise/README.md)
+add_iceemdan_executable(same_noise validation/same_noise/same_noise.cpp)
 
 # ============================================================================
 # C interface (src/c_api), built as the shared library the Python binding loads
@@ -403,6 +424,7 @@ install(FILES
     src/fft/eemd_fft.hpp
     src/threads/eemd_threads.hpp
     src/spline/cubic_spline.hpp
+    src/rng/eemd_rng.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
@@ -416,10 +438,9 @@ install(EXPORT eemd_mkl_targets
 # Summary
 # ============================================================================
 message(STATUS "")
-message(STATUS "=== EEMD/ICEEMDAN-MKL Configuration ===")
+message(STATUS "=== EEMD/ICEEMDAN Configuration ===")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
-message(STATUS "  MKL interface: ${MKL_INTERFACE}")
-message(STATUS "  MKL threading: ${MKL_THREADING}")
+message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")
 message(STATUS "  EEMD header: src/core/eemd_mkl.hpp")
 message(STATUS "  ICEEMDAN header: src/core/iceemdan_mkl.hpp")
 message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")

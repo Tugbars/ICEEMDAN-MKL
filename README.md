@@ -2,16 +2,16 @@
 
 **Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise (ICEEMDAN) in C++, with C and Python interfaces.**
 
-It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 7 ms on eight threads, and every further signal of that length in 4 ms.
+It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 8 ms on eight threads, where the authors' code takes 36 s. Every further signal of that length takes 4 ms.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/decomposition-dark.png">
-  <img src="docs/img/decomposition-light.png" width="900" alt="A sinusoid with a short burst of a higher frequency, decomposed by this library: IMF 1 holds the burst, IMF 2 the sinusoid, and the remaining modes are close to zero.">
+  <img src="docs/img/decomposition-light.png" width="900" alt="A sinusoid with a short burst of a higher frequency, decomposed by the authors' reference code (left, 21.5 s) and by this library (right, 6.1 ms on 8 threads). Both put the burst in IMF 1 and leave the sinusoid as the residue.">
 </picture>
 
-The test signal of the ICEEMDAN paper: a sinusoid with a short burst of a higher frequency, the standard example of mode mixing in plain EMD. The library puts the burst in IMF 1 and the sinusoid in IMF 2, within 7.6 % and 4.2 % of the true components, and leaves next to nothing in the remaining modes.
+The test signal of the ICEEMDAN paper: a sinusoid with a short burst of a higher frequency, the standard example of mode mixing in plain EMD. Both codes put the burst in IMF 1 and stop there: what is left, the sinusoid, is already a mode and becomes the residue. Both are within 8 % of the true components.
 
 ## What is ICEEMDAN?
 
@@ -28,7 +28,7 @@ ICEEMDAN averages the *local mean* of each noisy copy instead of its modes. The 
 
 ## Accuracy
 
-The default configuration is the published algorithm, and it agrees with the authors' own code (`ceemdan.m` with `emd.m`, run in GNU Octave) at the same settings:
+The default configuration is the published algorithm as the authors' own code computes it (`ceemdan.m` with `emd.m`, run in GNU Octave), and it agrees with that code at the same settings:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/accuracy-dark.png">
@@ -43,14 +43,14 @@ White noise, N = 4096: mean frequency of the first six modes, in cycles per samp
 | | IMF 1 | IMF 2 | IMF 3 | IMF 4 | IMF 5 | IMF 6 |
 |---|---|---|---|---|---|---|
 | Authors' code | 0.3421 | 0.1568 | 0.0788 | 0.0422 | 0.0201 | 0.0095 |
-| This library | 0.3421 | 0.1566 | 0.0787 | 0.0424 | 0.0202 | 0.0094 |
+| This library | 0.3422 | 0.1568 | 0.0788 | 0.0422 | 0.0203 | 0.0095 |
 
 Tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the mode nearest each tone, edges excluded.
 
 | | 128 cycles | 32 cycles | 8 cycles |
 |---|---|---|---|
 | Authors' code | 0.269 | 0.302 | 0.058 |
-| This library | 0.260 | 0.323 | 0.086 |
+| This library | 0.265 | 0.306 | 0.080 |
 
 </details>
 
@@ -58,32 +58,39 @@ The two codes draw different random numbers, so they agree statistically, not sa
 
 ## Speed
 
-Time per decomposition with an ensemble of 100, in the default configuration:
+![Time per decomposition as a matrix over signal length 1,024 to 8,192. The authors' code takes 35.7 to 111 s. For the first signal of a length, this library is 715 to 150 times faster on one thread and 4,280 to 959 times faster on eight; for further signals, 1,760 to 536 times on one thread and 8,090 to 3,030 times on eight.](docs/img/speed.svg)
 
-| Signal length | First signal, 1 thread | First signal, 8 threads | Further signals, 1 thread | Further signals, 8 threads |
-|---------------|------------------------|-------------------------|---------------------------|----------------------------|
-| 1,024 | 36 ms | 7.2 ms | 21 ms | 4.1 ms |
-| 2,048 | 77 ms | 15 ms | 42 ms | 7.5 ms |
-| 4,096 | 177 ms | 36 ms | 90 ms | 16 ms |
-| 8,192 | 467 ms | 92 ms | 212 ms | 44 ms |
+The authors' code (`ceemdan.m` with `emd.m`, at the same settings) ran in GNU Octave 11.3 on the same cores. Like the library's first signal of a length, it decomposes the noise of the ensemble on every call. The library keeps that noise, so further signals of the same length and settings skip the step, with the same result as they would get alone.
 
-The first signal of a given length also decomposes the noise of the ensemble. The library keeps that noise, so every further signal of the same length and settings skips the step, with the same result as it would get alone.
+<details>
+<summary>The numbers</summary>
 
-Measured on an Intel Core i9-14900KF, threads on the performance cores, built with GCC 16.2; median of 7 runs on a sum of tones. The measurement is described in [`validation/figures/README.md`](validation/figures/README.md).
+Time per decomposition, ensemble of 100, default configuration:
 
-The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 7 to 13 times faster again on further signals: 0.5 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
+| Signal length | Authors' code | First signal, 1 thread | First signal, 8 threads | Further signals, 1 thread | Further signals, 8 threads |
+|---------------|---------------|------------------------|-------------------------|---------------------------|----------------------------|
+| 1,024 | 35.7 s | 50.0 ms | 8.36 ms | 20.3 ms | 4.42 ms |
+| 2,048 | 44.3 s | 110 ms | 18.7 ms | 40.8 ms | 7.52 ms |
+| 4,096 | 64.9 s | 271 ms | 46.2 ms | 90.4 ms | 17.3 ms |
+| 8,192 | 111 s | 739 ms | 116 ms | 207 ms | 36.6 ms |
+
+Intel Core i9-14900KF, threads on the performance cores, built with GCC 16.2; median of 7 runs on a sum of tones for the library, the faster of 2 runs for the authors' code. The measurement is described in [`validation/figures/README.md`](validation/figures/README.md).
+
+</details>
+
+The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 5 to 12 times faster again on further signals: 0.7 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
 
 ## Features
 
 **The decomposition**
 
-- **ICEEMDAN as published**, by default; EEMD and plain EMD as well.
+- **ICEEMDAN as published**, by default, computed the way the authors' code computes it; EEMD and plain EMD as well.
 - **Complete**: the IMFs and the residue add up to the signal to rounding.
-- **Reproducible**: for a given seed, the same result bit for bit at any number of threads.
+- **Reproducible**: for a given seed, the same result bit for bit at any number of threads. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
 - **Three presets**: Standard, Scientific (no shortcuts, an audit trail) and Finance (Akima splines, noise scaled to the local volatility, causal boundaries, NaN and Inf cleaned from the input).
 - **Envelopes**: cubic (not-a-knot), Akima or linear splines; symmetric, mirrored, autoregressive or linear boundary extension.
-- **Made for batches**: the decomposed noise of the ensemble is kept between calls, so further signals of the same length take about half the time.
-- **Speed options** for when exact agreement with the paper matters less than time, and a memory cap for the noise bank.
+- **Made for batches**: the decomposed noise of the ensemble is kept between calls, so further signals of the same length take half the time or less.
+- **Speed options** for when exact agreement with the paper matters less than time (among them ± noise pairs, which halve the noise to decompose), and a memory cap for the noise bank.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
 - **Analysis utilities**: Hilbert transform, instantaneous frequency, spectral entropy.
 
@@ -91,7 +98,7 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 
 - **Three interfaces**: C++17 headers, a C interface built as a shared library, and a Python binding on NumPy arrays.
 - **Multithreaded without OpenMP**: the ensemble runs on the library's own thread pool. The thread count is one setting, and idle threads use no processor.
-- **Little to install**: Intel MKL (the random numbers, and the Akima and linear envelopes). The FFT library, [VectorFFT](https://github.com/Tugbars/VectorFFT), is downloaded by CMake as a ready-built binary.
+- **Little to install**: a C++17 compiler and CMake. The splines, the noise and the threads are the library's own; the one library it uses, [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs, is downloaded by CMake as a ready-built binary.
 - **Windows and Linux** on x86-64 processors with AVX2. Developed and tested with GCC (MinGW included); it also builds with MSVC, and CMake has configurations for Clang and Intel ICX.
 - **Tested**: regression tests run with `ctest`, and the validation against the authors' code is in the repository.
 
@@ -108,6 +115,10 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 5. **Sifting stop rule and boundary extension**: Rilling, G., Flandrin, P., & Gonçalves, P. (2003). On empirical mode decomposition and its algorithms. *IEEE-EURASIP Workshop on Nonlinear Signal and Image Processing (NSIP-03)*.
 
 6. **Akima Splines**: Akima, H. (1970). A new method of interpolation and smooth curve fitting based on local procedures. *Journal of the ACM*, 17(4), 589-602.
+
+7. **The noise generator**: Salmon, J. K., Moraes, M. A., Dror, R. O., & Shaw, D. E. (2011). Parallel random numbers: as easy as 1, 2, 3. *SC '11: Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis*.
+
+8. **The inverse normal distribution function**: Wichura, M. J. (1988). Algorithm AS 241: The percentage points of the normal distribution. *Applied Statistics*, 37(3), 477-484.
 
 ## Citation
 
@@ -134,5 +145,4 @@ Contributions welcome! Please open an issue or PR.
 
 - Colominas, Schlotthauer and Torres for the ICEEMDAN algorithm and its reference code
 - Rilling, Flandrin and Gonçalves for `emd.m`, whose stop rule and boundary extension the defaults follow
-- Intel MKL for the random numbers
 - [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs

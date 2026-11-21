@@ -20,33 +20,11 @@ Usage:
 
 import ctypes
 import numpy as np
-import os
 import sys
 from pathlib import Path
 from enum import IntEnum
 from typing import Tuple, Optional, Union, Dict
 import platform
-
-# =============================================================================
-# Windows MKL DLL paths (must be set BEFORE loading the library)
-# =============================================================================
-
-if sys.platform == "win32":
-    mkl_paths = [
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.1\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.2\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.3\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.1\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.2\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.3\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
-    ]
-    for p in mkl_paths:
-        if os.path.exists(p):
-            os.add_dll_directory(p)
 
 # ============================================================================
 # Enums
@@ -111,9 +89,8 @@ def _load_library() -> ctypes.CDLL:
         Path.cwd() / "build",
     ]
     
-    # MKL loads its CPU-specific kernels (libmkl_avx2.so, ...) at run time and
-    # resolves them against libmkl_core: on Linux/macOS the library must be
-    # loaded with RTLD_GLOBAL, or MKL aborts with "Error on loading function".
+    # Linux and macOS: RTLD_GLOBAL, so that libraries the library loads in turn
+    # see its symbols.
     load_mode = 0 if system == "Windows" else ctypes.RTLD_GLOBAL
 
     errors = []
@@ -127,9 +104,9 @@ def _load_library() -> ctypes.CDLL:
                     errors.append(f"{lib_path}: {e}")
                 if system == "Windows":
                     # Python 3.8+ leaves PATH out when it looks for the DLLs a
-                    # library depends on (MKL, and the compiler's runtime for
-                    # a GCC build). This search takes the library's folder
-                    # first and PATH after it.
+                    # library depends on (the compiler's runtime, for a GCC
+                    # build). This search takes the library's folder first and
+                    # PATH after it.
                     try:
                         return ctypes.CDLL(str(lib_path), winmode=_LOAD_WITH_ALTERED_SEARCH_PATH)
                     except (OSError, TypeError) as e:
@@ -147,9 +124,9 @@ def _load_library() -> ctypes.CDLL:
     error_msg += f"Searched for {lib_names} in {[str(p) for p in search_paths]}.\n"
     if errors:
         error_msg += "Load errors:\n" + "\n".join(f"  - {e}" for e in errors)
-        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH (for a GCC build on Windows,"
-        error_msg += "\nthe compiler's bin folder as well), and on Windows that libvfft.dll,"
-        error_msg += "\nlibvfft_avx2.dll and libvfft_avx512.dll are beside the ICEEMDAN DLL."
+        error_msg += "\n\nOn Windows, libvfft.dll, libvfft_avx2.dll and libvfft_avx512.dll must be"
+        error_msg += "\nbeside the ICEEMDAN DLL, and for a GCC build the compiler's bin folder"
+        error_msg += "\nmust be in PATH (its C++ runtime)."
     raise RuntimeError(error_msg)
 
 # Load library
@@ -323,7 +300,7 @@ class ICEEMDAN:
     @property
     def max_imfs(self) -> int:
         """Maximum number of IMFs to extract."""
-        return self._max_imfs if hasattr(self, '_max_imfs') else 10
+        return self._max_imfs if hasattr(self, '_max_imfs') else 32
     
     @max_imfs.setter
     def max_imfs(self, value: int):

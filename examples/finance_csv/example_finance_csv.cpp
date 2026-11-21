@@ -31,11 +31,8 @@
 void generate_garch_price(double *price, double *returns, double *volatility,
                           int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> innovations(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, innovations.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, innovations.data());
     
     // GARCH(1,1): sigma^2_t = omega + alpha * eps^2_{t-1} + beta * sigma^2_{t-1}
     const double omega = 0.00001;
@@ -56,8 +53,6 @@ void generate_garch_price(double *price, double *returns, double *volatility,
         returns[i] = volatility[i] * innovations[i];
         price[i] = price[i-1] * std::exp(returns[i]);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 /**
@@ -66,11 +61,8 @@ void generate_garch_price(double *price, double *returns, double *volatility,
 void generate_regime_switch(double *price, double *returns, double *volatility,
                             int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> noise(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, noise.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, noise.data());
     
     price[0] = 100.0;
     returns[0] = 0.0;
@@ -96,8 +88,6 @@ void generate_regime_switch(double *price, double *returns, double *volatility,
         returns[i] = drift + vol * noise[i];
         price[i] = price[i-1] * (1.0 + returns[i]);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 /**
@@ -106,11 +96,8 @@ void generate_regime_switch(double *price, double *returns, double *volatility,
  */
 void generate_multi_scale(double *price, int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> noise(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, noise.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, noise.data());
     
     for (int32_t i = 0; i < n; ++i)
     {
@@ -133,8 +120,6 @@ void generate_multi_scale(double *price, int32_t n, uint32_t seed)
         
         price[i] = trend + seasonal + oscillation + high_freq + noise_component;
     }
-    
-    vslDeleteStream(&stream);
 }
 
 // ============================================================================

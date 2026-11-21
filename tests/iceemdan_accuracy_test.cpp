@@ -4,7 +4,7 @@
  * Run this before and after optimizations to ensure correctness.
  * Tests mathematical properties that must hold regardless of implementation.
  * 
- * Build: g++ -O3 -std=c++17 iceemdan_accuracy_test.cpp -o accuracy_test -lmkl_rt -liomp5 -lpthread -lm
+ * Build: with the project (cmake --build build --target accuracy_test)
  */
 
 #include "iceemdan_mkl.hpp"
@@ -63,11 +63,8 @@ void generate_sum_of_sines(double* signal, int32_t n, uint32_t seed) {
 }
 
 void generate_garch(double* signal, int32_t n, uint32_t seed) {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> noise(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, noise.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, noise.data());
     
     double sigma2 = 0.0001;
     signal[0] = 100.0;
@@ -77,8 +74,6 @@ void generate_garch(double* signal, int32_t n, uint32_t seed) {
         sigma2 = 0.00001 + 0.1 * eps * eps + 0.85 * sigma2;
         signal[i] = signal[i-1] * std::exp(std::sqrt(sigma2) * noise[i]);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 void generate_impulse(double* signal, int32_t n) {
@@ -99,10 +94,7 @@ void generate_ramp(double* signal, int32_t n) {
 }
 
 void generate_white_noise(double* signal, int32_t n, uint32_t seed) {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, signal, 0.0, 1.0);
-    vslDeleteStream(&stream);
+    eemd::rng::gaussian(seed, 0, n, signal);
 }
 
 // ============================================================================

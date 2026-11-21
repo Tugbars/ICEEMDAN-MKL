@@ -164,14 +164,19 @@ int main()
         d.config().ensemble_size = 20;
         std::vector<std::vector<double>> imfs;
         std::vector<double> res;
-        const size_t per_unit = size_t(d.config().max_imfs) * n * sizeof(double);
+        // the bank holds about log2(n) modes per realization, as the library sizes it
+        int32_t bank_modes = 2;
+        for (int32_t len = n; len > 1; len >>= 1)
+            ++bank_modes;
+        bank_modes = std::min(bank_modes, d.config().max_imfs);
+        const size_t per_unit = size_t(bank_modes) * n * sizeof(double);
 
         d.config().use_circular_bank = true;
         check(d.decompose(x.data(), n, imfs, res) && d.last_diagnostics().noise_bank_multiplier == 20,
               "use_circular_bank: circular bank with multiplier 20");
         d.config().use_circular_bank = false;
 
-        // independent bank needs 10 trial units (20 trials, antithetic); allow 6
+        // independent bank needs 20 trial units (20 independent realizations); allow 6
         d.config().noise_bank_max_bytes = per_unit * 6;
         const bool ok6 = d.decompose(x.data(), n, imfs, res);
         check(ok6 && d.last_diagnostics().noise_bank_multiplier == 6,
@@ -275,7 +280,8 @@ int main()
         eemd::find_maxima_raw(s, m, idx, cnt);
         check(cnt == 2 && idx[0] == 4 && idx[1] == 10, "maxima at plateau centre (4) and strict peak (10)");
         eemd::find_minima_raw(s, m, idx, cnt);
-        check(cnt == 2 && idx[0] == 2 && idx[1] == 7, "minima at strict trough (2) and plateau [7, 8] (7)");
+        // a plateau of even length: the later of its two middle samples, as emd.m takes it
+        check(cnt == 2 && idx[0] == 2 && idx[1] == 8, "minima at strict trough (2) and plateau [7, 8] (8)");
         check(eemd::count_extrema(s, m) == 4, "count_extrema agrees");
 
         // prices on a tick grid: strict comparisons would find almost nothing

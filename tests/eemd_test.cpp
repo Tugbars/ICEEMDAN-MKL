@@ -352,10 +352,9 @@ int main(int argc, char* argv[]) {
     // Initialize with low-latency settings
     eemd_init_low_latency(8);  // Adjust core count for your CPU
     
-    std::cout << "EEMD-MKL Test Suite" << std::endl;
-    std::cout << "===================" << std::endl;
+    std::cout << "EEMD Test Suite" << std::endl;
+    std::cout << "===============" << std::endl;
     std::cout << "Threads: " << eemd::get_num_threads() << std::endl;
-    std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential)" << std::endl;
     
     test_basic_emd();
     test_eemd_ensemble();

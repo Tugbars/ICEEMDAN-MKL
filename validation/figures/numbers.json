@@ -1,16 +1,19 @@
 {
-  "machine": "Intel Core i9-14900KF, P-cores",
+  "machine": "Intel Core i9-14900KF, performance cores",
   "burst": {
     "library_error": [
-      0.0759,
-      0.0425
+      0.0774,
+      0.0386
     ],
-    "reference_error": null,
-    "library_first_ms_1_thread": 30.34,
-    "library_first_ms_8_threads": 6.342,
-    "library_ms_1_thread": 16.056,
-    "library_ms_8_threads": 3.153,
-    "reference_s": null
+    "reference_error": [
+      0.0765,
+      0.0382
+    ],
+    "library_first_ms_1_thread": 35.037,
+    "library_first_ms_8_threads": 6.095,
+    "library_ms_1_thread": 6.038,
+    "library_ms_8_threads": 1.237,
+    "reference_s": 21.539
   },
   "speed": {
     "n": [
@@ -20,29 +23,34 @@
       8192
     ],
     "library_first_ms_1_thread": [
-      36.034,
-      76.775,
-      176.768,
-      467.292
+      49.955,
+      110.428,
+      270.86,
+      739.011
     ],
     "library_first_ms_8_threads": [
-      7.154,
-      15.226,
-      36.213,
-      91.773
+      8.359,
+      18.728,
+      46.218,
+      115.631
     ],
     "library_ms_1_thread": [
-      20.872,
-      41.711,
-      89.501,
-      211.544
+      20.264,
+      40.757,
+      90.429,
+      206.722
     ],
     "library_ms_8_threads": [
-      4.136,
-      7.483,
-      16.365,
-      44.354
+      4.418,
+      7.517,
+      17.292,
+      36.603
     ],
-    "reference_s": null
+    "reference_s": [
+      35.738,
+      44.343,
+      64.893,
+      110.906
+    ]
   }
 }

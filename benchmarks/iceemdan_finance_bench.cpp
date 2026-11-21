@@ -37,11 +37,8 @@ using Clock = std::chrono::high_resolution_clock;
  */
 void generate_garch_price(double *signal, int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> innovations(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, innovations.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, innovations.data());
     
     // GARCH(1,1) parameters
     const double omega = 0.00001;
@@ -63,8 +60,6 @@ void generate_garch_price(double *signal, int32_t n, uint32_t seed)
         // Price update
         signal[i] = signal[i-1] * std::exp(ret);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 /**
@@ -73,11 +68,8 @@ void generate_garch_price(double *signal, int32_t n, uint32_t seed)
  */
 void generate_regime_switch(double *signal, int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> noise(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, noise.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, noise.data());
     
     signal[0] = 100.0;
     
@@ -93,8 +85,6 @@ void generate_regime_switch(double *signal, int32_t n, uint32_t seed)
         
         signal[i] = signal[i-1] * (1.0 + vol * noise[i]);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 /**
@@ -133,11 +123,8 @@ void generate_dirty_signal(double *signal, int32_t n, uint32_t seed, double bad_
  */
 void generate_flash_crash(double *signal, int32_t n, uint32_t seed)
 {
-    VSLStreamStatePtr stream = nullptr;
-    vslNewStream(&stream, VSL_BRNG_MT19937, seed);
-    
     std::vector<double> noise(n);
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, noise.data(), 0.0, 1.0);
+    eemd::rng::gaussian(seed, 0, n, noise.data());
     
     signal[0] = 100.0;
     
@@ -155,8 +142,6 @@ void generate_flash_crash(double *signal, int32_t n, uint32_t seed)
         
         signal[i] = signal[i-1] * (1.0 + drift + vol * noise[i]);
     }
-    
-    vslDeleteStream(&stream);
 }
 
 // ============================================================================

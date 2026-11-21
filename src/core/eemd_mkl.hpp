@@ -1,23 +1,18 @@
 /**
- * EEMD (Ensemble Empirical Mode Decomposition) with Intel MKL
+ * EEMD (Ensemble Empirical Mode Decomposition): the sifting, the envelopes and
+ * the EEMD ensemble, on which ICEEMDAN (iceemdan_mkl.hpp) builds.
  *
- * Optimized Implementation:
- * - DF_UNIFORM_PARTITION for O(1) knot lookup (vs O(log K) binary search)
+ * - Envelopes evaluated at every sample in one pass (no knot search)
  * - Raw pointer hot paths (no std::vector overhead in inner loops)
  * - Fused mean/SD/update loop (single memory pass)
- * - Thread-local accumulation (one critical section per thread)
- * - Zero-malloc scratch pads (pre-allocated, reused buffers)
- * - Capacity-aware MKL buffers (grow-only)
+ * - Zero-malloc scratch pads (pre-allocated, reused buffers, grow-only)
  *
- * Dependencies:
- * - MKL VSL for Gaussian noise generation
- * - MKL Data Fitting (df) for the Akima and linear envelopes; the cubic
- *   envelopes are this library's own (cubic_spline.hpp)
- * - VectorFFT for the FFTs (eemd_fft.hpp)
- *
- * Threads: the ensembles run on this library's own pool (eemd_threads.hpp),
- * with no OpenMP runtime. MKL is called from each of those threads and does
- * not need threads of its own: link its sequential layer.
+ * Everything is this library's own except the FFTs:
+ * - the envelope splines: cubic_spline.hpp (cubic, Akima, linear)
+ * - the noise: eemd_rng.hpp (Philox4x32-10 and the inverse normal
+ *   distribution function)
+ * - the threads: eemd_threads.hpp, a fork-join pool on std::thread
+ * - the FFTs: VectorFFT (eemd_fft.hpp)
  *
  * License: MIT
  */
@@ -25,11 +20,8 @@
 #ifndef EEMD_MKL_HPP
 #define EEMD_MKL_HPP
 
-#include <mkl.h>
-#include <mkl_df.h>
-#include <mkl_vsl.h>
-
 #include "eemd_threads.hpp" // set_num_threads(), the fork-join pool
+#include "eemd_rng.hpp"     // the noise
 
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +30,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <new>
 #include <stdexcept>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -72,41 +65,12 @@
 #define EEMD_P_CORES 8
 #define EEMD_CACHE_LINE 64
 
-// ============================================================================
-// Platform Configuration
-// ============================================================================
-
-#ifdef _WIN32
-#include <intrin.h>
-#define EEMD_SETENV(name, value) _putenv_s(name, value)
-#else
-#define EEMD_SETENV(name, value) setenv(name, value, 1)
-#endif
-
-#ifdef EEMD_MKL_SINGLE_DYNAMIC_LIBRARY
-namespace eemd
-{
-    namespace detail
-    {
-        // MKL's single dynamic library (mkl_rt) picks its threading layer when
-        // it is first used: take the sequential one, which needs no OpenMP
-        // runtime. With MKL's layered libraries the layer is chosen at link
-        // time instead.
-        inline const int mkl_threading_layer = mkl_set_threading_layer(MKL_THREADING_SEQUENTIAL);
-    } // namespace detail
-} // namespace eemd
-#endif
-
 /**
  * Low-latency mode: n_cores threads that never sleep between decompositions
  * (each worker keeps one core busy).
  */
 inline void eemd_init_low_latency(int n_cores = EEMD_P_CORES, bool verbose = false)
 {
-    EEMD_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
-
-    mkl_set_dynamic(0);
-    mkl_set_num_threads(1);
     eemd::set_num_threads(n_cores);
     eemd::set_thread_block_ms(-1.0);
 
@@ -115,7 +79,7 @@ inline void eemd_init_low_latency(int n_cores = EEMD_P_CORES, bool verbose = fal
 
     if (verbose)
     {
-        printf("EEMD-MKL: Low-latency mode (%d threads, never sleeping, DAZ/FTZ)\n", n_cores);
+        printf("EEMD: Low-latency mode (%d threads, never sleeping, DAZ/FTZ)\n", n_cores);
     }
 }
 
@@ -125,10 +89,6 @@ inline void eemd_init_low_latency(int n_cores = EEMD_P_CORES, bool verbose = fal
  */
 inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = false)
 {
-    EEMD_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
-
-    mkl_set_dynamic(0);
-    mkl_set_num_threads(1);
     eemd::set_num_threads(n_cores * 2);
     eemd::set_thread_block_ms(0.0);
 
@@ -137,7 +97,7 @@ inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = fals
 
     if (verbose)
     {
-        printf("EEMD-MKL: Throughput mode (%d threads with HT)\n", n_cores * 2);
+        printf("EEMD: Throughput mode (%d threads with HT)\n", n_cores * 2);
     }
 }
 
@@ -156,9 +116,9 @@ namespace eemd
      */
     enum class SplineMethod : uint8_t
     {
-        Cubic = 0, // DF_PP_CUBIC - smooth but can overshoot
-        Akima = 1, // DF_PP_AKIMA - local, outlier-resistant
-        Linear = 2 // DF_PP_LINEAR - fastest, for very few extrema
+        Cubic = 0, // smooth (C2), can overshoot on sharp changes
+        Akima = 1, // local (C1), outlier-resistant
+        Linear = 2 // fastest, for very few extrema
     };
 
     /**
@@ -239,31 +199,20 @@ namespace eemd
     // ============================================================================
     // Per-trial random streams
     //
-    // Trial t of seed s draws its noise from its own Philox4x32-10 stream with
-    // the 64-bit key s + 2^32 t. The noise of a trial therefore depends only on
+    // Trial t of seed s draws its noise from its own Philox4x32-10 stream, keyed
+    // (s, t) (eemd_rng.hpp). The noise of a trial therefore depends only on
     // (s, t): not on the thread that runs it, the number of threads, or the
     // order trials are scheduled in.
     // ============================================================================
-
-    inline VSLStreamStatePtr new_trial_stream(uint32_t seed, uint32_t trial)
-    {
-        VSLStreamStatePtr stream = nullptr;
-        const unsigned int params[2] = {seed, trial};
-        if (vslNewStreamEx(&stream, VSL_BRNG_PHILOX4X32X10, 2, params) != VSL_STATUS_OK)
-            return nullptr;
-        return stream;
-    }
 
     /** Fill out[0..n) with N(mean, sigma) noise of trial `trial` under `seed`. */
     inline bool trial_gaussian(uint32_t seed, uint32_t trial, int32_t n, double *out,
                                double mean = 0.0, double sigma = 1.0)
     {
-        VSLStreamStatePtr stream = new_trial_stream(seed, trial);
-        if (!stream)
+        if (n < 0 || (n > 0 && !out))
             return false;
-        const int status = vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream, n, out, mean, sigma);
-        vslDeleteStream(&stream);
-        return status == VSL_STATUS_OK;
+        rng::gaussian(seed, trial, n, out, mean, sigma);
+        return true;
     }
 
     // ============================================================================
@@ -277,15 +226,23 @@ namespace eemd
         size_t size = 0;
         size_t capacity = 0;
 
+        // 64-byte aligned memory; throws std::bad_alloc when there is none
+        static T *allocate(size_t n)
+        {
+            return static_cast<T *>(::operator new(n * sizeof(T), std::align_val_t(EEMD_CACHE_LINE)));
+        }
+        static void deallocate(T *p)
+        {
+            ::operator delete(p, std::align_val_t(EEMD_CACHE_LINE));
+        }
+
         AlignedBuffer() = default;
 
         explicit AlignedBuffer(size_t n)
         {
             if (n > 0)
             {
-                data = static_cast<T *>(mkl_malloc(n * sizeof(T), EEMD_CACHE_LINE));
-                if (!data)
-                    throw std::bad_alloc();
+                data = allocate(n);
                 size = n;
                 capacity = n;
             }
@@ -294,7 +251,7 @@ namespace eemd
         ~AlignedBuffer()
         {
             if (data)
-                mkl_free(data);
+                deallocate(data);
         }
 
         AlignedBuffer(const AlignedBuffer &) = delete;
@@ -313,7 +270,7 @@ namespace eemd
             if (this != &other)
             {
                 if (data)
-                    mkl_free(data);
+                    deallocate(data);
                 data = other.data;
                 size = other.size;
                 capacity = other.capacity;
@@ -329,10 +286,10 @@ namespace eemd
             if (n > capacity)
             {
                 if (data)
-                    mkl_free(data);
-                data = (n > 0) ? static_cast<T *>(mkl_malloc(n * sizeof(T), EEMD_CACHE_LINE)) : nullptr;
-                if (n > 0 && !data)
-                    throw std::bad_alloc();
+                    deallocate(data);
+                data = nullptr;
+                capacity = 0;
+                data = (n > 0) ? allocate(n) : nullptr;
                 capacity = n;
             }
             size = n;
@@ -437,8 +394,10 @@ namespace eemd
                         ++j; // run [i, j] of equal values
                     if (j < n - 1 && above(s[i], s[j + 1]))
                     {
+                        // the middle of the run, the later of two middles (emd.m:
+                        // round((first + last) / 2) in 1-based indices)
                         if (out_idx)
-                            out_idx[count] = i + (j - i) / 2;
+                            out_idx[count] = i + (j - i + 1) / 2;
                         ++count;
                     }
                     i = j + 1;
@@ -556,13 +515,21 @@ namespace eemd
                detail::scan_extrema<false>(signal, n, nullptr);
     }
 
+    /**
+     * Zero crossings as emd.m counts them: neighbours of opposite sign, plus
+     * one for each run of samples that are exactly zero.
+     */
     inline int32_t count_zero_crossings(const double *signal, int32_t n)
     {
         int32_t count = 0;
         for (int32_t i = 1; i < n; ++i)
         {
-            count += ((signal[i - 1] >= 0.0) != (signal[i] >= 0.0));
+            const double a = signal[i - 1], b = signal[i];
+            count += ((a < 0.0) & (b > 0.0)) | ((a > 0.0) & (b < 0.0));
+            count += (b == 0.0) & (a != 0.0); // a run of zeros starts at i
         }
+        if (n > 0 && signal[0] == 0.0)
+            ++count; // a run of zeros starts at 0
         return count;
     }
 
@@ -881,17 +848,17 @@ namespace eemd
     }
 
     // ============================================================================
-    // Envelope spline
+    // Envelope spline: the library's own (cubic_spline.hpp)
     //
-    // Cubic (the default): this library's own spline, cubic_spline.hpp.
-    // Akima and Linear: MKL Data Fitting.
+    // Cubic (the default): not-a-knot ends, natural below 4 knots.
+    // Akima: Akima's local spline; below 5 knots the cubic spline.
+    // Linear: straight lines between the knots.
     // ============================================================================
 
     class EnvelopeSpline
     {
     public:
         EnvelopeSpline() = default;
-        ~EnvelopeSpline() { cleanup(); }
 
         EnvelopeSpline(const EnvelopeSpline &) = delete;
         EnvelopeSpline &operator=(const EnvelopeSpline &) = delete;
@@ -903,123 +870,21 @@ namespace eemd
         bool construct(const double *x, const double *y, int32_t n,
                        SplineMethod method = SplineMethod::Cubic)
         {
-            cleanup();
-            use_cubic_ = false;
-
-            if (n < 2)
-                return false;
-
-            // Cubic: not-a-knot ends (the default of MATLAB's spline/interp1
-            // and SciPy's CubicSpline, so of the reference ICEEMDAN code);
-            // natural free ends below 4 knots, where not-a-knot is undefined.
-            // Akima needs 5 points and is a cubic spline below that.
-            if (method == SplineMethod::Cubic || (method == SplineMethod::Akima && n < 5))
-            {
-                use_cubic_ = cubic_.construct(x, y, n);
-                return use_cubic_;
-            }
-
-            // dfdEditPPSpline1D signature: (task, s_order, s_type, bc_type, ...)
-            MKL_INT s_order; // Spline order (DF_PP_AKIMA, DF_PP_LINEAR)
-            MKL_INT s_type;  // Spline type
-            MKL_INT bc_type; // Boundary condition type
-            if (method == SplineMethod::Akima)
-            {
-                s_order = DF_PP_AKIMA;
-                s_type = DF_PP_DEFAULT; // Ignored for Akima per MKL docs
-                bc_type = DF_NO_BC;     // Akima computes locally, no BC needed
-            }
-            else
-            {
-                s_order = DF_PP_LINEAR;
-                s_type = DF_PP_DEFAULT;
-                bc_type = DF_NO_BC;
-            }
-
-            const MKL_INT mkl_n = static_cast<MKL_INT>(n);
-            const MKL_INT required = 4 * (mkl_n - 1);
-
-            if (coeffs_.capacity < static_cast<size_t>(required))
-            {
-                coeffs_.resize(required);
-            }
-            coeffs_.size = required;
-
-            MKL_INT status = dfdNewTask1D(&task_, mkl_n, x,
-                                          DF_NON_UNIFORM_PARTITION, 1, y, DF_NO_HINT);
-            if (status != DF_STATUS_OK)
-                return false;
-
-            task_valid_ = true;
-
-            status = dfdEditPPSpline1D(task_, s_order, s_type,
-                                       bc_type, nullptr, DF_NO_IC, nullptr,
-                                       coeffs_.data, DF_NO_HINT);
-            if (status != DF_STATUS_OK)
-            {
-                cleanup();
-                return false;
-            }
-
-            status = dfdConstruct1D(task_, DF_PP_SPLINE, DF_METHOD_STD);
-            if (status != DF_STATUS_OK)
-            {
-                cleanup();
-                return false;
-            }
-
-            spline_valid_ = true;
-            return true;
+            if (method == SplineMethod::Linear)
+                return spline_.construct_linear(x, y, n);
+            if (method == SplineMethod::Akima && n >= 5)
+                return spline_.construct_akima(x, y, n);
+            return spline_.construct(x, y, n);
         }
 
         /** results[j] = spline at j, for j = 0 .. n_sites - 1. */
         bool evaluate_uniform(double *results, int32_t n_sites) const
         {
-            if (use_cubic_)
-                return cubic_.evaluate_uniform(results, n_sites);
-            if (!spline_valid_)
-                return false;
-
-            const double interval[2] = {0.0, static_cast<double>(n_sites - 1)};
-            const MKL_INT mkl_n = static_cast<MKL_INT>(n_sites);
-            const MKL_INT dorder[] = {1};
-
-            MKL_INT status = dfdInterpolate1D(
-                task_,
-                DF_INTERP,
-                DF_METHOD_PP,
-                mkl_n,
-                interval,
-                DF_UNIFORM_PARTITION, // O(1) knot lookup
-                1,
-                dorder,
-                nullptr,
-                results,
-                DF_NO_HINT,
-                nullptr);
-
-            return (status == DF_STATUS_OK);
+            return spline_.evaluate_uniform(results, n_sites);
         }
 
     private:
-        void cleanup()
-        {
-            if (task_valid_)
-            {
-                dfDeleteTask(&task_);
-                task_valid_ = false;
-            }
-            spline_valid_ = false;
-        }
-
-        CubicSpline cubic_;
-        bool use_cubic_ = false;
-
-        // MKL Data Fitting (Akima, Linear)
-        DFTaskPtr task_ = nullptr;
-        bool task_valid_ = false;
-        bool spline_valid_ = false;
-        AlignedBuffer<double> coeffs_;
+        CubicSpline spline_;
     };
 
     // ============================================================================
@@ -1055,7 +920,13 @@ namespace eemd
 
                 const bool rilling = (config_.stop_rule == SiftStopRule::Rilling);
 
-                if (scratch_.n_max < 2 || scratch_.n_min < 2)
+                // Enough extrema for envelopes: with the symmetric ends, three
+                // in all (emd.m); otherwise two of each kind
+                const bool enough = config_.symmetric_boundary
+                                        ? (scratch_.n_max >= 1 && scratch_.n_min >= 1 &&
+                                           scratch_.n_max + scratch_.n_min >= 3)
+                                        : (scratch_.n_max >= 2 && scratch_.n_min >= 2);
+                if (!enough)
                 {
                     // Rilling (as emd.m): a mode that runs out of extrema
                     // mid-sift is kept as it stands

@@ -1,11 +1,21 @@
 /**
- * Cubic spline for the envelopes: through the knots, evaluated at the samples
- * 0, 1, ..., n - 1.
+ * The envelope splines: piecewise cubics through the knots, evaluated at the
+ * samples 0, 1, ..., n - 1. Three kinds, which differ only in the slopes at
+ * the knots:
  *
- * Ends: not-a-knot from 4 knots up (the ends of MATLAB's spline and SciPy's
- * CubicSpline, so of the reference ICEEMDAN code); natural ends (zero second
- * derivative) at 3 knots; a straight line at 2. Outside the knots the first
- * and the last piece are continued.
+ * - construct(): the cubic spline (C2) with not-a-knot ends, as MATLAB's
+ *   spline and SciPy's CubicSpline make it (so the reference ICEEMDAN code's
+ *   envelopes): at 3 knots that is the parabola through them, at 2 the
+ *   straight line.
+ * - construct_akima(): Akima's spline (H. Akima, J. ACM 17(4), 1970, 589-602),
+ *   C1 and local: the slope at a knot is a weighted mean of the chords on
+ *   either side, from the two knots before it to the two after, so a single
+ *   outlying knot moves the curve only near itself and the curve does not
+ *   overshoot a step. Past the ends, two chords on each side are extended
+ *   linearly, as in Akima's paper.
+ * - construct_linear(): straight lines between the knots.
+ *
+ * Outside the knots the first and the last piece are continued.
  *
  * An envelope needs one construct() and one evaluate_uniform(), tens of
  * thousands of times per decomposition, so both are written for that case:
@@ -43,33 +53,24 @@ namespace eemd
          */
         bool construct(const double *x, const double *y, int32_t n_knots)
         {
-            valid_ = false;
             const int32_t k = n_knots;
-            if (k < 2)
+            if (!prepare(x, y, k))
                 return false;
-            reserve(k);
-
-            double *h = h_.data();
-            double *delta = delta_.data();
-            double *inv_h = inv_h_.data();
-            double min_h = x[1] - x[0];
-            for (int32_t i = 0; i < k - 1; ++i)
-            {
-                h[i] = x[i + 1] - x[i];
-                min_h = h[i] < min_h ? h[i] : min_h;
-            }
-            if (!(min_h > 0.0))
-                return false;
-            for (int32_t i = 0; i < k - 1; ++i)
-            {
-                inv_h[i] = 1.0 / h[i];
-                delta[i] = (y[i + 1] - y[i]) * inv_h[i];
-            }
+            const double *h = h_.data();
+            const double *delta = delta_.data();
 
             double *s = slope_.data();
             if (k == 2)
             {
                 s[0] = s[1] = delta[0];
+            }
+            else if (k == 3)
+            {
+                // the parabola through the three knots: its slopes there
+                const double c = (delta[1] - delta[0]) / (h[0] + h[1]);
+                s[0] = delta[0] - c * h[0];
+                s[1] = delta[0] + c * h[0];
+                s[2] = delta[1] + c * h[1];
             }
             else
             {
@@ -80,22 +81,12 @@ namespace eemd
                 // from the first row down (cp, dp), then substitution back up.
                 double *cp = cp_.data();
                 double *dp = dp_.data();
-                const bool not_a_knot = k >= 4;
 
-                double b0, c0, d0;
-                if (not_a_knot)
-                {
-                    const double span = h[0] + h[1];
-                    b0 = h[1];
-                    c0 = span;
-                    d0 = ((3.0 * h[0] + 2.0 * h[1]) * h[1] * delta[0] + h[0] * h[0] * delta[1]) / span;
-                }
-                else
-                {
-                    b0 = 2.0;
-                    c0 = 1.0;
-                    d0 = 3.0 * delta[0];
-                }
+                // not-a-knot: the third derivative is continuous at the second knot
+                const double span0 = h[0] + h[1];
+                const double b0 = h[1];
+                const double c0 = span0;
+                const double d0 = ((3.0 * h[0] + 2.0 * h[1]) * h[1] * delta[0] + h[0] * h[0] * delta[1]) / span0;
                 cp[0] = c0 / b0;
                 dp[0] = d0 / b0;
 
@@ -109,40 +100,80 @@ namespace eemd
                     dp[i] = (d - a * dp[i - 1]) / denom;
                 }
 
-                double a_last, b_last, d_last;
-                if (not_a_knot)
-                {
-                    const double span = h[k - 3] + h[k - 2];
-                    a_last = span;
-                    b_last = h[k - 3];
-                    d_last = (h[k - 2] * h[k - 2] * delta[k - 3] +
-                              (2.0 * h[k - 3] + 3.0 * h[k - 2]) * h[k - 3] * delta[k - 2]) /
-                             span;
-                }
-                else
-                {
-                    a_last = 1.0;
-                    b_last = 2.0;
-                    d_last = 3.0 * delta[k - 2];
-                }
+                // and at the last but one
+                const double span1 = h[k - 3] + h[k - 2];
+                const double a_last = span1;
+                const double b_last = h[k - 3];
+                const double d_last = (h[k - 2] * h[k - 2] * delta[k - 3] +
+                                       (2.0 * h[k - 3] + 3.0 * h[k - 2]) * h[k - 3] * delta[k - 2]) /
+                                      span1;
                 s[k - 1] = (d_last - a_last * dp[k - 2]) / (b_last - a_last * cp[k - 2]);
                 for (int32_t i = k - 2; i >= 0; --i)
                     s[i] = dp[i] - cp[i] * s[i + 1];
             }
+            finish_hermite(x, y, k);
+            return true;
+        }
 
-            // Piece i on [x[i], x[i+1]], t = x - x[i]:  y[i] + s[i] t + c2[i] t^2 + c3[i] t^3
+        /**
+         * Akima's spline through the knots (same contract as construct()).
+         * At 2 knots, the straight line.
+         */
+        bool construct_akima(const double *x, const double *y, int32_t n_knots)
+        {
+            const int32_t k = n_knots;
+            if (!prepare(x, y, k))
+                return false;
+            const double *delta = delta_.data();
+            double *s = slope_.data();
+            if (k == 2)
+            {
+                s[0] = s[1] = delta[0];
+            }
+            else
+            {
+                // chords m[-2 .. k]: m[j] = delta[j] for 0 <= j <= k - 2, and two
+                // more on each side extended linearly (Akima 1970, eq. 7)
+                double *m = chord_.data() + 2;
+                for (int32_t j = 0; j < k - 1; ++j)
+                    m[j] = delta[j];
+                m[-1] = 2.0 * m[0] - m[1];
+                m[-2] = 2.0 * m[-1] - m[0];
+                m[k - 1] = 2.0 * m[k - 2] - m[k - 3];
+                m[k] = 2.0 * m[k - 1] - m[k - 2];
+                // slope at knot i: the chords m[i-1] and m[i], each weighted by how
+                // much the chords on the far side change (eq. 1); their mean where
+                // neither side changes
+                for (int32_t i = 0; i < k; ++i)
+                {
+                    const double w_left = std::fabs(m[i + 1] - m[i]);  // weight of m[i-1]
+                    const double w_right = std::fabs(m[i - 1] - m[i - 2]); // weight of m[i]
+                    const double w = w_left + w_right;
+                    s[i] = w > 0.0 ? (w_left * m[i - 1] + w_right * m[i]) / w : 0.5 * (m[i - 1] + m[i]);
+                }
+            }
+            finish_hermite(x, y, k);
+            return true;
+        }
+
+        /** Straight lines between the knots (same contract as construct()). */
+        bool construct_linear(const double *x, const double *y, int32_t n_knots)
+        {
+            const int32_t k = n_knots;
+            if (!prepare(x, y, k))
+                return false;
+            // piece i: y[i] + delta[i] t
+            const double *delta = delta_.data();
+            double *s = slope_.data();
             double *c2 = c2_.data();
             double *c3 = c3_.data();
             for (int32_t i = 0; i < k - 1; ++i)
             {
-                c2[i] = (3.0 * delta[i] - 2.0 * s[i] - s[i + 1]) * inv_h[i];
-                c3[i] = (s[i] + s[i + 1] - 2.0 * delta[i]) * inv_h[i] * inv_h[i];
+                s[i] = delta[i];
+                c2[i] = 0.0;
+                c3[i] = 0.0;
             }
-
-            x_ = x;
-            y_ = y;
-            n_knots_ = k;
-            valid_ = true;
+            commit(x, y, k);
             return true;
         }
 
@@ -233,6 +264,57 @@ namespace eemd
         }
 
     private:
+        /** Spacing and chord slopes; false for fewer than 2 knots or x not increasing. */
+        bool prepare(const double *x, const double *y, int32_t k)
+        {
+            valid_ = false;
+            if (k < 2)
+                return false;
+            reserve(k);
+            double *h = h_.data();
+            double *delta = delta_.data();
+            double *inv_h = inv_h_.data();
+            double min_h = x[1] - x[0];
+            for (int32_t i = 0; i < k - 1; ++i)
+            {
+                h[i] = x[i + 1] - x[i];
+                min_h = h[i] < min_h ? h[i] : min_h;
+            }
+            if (!(min_h > 0.0))
+                return false;
+            for (int32_t i = 0; i < k - 1; ++i)
+            {
+                inv_h[i] = 1.0 / h[i];
+                delta[i] = (y[i + 1] - y[i]) * inv_h[i];
+            }
+            return true;
+        }
+
+        /** The cubic of each piece from the slopes at its two knots (Hermite form). */
+        void finish_hermite(const double *x, const double *y, int32_t k)
+        {
+            // Piece i on [x[i], x[i+1]], t = x - x[i]:  y[i] + s[i] t + c2[i] t^2 + c3[i] t^3
+            const double *s = slope_.data();
+            const double *delta = delta_.data();
+            const double *inv_h = inv_h_.data();
+            double *c2 = c2_.data();
+            double *c3 = c3_.data();
+            for (int32_t i = 0; i < k - 1; ++i)
+            {
+                c2[i] = (3.0 * delta[i] - 2.0 * s[i] - s[i + 1]) * inv_h[i];
+                c3[i] = (s[i] + s[i + 1] - 2.0 * delta[i]) * inv_h[i] * inv_h[i];
+            }
+            commit(x, y, k);
+        }
+
+        void commit(const double *x, const double *y, int32_t k)
+        {
+            x_ = x;
+            y_ = y;
+            n_knots_ = k;
+            valid_ = true;
+        }
+
         void reserve(int32_t k)
         {
             if (static_cast<size_t>(k) <= h_.size())
@@ -246,6 +328,7 @@ namespace eemd
             c3_.resize(cap);
             cp_.resize(cap);
             dp_.resize(cap);
+            chord_.resize(cap + 4);
         }
 
         const double *x_ = nullptr;
@@ -256,6 +339,7 @@ namespace eemd
         std::vector<double> h_, inv_h_, delta_; // knot spacing, its reciprocal, chord slopes
         std::vector<double> slope_, c2_, c3_;   // per knot / per piece
         std::vector<double> cp_, dp_;           // elimination workspace
+        std::vector<double> chord_;             // Akima: the chords, two extra on each side
     };
 
 } // namespace eemd
