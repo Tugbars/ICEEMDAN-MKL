@@ -28,31 +28,33 @@ ICEEMDAN averages the *local mean* of each noisy copy instead of its modes. The 
 
 ## Accuracy
 
-The default configuration is the published algorithm. The local mean of each noisy copy is found by sifting its first mode to convergence, with the stop rule and the boundary treatment of Rilling, Flandrin and Gonçalves's `emd.m`, and the noise is scaled at every stage as in the paper.
+The default configuration is the published algorithm, and it agrees with the authors' own code (`ceemdan.m` with `emd.m`, run in GNU Octave) at the same settings:
 
-It was compared with the authors' own ICEEMDAN code (`ceemdan.m` with `emd.m`, run in GNU Octave) at the same settings: noise 0.2, 100 realizations. The two draw different random numbers, so they agree statistically, not sample by sample.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/accuracy-dark.png">
+  <img src="docs/img/accuracy-light.png" width="900" alt="This library beside the authors' code. On white noise the mean frequencies of the first six modes coincide, one octave apart. On three tones on a trend the error of the mode nearest each tone is within 0.03 of the authors' code.">
+</picture>
 
-**White noise, N = 4096.** ICEEMDAN of white noise acts as a bank of filters one octave apart. Mean frequency of the first six modes, in cycles per sample:
+<details>
+<summary>The numbers</summary>
+
+White noise, N = 4096: mean frequency of the first six modes, in cycles per sample.
 
 | | IMF 1 | IMF 2 | IMF 3 | IMF 4 | IMF 5 | IMF 6 |
 |---|---|---|---|---|---|---|
 | Authors' code | 0.3421 | 0.1568 | 0.0788 | 0.0422 | 0.0201 | 0.0095 |
 | This library | 0.3421 | 0.1566 | 0.0787 | 0.0424 | 0.0202 | 0.0094 |
 
-The bands agree within 0.007 octave on average.
-
-**Tones of 128, 32 and 8 cycles on a trend, N = 2048.** Relative error of the mode nearest each tone, edges excluded:
+Tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the mode nearest each tone, edges excluded.
 
 | | 128 cycles | 32 cycles | 8 cycles |
 |---|---|---|---|
 | Authors' code | 0.269 | 0.302 | 0.058 |
 | This library | 0.260 | 0.323 | 0.086 |
 
-**The paper's test signal, N = 1000** (the figure above). Relative error against the true components: 7.6 % for the burst, 4.2 % for the sinusoid.
+</details>
 
-**Completeness.** The modes and the residue add up to the signal to rounding: the largest difference in these tests was 2 × 10⁻¹⁶ of the signal's amplitude.
-
-How these numbers were obtained: [`validation/README.md`](validation/README.md) for the comparison with the authors' code, [`validation/figures/README.md`](validation/figures/README.md) for the test signal of the figure.
+The two codes draw different random numbers, so they agree statistically, not sample by sample. The modes and the residue add up to the signal to rounding (2 × 10⁻¹⁶). Method: [`validation/README.md`](validation/README.md).
 
 ## Speed
 

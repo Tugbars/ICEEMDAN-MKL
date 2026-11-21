@@ -1,0 +1,15 @@
+{
+  "source": "validation/compare.py: the authors' code run in GNU Octave (3 seeds), this library in its default configuration (5 seeds)",
+  "white_noise": {
+    "what": "white noise, N = 4096: mean frequency of IMF 1..6 in cycles per sample",
+    "reference": [0.3421, 0.1568, 0.0788, 0.0422, 0.0201, 0.0095],
+    "library": [0.3421, 0.1566, 0.0787, 0.0424, 0.0202, 0.0094],
+    "mean_octave_distance": 0.007
+  },
+  "tones": {
+    "what": "tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the nearest IMF, edges excluded",
+    "names": ["128 cycles", "32 cycles", "8 cycles"],
+    "reference": [0.269, 0.302, 0.058],
+    "library": [0.260, 0.323, 0.086]
+  }
+}

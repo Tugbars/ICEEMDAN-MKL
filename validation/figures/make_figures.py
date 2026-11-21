@@ -4,6 +4,8 @@
                                   short burst of a higher frequency) decomposed by this library,
                                   beside the authors' reference code when its output is there;
                                   the amplitude of the true components lies underneath
+  accuracy-{light,dark}.png       this library beside the authors' code on the two tests of
+                                  ../compare.py, from the numbers in accuracy.json
   speed-{light,dark}.png          time per decomposition against signal length, this library
                                   and the reference code (drawn only with the reference times)
   numbers.json                    the errors and times read off the files below, written
@@ -252,10 +254,75 @@ def speed(mode):
     plt.close(fig)
 
 
+def accuracy(mode):
+    """Authors' code (an open ring) and this library (a dot) on each item: where the dot sits
+    in the ring, the two agree."""
+    c = THEMES[mode]
+    a = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "accuracy.json")))
+    wn, tones = a["white_noise"], a["tones"]
+
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10, 3.5), facecolor=c["surface"],
+                                      gridspec_kw=dict(width_ratios=[1.25, 1]))
+
+    def paired(ax, ref, lib, names):
+        rows = np.arange(len(names))[::-1]  # first item on top
+        style_axes(ax, c)
+        for y, r, v in zip(rows, ref, lib):
+            ax.plot([r, v], [y, y], color=c["axis"], linewidth=1.2, solid_capstyle="round", zorder=1)
+        ax.plot(ref, rows, linestyle="none", marker="o", markersize=11, markerfacecolor=c["surface"],
+                markeredgecolor=c["ref"], markeredgewidth=1.7, label="Authors' code", zorder=2)
+        ax.plot(lib, rows, linestyle="none", marker="o", markersize=6, markerfacecolor=c["lib"],
+                markeredgecolor=c["lib"], label="This library", zorder=3)
+        ax.set_yticks(rows)
+        ax.set_yticklabels(names, color=c["ink"], fontsize=9.5)
+        ax.set_ylim(-0.7, len(names) - 0.3)
+        ax.tick_params(axis="y", length=0, pad=8)
+        ax.spines["left"].set_visible(False)
+        ax.grid(axis="x", color=c["grid"], linewidth=0.8)
+        ax.set_axisbelow(True)
+
+    # white noise: the modes sit one octave apart
+    paired(left, wn["reference"], wn["library"], [f"IMF {k}" for k in range(1, len(wn["library"]) + 1)])
+    left.set_xscale("log", base=2)
+    ticks = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32]
+    left.xaxis.set_major_locator(FixedLocator(ticks))
+    left.xaxis.set_minor_locator(NullLocator())
+    left.set_xticklabels([f"{v:g}" for v in ticks])
+    left.set_xlim(0.0072, 0.45)
+    left.set_xlabel("mean frequency of the mode, cycles per sample (each step is one octave)", color=c["ink2"],
+                    fontsize=9)
+    left.set_title("White noise", loc="left", color=c["ink"], fontsize=12, fontweight="semibold", pad=24)
+    left.text(0, 1.06, f"the six bands agree within {wn['mean_octave_distance']:g} octave on average",
+              transform=left.transAxes, color=c["ink2"], fontsize=9, va="bottom")
+
+    # tones on a trend: how well one mode holds each tone
+    paired(right, tones["reference"], tones["library"], tones["names"])
+    right.set_xlim(0, 0.41)
+    right.xaxis.set_major_locator(FixedLocator([0, 0.1, 0.2, 0.3, 0.4]))
+    right.set_xticklabels(["0", "0.1", "0.2", "0.3", "0.4"])
+    right.set_xlabel("relative error of the mode nearest the tone", color=c["ink2"], fontsize=9)
+    right.set_title("Three tones on a trend", loc="left", color=c["ink"], fontsize=12, fontweight="semibold", pad=24)
+    gap = max(abs(r - v) for r, v in zip(tones["reference"], tones["library"]))
+    right.text(0, 1.06, f"within {np.ceil(gap * 100) / 100:g} of the authors' code on every tone",
+               transform=right.transAxes, color=c["ink2"], fontsize=9, va="bottom")
+
+    handles, labels = left.get_legend_handles_labels()
+    legend = fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.985, 0.985), frameon=False,
+                        fontsize=9, ncol=2, columnspacing=1.8, handletextpad=0.5, borderaxespad=0)
+    for text in legend.get_texts():
+        text.set_color(c["ink2"])
+
+    fig.subplots_adjust(left=0.07, right=0.985, top=0.76, bottom=0.17, wspace=0.3)
+    fig.savefig(f"{out_dir}/accuracy-{mode}.png", dpi=200, facecolor=c["surface"])
+    plt.close(fig)
+
+
 made = []
 for mode in ("light", "dark"):
     decomposition(mode)
     made.append(f"decomposition-{mode}.png")
+    accuracy(mode)
+    made.append(f"accuracy-{mode}.png")
     if numbers["speed"]["reference_s"]:
         speed(mode)
         made.append(f"speed-{mode}.png")
