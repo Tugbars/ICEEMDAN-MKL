@@ -172,6 +172,10 @@ _lib.iceemdan_set_spline_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_volatility_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_boundary_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_local_mean_method.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_keep_noise_bank.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_keep_noise_bank.restype = None
+_lib.iceemdan_release_noise_bank.argtypes = [_HandlePtr]
+_lib.iceemdan_release_noise_bank.restype = None
 
 # Decomposition
 _lib.iceemdan_decompose.argtypes = [_HandlePtr, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
@@ -208,6 +212,9 @@ _lib.iceemdan_get_rng_seed_used.restype = ctypes.c_uint
 
 _lib.iceemdan_get_valid.argtypes = [_HandlePtr]
 _lib.iceemdan_get_valid.restype = ctypes.c_int
+
+_lib.iceemdan_get_noise_bank_reused.argtypes = [_HandlePtr]
+_lib.iceemdan_get_noise_bank_reused.restype = ctypes.c_int
 
 for _name, _restype in [('iceemdan_get_imf_sift_iterations', ctypes.c_int),
                         ('iceemdan_get_imf_mean_sift_iterations', ctypes.c_double),
@@ -333,8 +340,8 @@ class ICEEMDAN:
     
     @property
     def rng_seed(self) -> int:
-        """Random seed for reproducibility (0 = random)."""
-        return self._rng_seed if hasattr(self, '_rng_seed') else 0
+        """Seed of the noise. The same seed gives the same decomposition."""
+        return self._rng_seed if hasattr(self, '_rng_seed') else 42
     
     @rng_seed.setter
     def rng_seed(self, value: int):
@@ -390,6 +397,27 @@ class ICEEMDAN:
     def local_mean_method(self, value: LocalMeanMethod):
         _lib.iceemdan_set_local_mean_method(self._handle, int(value))
         self._local_mean_method = value
+
+    @property
+    def keep_noise_bank(self) -> bool:
+        """
+        Keep the decomposed noise of the ensemble between calls (default: True).
+
+        It depends on the signal length, the seed, the ensemble size and the
+        sifting settings, not on the signal: with it kept, every further signal
+        of the same length is decomposed faster and gets the same result as
+        before. Set to False to free it at the end of each call.
+        """
+        return self._keep_noise_bank if hasattr(self, '_keep_noise_bank') else True
+
+    @keep_noise_bank.setter
+    def keep_noise_bank(self, value: bool):
+        _lib.iceemdan_set_keep_noise_bank(self._handle, int(bool(value)))
+        self._keep_noise_bank = bool(value)
+
+    def release_noise_bank(self):
+        """Free the noise kept from the last call. The next call builds it again."""
+        _lib.iceemdan_release_noise_bank(self._handle)
     
     # ========================================================================
     # Decomposition
@@ -423,6 +451,7 @@ class ICEEMDAN:
             - nan_count: Number of NaN/Inf values sanitized
             - rng_seed_used: Actual RNG seed used
             - valid: True if decomposition succeeded
+            - noise_bank_reused: True if the noise kept from an earlier call was used
             - sift_iterations: per IMF, most sifting iterations any trial needed
             - mean_sift_iterations: per IMF, mean iterations per trial
             - nonconverged_trials: per IMF, trials that hit max_sift_iters
@@ -472,6 +501,7 @@ class ICEEMDAN:
                 'nan_count': _lib.iceemdan_get_nan_count(self._handle),
                 'rng_seed_used': _lib.iceemdan_get_rng_seed_used(self._handle),
                 'valid': bool(_lib.iceemdan_get_valid(self._handle)),
+                'noise_bank_reused': bool(_lib.iceemdan_get_noise_bank_reused(self._handle)),
                 'sift_iterations': [_lib.iceemdan_get_imf_sift_iterations(self._handle, k) for k in range(num_imfs)],
                 'mean_sift_iterations': [_lib.iceemdan_get_imf_mean_sift_iterations(self._handle, k) for k in range(num_imfs)],
                 'nonconverged_trials': [_lib.iceemdan_get_imf_nonconverged_trials(self._handle, k) for k in range(num_imfs)],

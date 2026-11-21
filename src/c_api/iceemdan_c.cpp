@@ -203,6 +203,26 @@ ICEEMDAN_API void iceemdan_set_local_mean_method(ICEEMDANHandle *h, int method)
             (method == 1) ? eemd::LocalMeanMethod::SingleEnvelope : eemd::LocalMeanMethod::Sifted;
 }
 
+/**
+ * Keep the noise bank between calls (default: 1). The bank is the decomposed
+ * noise of the ensemble. It depends on the signal length, the seed, the
+ * ensemble size and the sifting settings, not on the signal, so with it kept
+ * every further signal of the same length skips building it and gets the same
+ * result as before. 0 frees it at the end of each call.
+ */
+ICEEMDAN_API void iceemdan_set_keep_noise_bank(ICEEMDANHandle *h, int keep)
+{
+    if (h && h->decomposer)
+        h->decomposer->config().keep_noise_bank = keep != 0;
+}
+
+/** Free the noise bank kept from the last call. The next call builds it again. */
+ICEEMDAN_API void iceemdan_release_noise_bank(ICEEMDANHandle *h)
+{
+    if (h && h->decomposer)
+        h->decomposer->release_noise_bank();
+}
+
 // ============================================================================
 // Decomposition
 // ============================================================================
@@ -382,6 +402,12 @@ ICEEMDAN_API unsigned int iceemdan_get_rng_seed_used(ICEEMDANHandle *h)
 ICEEMDAN_API int iceemdan_get_valid(ICEEMDANHandle *h)
 {
     return h ? (h->diagnostics.valid ? 1 : 0) : 0;
+}
+
+/** 1 when the last decomposition used the noise bank kept from an earlier call. */
+ICEEMDAN_API int iceemdan_get_noise_bank_reused(ICEEMDANHandle *h)
+{
+    return h ? (h->diagnostics.noise_bank_reused ? 1 : 0) : 0;
 }
 
 // Per-IMF convergence diagnostics (index 0 = first IMF). -1 / -1.0 when out of range.

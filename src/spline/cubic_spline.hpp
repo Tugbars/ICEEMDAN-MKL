@@ -24,7 +24,8 @@
 #include <cstdint>
 #include <vector>
 
-#if defined(__AVX2__) && defined(__FMA__)
+// Visual C++ has no __FMA__: its /arch:AVX2 stands for both
+#if defined(__AVX2__) && (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
 #include <immintrin.h>
 #define EEMD_SPLINE_AVX2 1
 #endif

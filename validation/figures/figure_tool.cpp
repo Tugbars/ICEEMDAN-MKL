@@ -4,6 +4,8 @@
 //   figure_tool time <in.csv> <runs> [options]            prints: median ms, min ms, number of IMFs
 //
 // options: --seed S  --threads T  --sd  --single  --circular  --mirror
+//          --no-keep   the noise bank is not kept between calls: every timed decomposition
+//                      costs what the first one of its length costs
 #include "iceemdan_mkl.hpp"
 
 #include <algorithm>
@@ -51,6 +53,8 @@ int main(int argc, char **argv)
             d.config().use_circular_bank = true;
         else if (!std::strcmp(argv[a], "--mirror"))
             d.config().boundary_method = eemd::BoundaryMethod::Mirror;
+        else if (!std::strcmp(argv[a], "--no-keep"))
+            d.config().keep_noise_bank = false;
     }
 
     std::vector<std::vector<double>> imfs;
