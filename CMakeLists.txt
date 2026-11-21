@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(iceemdan 
     VERSION 1.0.0
-    LANGUAGES CXX
+    LANGUAGES C CXX
     DESCRIPTION "EEMD and ICEEMDAN (Improved Complete Ensemble EMD with Adaptive Noise)"
 )
 
@@ -390,6 +390,11 @@ add_iceemdan_executable(same_noise validation/same_noise/same_noise.cpp)
 
 add_library(iceemdan_shared SHARED src/c_api/iceemdan_c.cpp)
 target_link_libraries(iceemdan_shared PRIVATE iceemdan)
+# include/iceemdan.h: the interface, for the library itself and its users
+target_include_directories(iceemdan_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
 set_target_properties(iceemdan_shared PROPERTIES
     OUTPUT_NAME "iceemdan"
     POSITION_INDEPENDENT_CODE ON
@@ -412,6 +417,22 @@ if(WIN32)
     )
 endif()
 
+# The C interface from C: an example for users, and a test of include/iceemdan.h
+# compiled as C against the shared library
+add_executable(c_example examples/c/decompose.c)
+add_executable(test_c_api tests/test_c_api.c)
+foreach(c_program c_example test_c_api)
+    target_link_libraries(${c_program} PRIVATE iceemdan_shared)
+    if(UNIX)
+        target_link_libraries(${c_program} PRIVATE m)
+    endif()
+    if(TARGET vectorfft_runtime)
+        add_dependencies(${c_program} vectorfft_runtime)
+    endif()
+endforeach()
+add_test(NAME c_api COMMAND test_c_api)
+add_test(NAME c_example COMMAND c_example)
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================
@@ -433,6 +454,15 @@ install(FILES
     src/hht/eemd_hht.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+# The C interface: include/iceemdan.h and the shared library (on Windows
+# iceemdan.dll in bin, its import library in lib)
+install(TARGETS iceemdan_shared
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES include/iceemdan.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT iceemdan_targets
     FILE iceemdan-targets.cmake

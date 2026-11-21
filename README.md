@@ -98,7 +98,7 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 **The library**
 
-- **Three interfaces**: C++17 headers, a C interface built as a shared library, and a Python binding on NumPy arrays.
+- **Three interfaces**: C++17 headers, a C interface built as a shared library with one header ([`include/iceemdan.h`](include/iceemdan.h), every function documented; example in [`examples/c/decompose.c`](examples/c/decompose.c)), and a Python binding on NumPy arrays.
 - **Multithreaded without OpenMP**: the ensemble runs on the library's own thread pool. The thread count is one setting, and idle threads use no processor.
 - **Little to install**: a C++17 compiler and CMake. The splines, the noise and the threads are the library's own; the one library it uses, [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs, is downloaded by CMake as a ready-built binary.
 - **Windows and Linux** on x86-64 processors with AVX2. Developed and tested with GCC (MinGW included); it also builds with MSVC, and CMake has configurations for Clang and Intel ICX.

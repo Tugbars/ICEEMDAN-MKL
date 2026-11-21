@@ -53,10 +53,22 @@ class BoundaryMethod(IntEnum):
     MIRROR = 0
     AR = 1
     LINEAR = 2
+    SYMMETRIC = 3        # the symmetric extension of the authors' code (default)
 
 class LocalMeanMethod(IntEnum):
     SIFTED = 0           # Colominas et al. (2014): first mode sifted to convergence (default)
     SINGLE_ENVELOPE = 1  # one envelope mean per trial: faster, not the published algorithm
+
+class StopRule(IntEnum):
+    SD = 0               # the SD criterion (sift_threshold, s_number): faster
+    RILLING = 1          # Rilling, Flandrin and Goncalves (2003), as the authors' code (default)
+
+# The settings each preset starts with (include/iceemdan.h, iceemdan_create)
+_PRESET_DEFAULTS = {
+    0: dict(spline_method=0, volatility_method=0, boundary_method=3, antithetic=False),  # Standard
+    1: dict(spline_method=1, volatility_method=2, boundary_method=1, antithetic=True),   # Finance
+    2: dict(spline_method=0, volatility_method=0, boundary_method=3, antithetic=False),  # Scientific
+}
 
 # ============================================================================
 # Library Loading
@@ -167,6 +179,14 @@ _lib.iceemdan_set_boundary_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_local_mean_method.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_keep_noise_bank.argtypes = [_HandlePtr, ctypes.c_int]
 _lib.iceemdan_set_keep_noise_bank.restype = None
+_lib.iceemdan_set_stop_rule.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_stop_rule.restype = None
+_lib.iceemdan_set_antithetic.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_antithetic.restype = None
+_lib.iceemdan_set_circular_bank.argtypes = [_HandlePtr, ctypes.c_int]
+_lib.iceemdan_set_circular_bank.restype = None
+_lib.iceemdan_set_noise_bank_max_bytes.argtypes = [_HandlePtr, ctypes.c_size_t]
+_lib.iceemdan_set_noise_bank_max_bytes.restype = None
 _lib.iceemdan_release_noise_bank.argtypes = [_HandlePtr]
 _lib.iceemdan_release_noise_bank.restype = None
 
@@ -302,6 +322,10 @@ class ICEEMDAN:
             raise RuntimeError("Failed to create ICEEMDAN instance")
         self._mode = mode
     
+    def _preset(self, name):
+        """The value the preset gave a setting."""
+        return _PRESET_DEFAULTS.get(int(self._mode), _PRESET_DEFAULTS[0])[name]
+
     def __del__(self):
         if hasattr(self, '_handle') and self._handle:
             _lib.iceemdan_destroy(self._handle)
@@ -383,7 +407,7 @@ class ICEEMDAN:
     @property
     def spline_method(self) -> SplineMethod:
         """Spline interpolation method."""
-        return self._spline_method if hasattr(self, '_spline_method') else SplineMethod.CUBIC
+        return self._spline_method if hasattr(self, '_spline_method') else SplineMethod(self._preset('spline_method'))
     
     @spline_method.setter
     def spline_method(self, value: SplineMethod):
@@ -393,7 +417,7 @@ class ICEEMDAN:
     @property
     def volatility_method(self) -> VolatilityMethod:
         """Volatility scaling method."""
-        return self._volatility_method if hasattr(self, '_volatility_method') else VolatilityMethod.GLOBAL
+        return self._volatility_method if hasattr(self, '_volatility_method') else VolatilityMethod(self._preset('volatility_method'))
     
     @volatility_method.setter
     def volatility_method(self, value: VolatilityMethod):
@@ -403,7 +427,7 @@ class ICEEMDAN:
     @property
     def boundary_method(self) -> BoundaryMethod:
         """Boundary extrapolation method."""
-        return self._boundary_method if hasattr(self, '_boundary_method') else BoundaryMethod.MIRROR
+        return self._boundary_method if hasattr(self, '_boundary_method') else BoundaryMethod(self._preset('boundary_method'))
     
     @boundary_method.setter
     def boundary_method(self, value: BoundaryMethod):
@@ -440,6 +464,46 @@ class ICEEMDAN:
     def release_noise_bank(self):
         """Free the noise kept from the last call. The next call builds it again."""
         _lib.iceemdan_release_noise_bank(self._handle)
+
+    @property
+    def stop_rule(self) -> StopRule:
+        """When sifting a mode stops: RILLING (default, as the authors' code) or SD (faster)."""
+        return self._stop_rule if hasattr(self, '_stop_rule') else StopRule.RILLING
+
+    @stop_rule.setter
+    def stop_rule(self, value: StopRule):
+        _lib.iceemdan_set_stop_rule(self._handle, int(value))
+        self._stop_rule = StopRule(int(value))
+
+    @property
+    def antithetic(self) -> bool:
+        """+/- noise pairs: half as many noise realizations to decompose. Not the published algorithm."""
+        return self._antithetic if hasattr(self, '_antithetic') else self._preset('antithetic')
+
+    @antithetic.setter
+    def antithetic(self, value: bool):
+        _lib.iceemdan_set_antithetic(self._handle, int(bool(value)))
+        self._antithetic = bool(value)
+
+    @property
+    def circular_bank(self) -> bool:
+        """The noise of all copies cut from one long decomposed noise signal. Not the published algorithm."""
+        return self._circular_bank if hasattr(self, '_circular_bank') else False
+
+    @circular_bank.setter
+    def circular_bank(self, value: bool):
+        _lib.iceemdan_set_circular_bank(self._handle, int(bool(value)))
+        self._circular_bank = bool(value)
+
+    @property
+    def noise_bank_max_bytes(self) -> int:
+        """Memory cap of the decomposed noise in bytes (default 2 GiB); above it the circular bank is used."""
+        return self._noise_bank_max_bytes if hasattr(self, '_noise_bank_max_bytes') else 2 << 30
+
+    @noise_bank_max_bytes.setter
+    def noise_bank_max_bytes(self, value: int):
+        _lib.iceemdan_set_noise_bank_max_bytes(self._handle, int(value))
+        self._noise_bank_max_bytes = int(value)
     
     # ========================================================================
     # Decomposition
