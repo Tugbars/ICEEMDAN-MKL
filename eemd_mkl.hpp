@@ -37,6 +37,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h> // _MM_SET_FLUSH_ZERO_MODE, _MM_SET_DENORMALS_ZERO_MODE
 #endif
+
 #include "eemd_fft.hpp" // real FFTs: VectorFFT when EEMD_USE_VECTORFFT, else MKL DFTI
 
 #ifndef M_PI
@@ -140,7 +141,7 @@ namespace eemd
 
     /**
      * Spline interpolation method for envelope construction
-     * - Cubic: Smooth C2 spline, can overshoot on sharp changes (default)
+     * - Cubic: Smooth C2 spline with not-a-knot ends, can overshoot on sharp changes (default)
      * - Akima: Local C1 spline, resistant to outliers (recommended for finance)
      * - Linear: Simple linear interpolation (fastest, least accurate)
      */
@@ -149,6 +150,32 @@ namespace eemd
         Cubic = 0, // DF_PP_CUBIC - smooth but can overshoot
         Akima = 1, // DF_PP_AKIMA - local, outlier-resistant
         Linear = 2 // DF_PP_LINEAR - fastest, for very few extrema
+    };
+
+    /**
+     * When sifting a mode stops
+     * - SD:      sum(m^2) / sum(h^2) < sift_threshold, plus the S-number and
+     *            extrema/zero-crossing early exits. Cheap; typically stops
+     *            after 2-3 iterations at the default threshold of 0.05.
+     * - Rilling: the criterion of Rilling, Flandrin & Goncalves (2003), as in
+     *            their emd.m that the ICEEMDAN authors' reference code uses:
+     *            with mode amplitude a = (U - L) / 2 and envelope mean m,
+     *            sift while |m| > theta1 * a on more than a fraction alpha of
+     *            the samples or |m| > theta2 * a anywhere, and stop only when
+     *            the extrema and zero-crossing counts differ by at most one.
+     */
+    enum class SiftStopRule : uint8_t
+    {
+        SD = 0,
+        Rilling = 1
+    };
+
+    /** Thresholds of SiftStopRule::Rilling (emd.m defaults [0.05, 0.5, 0.05]). */
+    struct RillingThresholds
+    {
+        double theta1 = 0.05;
+        double theta2 = 0.5;
+        double alpha = 0.05;
     };
 
     // ============================================================================
@@ -172,7 +199,19 @@ namespace eemd
 
         // Spline method for envelope interpolation
         SplineMethod spline_method = SplineMethod::Cubic;
+
+        // Sifting stop rule (see SiftStopRule); sift_threshold and s_number
+        // apply to SD, rilling to Rilling.
+        SiftStopRule stop_rule = SiftStopRule::SD;
+        RillingThresholds rilling;
+
+        // Envelope ends: false = mirror boundary_extend extrema plus a linear
+        // end point (extend_extrema_raw, the original scheme); true = the
+        // symmetric extension of emd.m (extend_extrema_symmetric), which stays
+        // stable when sifting runs for many iterations.
+        bool symmetric_boundary = false;
     };
+
     // ============================================================================
     // Finite check that survives -ffast-math
     //
@@ -320,15 +359,22 @@ namespace eemd
         int32_t n_ext = 0;
         int32_t ext_start = 0;
 
+        // Second knot buffer pair (symmetric extension builds both envelopes at once)
+        std::vector<double> ext_x2;
+        std::vector<double> ext_y2;
+        int32_t n_ext2 = 0;
+
         explicit ThreadScratchPad(int32_t n)
         {
             const int32_t max_extrema = n / 2 + 2;
-            const int32_t ext_size = n + 20;
+            const int32_t ext_size = n + 128; // extrema + up to 2 x 31 mirrored knots + end points
 
             max_idx.resize(max_extrema);
             min_idx.resize(max_extrema);
             ext_x.resize(ext_size);
             ext_y.resize(ext_size);
+            ext_x2.resize(ext_size);
+            ext_y2.resize(ext_size);
         }
     };
 
@@ -430,6 +476,31 @@ namespace eemd
             count += ((signal[i - 1] >= 0.0) != (signal[i] >= 0.0));
         }
         return count;
+    }
+
+    /**
+     * SiftStopRule::Rilling: true when the mode h (with upper/lower
+     * envelopes U, L and n_extrema extrema) should NOT be sifted further.
+     */
+    inline bool rilling_should_stop(const double *__restrict h,
+                                    const double *__restrict upper,
+                                    const double *__restrict lower,
+                                    int32_t n, int32_t n_extrema,
+                                    const RillingThresholds &th)
+    {
+        int64_t over = 0;
+        int32_t big = 0;
+        for (int32_t i = 0; i < n; ++i)
+        {
+            const double m = std::abs(0.5 * (upper[i] + lower[i]));
+            const double a = 0.5 * std::abs(upper[i] - lower[i]);
+            over += (m > th.theta1 * a);
+            big |= (m > th.theta2 * a);
+        }
+        const bool keep_sifting = (static_cast<double>(over) > th.alpha * n || big) && n_extrema > 2;
+        if (keep_sifting)
+            return false;
+        return std::abs(count_zero_crossings(h, n) - n_extrema) <= 1;
     }
 
     // ============================================================================
@@ -538,6 +609,190 @@ namespace eemd
     }
 
     // ============================================================================
+    // Symmetric boundary extension (Rilling, Flandrin & Goncalves 2003; the
+    // boundary_conditions() of emd.m, which the ICEEMDAN authors' reference
+    // code uses). Mirrors nbsym extrema of each kind about the first/last
+    // extremum, or about the end sample when that is the better symmetry
+    // point, so both envelopes are interpolated, never extrapolated, over
+    // [0, n-1]. Writes both envelopes' knots at once (the choice of symmetry
+    // point depends on both kinds of extrema). Knot buffers need
+    // n_max + 2 * nbsym + 2 (resp. n_min + ...) entries.
+    // Returns false when there are not enough extrema (fewer than one of
+    // each kind or fewer than three in total).
+    // ============================================================================
+
+    inline bool extend_extrema_symmetric(
+        const int32_t *__restrict imax, int32_t n_max,
+        const int32_t *__restrict imin, int32_t n_min,
+        const double *__restrict x, int32_t n, int32_t nbsym,
+        double *__restrict tmax, double *__restrict zmax, int32_t &n_tmax,
+        double *__restrict tmin, double *__restrict zmin, int32_t &n_tmin)
+    {
+        n_tmax = n_tmin = 0;
+        if (n_max < 1 || n_min < 1 || n_max + n_min < 3 || n < 3 || nbsym < 1)
+            return false;
+
+        const int32_t last = n - 1;
+        // Index lists of the mirrored knots, in the order emd.m builds them
+        // (fliplr: nearest the boundary last on the left, first on the right)
+        int32_t lmax[64], lmin[64], rmax[64], rmin[64];
+        int32_t n_lmax = 0, n_lmin = 0, n_rmax = 0, n_rmin = 0;
+        nbsym = std::min(nbsym, 30);
+
+        // fliplr(v(a:b)) in 0-based form: v[b], v[b-1], ..., v[a]
+        auto take_rev = [](const int32_t *v, int32_t a, int32_t b, int32_t *out, int32_t &cnt)
+        {
+            for (int32_t i = b; i >= a; --i)
+                out[cnt++] = v[i];
+        };
+
+        int32_t lsym, rsym;
+        // ---- left edge ----
+        if (imax[0] < imin[0])
+        {
+            if (x[0] > x[imin[0]])
+            {
+                take_rev(imax, 1, std::min(n_max - 1, nbsym), lmax, n_lmax);
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+                lsym = imax[0];
+            }
+            else
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+                take_rev(imin, 0, std::min(n_min, nbsym - 1) - 1, lmin, n_lmin);
+                lmin[n_lmin++] = 0;
+                lsym = 0;
+            }
+        }
+        else
+        {
+            if (x[0] < x[imax[0]])
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+                take_rev(imin, 1, std::min(n_min - 1, nbsym), lmin, n_lmin);
+                lsym = imin[0];
+            }
+            else
+            {
+                take_rev(imax, 0, std::min(n_max, nbsym - 1) - 1, lmax, n_lmax);
+                lmax[n_lmax++] = 0;
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+                lsym = 0;
+            }
+        }
+
+        // ---- right edge ----
+        if (imax[n_max - 1] < imin[n_min - 1])
+        {
+            if (x[last] < x[imax[n_max - 1]])
+            {
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym - 1, 0), n_min - 2, rmin, n_rmin);
+                rsym = imin[n_min - 1];
+            }
+            else
+            {
+                rmax[n_rmax++] = last;
+                take_rev(imax, std::max(n_max - nbsym + 1, 0), n_max - 1, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+                rsym = last;
+            }
+        }
+        else
+        {
+            if (x[last] > x[imin[n_min - 1]])
+            {
+                take_rev(imax, std::max(n_max - nbsym - 1, 0), n_max - 2, rmax, n_rmax);
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+                rsym = imax[n_max - 1];
+            }
+            else
+            {
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+                rmin[n_rmin++] = last;
+                take_rev(imin, std::max(n_min - nbsym + 1, 0), n_min - 1, rmin, n_rmin);
+                rsym = last;
+            }
+        }
+
+        // ---- in case the symmetrized parts do not reach the ends ----
+        auto first_mirror = [](int32_t sym, const int32_t *l, int32_t cnt)
+        { return cnt > 0 ? 2.0 * sym - l[0] : -1.0; };
+        auto last_mirror = [](int32_t sym, const int32_t *r, int32_t cnt)
+        { return cnt > 0 ? 2.0 * sym - r[cnt - 1] : 1e300; };
+
+        if (first_mirror(lsym, lmin, n_lmin) > 0.0 || first_mirror(lsym, lmax, n_lmax) > 0.0)
+        {
+            if (lsym == 0)
+                return false; // emd.m: error('bug')
+            if (lsym == imax[0])
+            {
+                n_lmax = 0;
+                take_rev(imax, 0, std::min(n_max, nbsym) - 1, lmax, n_lmax);
+            }
+            else
+            {
+                n_lmin = 0;
+                take_rev(imin, 0, std::min(n_min, nbsym) - 1, lmin, n_lmin);
+            }
+            lsym = 0;
+        }
+        if (last_mirror(rsym, rmin, n_rmin) < last || last_mirror(rsym, rmax, n_rmax) < last)
+        {
+            if (rsym == last)
+                return false; // emd.m: error('bug')
+            if (rsym == imax[n_max - 1])
+            {
+                n_rmax = 0;
+                take_rev(imax, std::max(n_max - nbsym, 0), n_max - 1, rmax, n_rmax);
+            }
+            else
+            {
+                n_rmin = 0;
+                take_rev(imin, std::max(n_min - nbsym, 0), n_min - 1, rmin, n_rmin);
+            }
+            rsym = last;
+        }
+
+        // ---- assemble [mirrored left, extrema, mirrored right] ----
+        auto assemble = [&](const int32_t *l, int32_t nl, const int32_t *mid, int32_t nmid,
+                            const int32_t *r, int32_t nr, double *t, double *z, int32_t &cnt)
+        {
+            cnt = 0;
+            for (int32_t i = 0; i < nl; ++i)
+            {
+                t[cnt] = 2.0 * lsym - l[i];
+                z[cnt++] = x[l[i]];
+            }
+            for (int32_t i = 0; i < nmid; ++i)
+            {
+                t[cnt] = static_cast<double>(mid[i]);
+                z[cnt++] = x[mid[i]];
+            }
+            for (int32_t i = 0; i < nr; ++i)
+            {
+                t[cnt] = 2.0 * rsym - r[i];
+                z[cnt++] = x[r[i]];
+            }
+            // knots must increase strictly (a mirrored end sample can coincide
+            // with the first/last extremum's mirror only in degenerate cases)
+            int32_t w = 1;
+            for (int32_t i = 1; i < cnt; ++i)
+            {
+                if (t[i] > t[w - 1])
+                {
+                    t[w] = t[i];
+                    z[w++] = z[i];
+                }
+            }
+            cnt = (cnt > 0) ? w : 0;
+        };
+        assemble(lmax, n_lmax, imax, n_max, rmax, n_rmax, tmax, zmax, n_tmax);
+        assemble(lmin, n_lmin, imin, n_min, rmin, n_rmin, tmin, zmin, n_tmin);
+        return n_tmax >= 2 && n_tmin >= 2;
+    }
+
+    // ============================================================================
     // MKL Spline - With DF_UNIFORM_PARTITION Optimization
     // ============================================================================
 
@@ -585,9 +840,14 @@ namespace eemd
                 break;
             case SplineMethod::Cubic:
             default:
+                // Not-a-knot ends (the default of MATLAB's spline/interp1 and
+                // SciPy's CubicSpline, so of the reference ICEEMDAN code);
+                // natural free ends below 4 knots, where not-a-knot is undefined.
+                // Free ends force zero curvature at the outermost knots and
+                // flatten the envelopes near the signal edges.
                 s_order = DF_PP_CUBIC;
                 s_type = DF_PP_NATURAL;
-                bc_type = DF_BC_FREE_END;
+                bc_type = (n >= 4) ? DF_BC_NOT_A_KNOT : DF_BC_FREE_END;
                 break;
             }
 
@@ -734,14 +994,20 @@ namespace eemd
                 find_maxima_raw(work_.data, n, p_max, scratch_.n_max);
                 find_minima_raw(work_.data, n, p_min, scratch_.n_min);
 
+                const bool rilling = (config_.stop_rule == SiftStopRule::Rilling);
+
                 if (scratch_.n_max < 2 || scratch_.n_min < 2)
                 {
+                    // Rilling (as emd.m): a mode that runs out of extrema
+                    // mid-sift is kept as it stands
+                    if (rilling && iter > 0)
+                        break;
                     return false;
                 }
 
                 // S-number criterion: track consecutive stable extrema counts
                 const int32_t n_extrema = scratch_.n_max + scratch_.n_min;
-                if (config_.s_number > 0)
+                if (!rilling && config_.s_number > 0)
                 {
                     if (n_extrema == prev_n_extrema)
                     {
@@ -759,41 +1025,76 @@ namespace eemd
                     }
                 }
 
-                // Upper envelope
-                extend_extrema_raw(p_max, scratch_.n_max, work_.data, n,
-                                   config_.boundary_extend, p_ext_x, p_ext_y,
-                                   scratch_.n_ext, scratch_.ext_start);
-
-                if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                if (config_.symmetric_boundary)
                 {
-                    return false;
+                    double *p_ext_x2 = scratch_.ext_x2.data();
+                    double *p_ext_y2 = scratch_.ext_y2.data();
+                    const bool ok =
+                        extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
+                                                 work_.data, n, config_.boundary_extend,
+                                                 p_ext_x, p_ext_y, scratch_.n_ext,
+                                                 p_ext_x2, p_ext_y2, scratch_.n_ext2) &&
+                        upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method) &&
+                        upper_spline_.evaluate_uniform(upper_env_.data, n) &&
+                        lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2, config_.spline_method) &&
+                        lower_spline_.evaluate_uniform(lower_env_.data, n);
+                    if (!ok)
+                    {
+                        if (rilling && iter > 0)
+                            break; // keep the mode as it stands (emd.m)
+                        return false;
+                    }
                 }
-                if (!upper_spline_.evaluate_uniform(upper_env_.data, n))
+                else
                 {
-                    return false;
+                    // Upper envelope
+                    extend_extrema_raw(p_max, scratch_.n_max, work_.data, n,
+                                       config_.boundary_extend, p_ext_x, p_ext_y,
+                                       scratch_.n_ext, scratch_.ext_start);
+
+                    if (!upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                    {
+                        return false;
+                    }
+                    if (!upper_spline_.evaluate_uniform(upper_env_.data, n))
+                    {
+                        return false;
+                    }
+
+                    // Lower envelope (reuse ext buffers)
+                    extend_extrema_raw(p_min, scratch_.n_min, work_.data, n,
+                                       config_.boundary_extend, p_ext_x, p_ext_y,
+                                       scratch_.n_ext, scratch_.ext_start);
+
+                    if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                    {
+                        return false;
+                    }
+                    if (!lower_spline_.evaluate_uniform(lower_env_.data, n))
+                    {
+                        return false;
+                    }
                 }
 
-                // Lower envelope (reuse ext buffers)
-                extend_extrema_raw(p_min, scratch_.n_min, work_.data, n,
-                                   config_.boundary_extend, p_ext_x, p_ext_y,
-                                   scratch_.n_ext, scratch_.ext_start);
+                const double *__restrict upper = upper_env_.data;
+                const double *__restrict lower = lower_env_.data;
+                double *__restrict w = work_.data;
 
-                if (!lower_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method))
+                if (rilling)
                 {
-                    return false;
-                }
-                if (!lower_spline_.evaluate_uniform(lower_env_.data, n))
-                {
-                    return false;
+                    if (rilling_should_stop(w, upper, lower, n, n_extrema, config_.rilling))
+                        break;
+                    EEMD_OMP_SIMD
+                    for (int32_t i = 0; i < n; ++i)
+                    {
+                        w[i] -= 0.5 * (upper[i] + lower[i]);
+                    }
+                    continue;
                 }
 
                 // Fused: compute mean, update work, calculate SD in single pass
                 double sd_num = 0.0;
                 double sd_den = 0.0;
-
-                const double *__restrict upper = upper_env_.data;
-                const double *__restrict lower = lower_env_.data;
-                double *__restrict w = work_.data;
 
                 EEMD_OMP_SIMD_REDUCTION2(+, sd_num, sd_den)
                 for (int32_t i = 0; i < n; ++i)
