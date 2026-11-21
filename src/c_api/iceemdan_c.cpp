@@ -1,9 +1,8 @@
 /**
  * C API wrapper for ICEEMDAN - Python ctypes bindings
  *
- * Compile as shared library:
- *   Windows: cl /LD /O2 iceemdan_c.cpp /link mkl_rt.lib
- *   Linux:   g++ -shared -fPIC -O3 -o libiceemdan.so iceemdan_c.cpp -lmkl_rt -liomp5
+ * CMake builds it as the shared library "iceemdan" (target iceemdan_shared),
+ * linked with MKL's sequential layer and VectorFFT.
  */
 
 #include "iceemdan_mkl.hpp"

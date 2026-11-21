@@ -15,7 +15,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # CRITICAL: Force LP64 (32-bit integers)
 set(MKL_INTERFACE "lp64" CACHE STRING "MKL interface (lp64 or ilp64)" FORCE)
-# Sequential MKL: the library runs its own threads (eemd_threads.hpp) and calls
+# Sequential MKL: the library runs its own threads (src/threads) and calls
 # MKL from each of them, so MKL needs no threads of its own and no OpenMP runtime.
 set(MKL_THREADING "sequential" CACHE STRING "MKL threading" FORCE)
 
@@ -103,8 +103,13 @@ endif()
 add_library(eemd_mkl INTERFACE)
 add_library(eemd::eemd_mkl ALIAS eemd_mkl)
 
+# The headers are grouped in folders under src/ and include one another by
+# name, so each group folder is an include directory. An install puts the
+# headers side by side in one folder.
 target_include_directories(eemd_mkl INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/fft>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/threads>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -266,7 +271,7 @@ add_library(iceemdan_mkl INTERFACE)
 add_library(eemd::iceemdan_mkl ALIAS iceemdan_mkl)
 
 target_include_directories(iceemdan_mkl INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
     $<INSTALL_INTERFACE:include>
 )
 
@@ -304,131 +309,77 @@ macro(add_iceemdan_executable name source)
 endmacro()
 
 # ============================================================================
-# Examples (in root)
+# Examples (examples/)
 # ============================================================================
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example_simple.cpp")
-    add_iceemdan_executable(example_simple example_simple.cpp)
-endif()
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example_finance_csv.cpp")
-    add_iceemdan_executable(example_finance_csv example_finance_csv.cpp)
-endif()
+add_iceemdan_executable(example_finance_csv examples/finance_csv/example_finance_csv.cpp)
 
 # ============================================================================
-# Tests and Benchmarks (in test/ subdirectory)
+# Tests (tests/)
 # ============================================================================
 
-set(TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/test")
-
-# --- Core EEMD tests ---
-if(EXISTS "${TEST_DIR}/eemd_bench.cpp")
-    add_eemd_executable(eemd_bench ${TEST_DIR}/eemd_bench.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/eemd_test.cpp")
-    add_eemd_executable(eemd_test ${TEST_DIR}/eemd_test.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/eemd_debug.cpp")
-    add_eemd_executable(eemd_debug ${TEST_DIR}/eemd_debug.cpp)
-endif()
-
-# --- ICEEMDAN tests ---
-if(EXISTS "${TEST_DIR}/iceemdan_bench.cpp")
-    add_iceemdan_executable(iceemdan_bench ${TEST_DIR}/iceemdan_bench.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/iceemdan_test.cpp")
-    add_iceemdan_executable(iceemdan_test ${TEST_DIR}/iceemdan_test.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/iceemdan_accuracy_test.cpp")
-    add_iceemdan_executable(accuracy_test ${TEST_DIR}/iceemdan_accuracy_test.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/iceemdan_finance_bench.cpp")
-    add_iceemdan_executable(iceemdan_finance_bench ${TEST_DIR}/iceemdan_finance_bench.cpp)
-endif()
-
-# --- Optimization benchmarks ---
-if(EXISTS "${TEST_DIR}/bench_adaptive.cpp")
-    add_iceemdan_executable(bench_adaptive ${TEST_DIR}/bench_adaptive.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/bench_snumber.cpp")
-    add_iceemdan_executable(bench_snumber ${TEST_DIR}/bench_snumber.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/bench_simd.cpp")
-    add_iceemdan_executable(bench_simd ${TEST_DIR}/bench_simd.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/test_akima.cpp")
-    add_iceemdan_executable(test_akima ${TEST_DIR}/test_akima.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/spline_bench.cpp")
-    add_eemd_executable(spline_bench ${TEST_DIR}/spline_bench.cpp)
-endif()
-
-# --- Validation against the reference code (validation/README.md) ---
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/validation/decompose_csv.cpp")
-    add_iceemdan_executable(decompose_csv ${CMAKE_CURRENT_SOURCE_DIR}/validation/decompose_csv.cpp)
-endif()
-
-# --- Regression tests (exit code != 0 on failure) ---
-if(EXISTS "${TEST_DIR}/test_fft_hilbert.cpp")
-    add_iceemdan_executable(test_fft_hilbert ${TEST_DIR}/test_fft_hilbert.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/test_fixes.cpp")
-    add_iceemdan_executable(test_fixes ${TEST_DIR}/test_fixes.cpp)
-endif()
-
-if(EXISTS "${TEST_DIR}/test_threads.cpp")
-    add_iceemdan_executable(test_threads ${TEST_DIR}/test_threads.cpp)
-endif()
+# --- Regression tests, run by ctest (exit code != 0 on failure) ---
+add_iceemdan_executable(test_fft_hilbert tests/test_fft_hilbert.cpp)
+add_iceemdan_executable(test_fixes tests/test_fixes.cpp)
+add_iceemdan_executable(test_threads tests/test_threads.cpp)
 
 enable_testing()
-if(TARGET test_fft_hilbert)
-    add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
-endif()
-if(TARGET test_fixes)
-    add_test(NAME fixes COMMAND test_fixes)
-endif()
-if(TARGET test_threads)
-    add_test(NAME threads COMMAND test_threads)
-endif()
+add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
+add_test(NAME fixes COMMAND test_fixes)
+add_test(NAME threads COMMAND test_threads)
+
+# --- Test programs run by hand ---
+add_eemd_executable(eemd_test tests/eemd_test.cpp)
+add_iceemdan_executable(accuracy_test tests/iceemdan_accuracy_test.cpp)
+add_iceemdan_executable(test_akima tests/test_akima.cpp)
 
 # ============================================================================
-# Python Bindings (Shared Library)
+# Benchmarks (benchmarks/)
 # ============================================================================
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/iceemdan_c.cpp")
-    add_library(iceemdan_shared SHARED iceemdan_c.cpp)
-    target_link_libraries(iceemdan_shared PRIVATE iceemdan_mkl)
+add_eemd_executable(eemd_bench benchmarks/eemd_bench.cpp)
+add_iceemdan_executable(iceemdan_bench benchmarks/iceemdan_bench.cpp)
+add_iceemdan_executable(iceemdan_finance_bench benchmarks/iceemdan_finance_bench.cpp)
+add_iceemdan_executable(bench_adaptive benchmarks/bench_adaptive.cpp)
+add_iceemdan_executable(bench_snumber benchmarks/bench_snumber.cpp)
+
+# spline_bench compares MKL's splines with the hand-written one in src/spline,
+# which the library itself does not use
+add_eemd_executable(spline_bench benchmarks/spline_bench.cpp)
+target_include_directories(spline_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/spline)
+
+# ============================================================================
+# Validation against the reference code (validation/README.md)
+# ============================================================================
+
+add_iceemdan_executable(decompose_csv validation/decompose_csv.cpp)
+
+# ============================================================================
+# C interface (src/c_api), built as the shared library the Python binding loads
+# ============================================================================
+
+add_library(iceemdan_shared SHARED src/c_api/iceemdan_c.cpp)
+target_link_libraries(iceemdan_shared PRIVATE iceemdan_mkl)
+set_target_properties(iceemdan_shared PROPERTIES
+    OUTPUT_NAME "iceemdan"
+    POSITION_INDEPENDENT_CODE ON
+)
+if(USE_IPO)
     set_target_properties(iceemdan_shared PROPERTIES
-        OUTPUT_NAME "iceemdan"
-        POSITION_INDEPENDENT_CODE ON
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
     )
-    if(USE_IPO)
-        set_target_properties(iceemdan_shared PROPERTIES
-            INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
-        )
-    endif()
-    if(TARGET vectorfft_runtime)
-        add_dependencies(iceemdan_shared vectorfft_runtime)
-    endif()
-    if(WIN32)
-        # Copy the DLL, and the VectorFFT DLLs it loads, to the python folder for easy testing
-        add_custom_command(TARGET iceemdan_shared POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:iceemdan_shared>
-            ${ICEEMDAN_VECTORFFT_RUNTIME}
-            ${CMAKE_CURRENT_SOURCE_DIR}/python/
-        )
-    endif()
+endif()
+if(TARGET vectorfft_runtime)
+    add_dependencies(iceemdan_shared vectorfft_runtime)
+endif()
+if(WIN32)
+    # Copy the DLL, and the VectorFFT DLLs it loads, to the python folder for easy testing
+    add_custom_command(TARGET iceemdan_shared POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:iceemdan_shared>
+        ${ICEEMDAN_VECTORFFT_RUNTIME}
+        ${CMAKE_CURRENT_SOURCE_DIR}/python/
+    )
 endif()
 
 # ============================================================================
@@ -442,11 +393,11 @@ install(TARGETS eemd_mkl iceemdan_mkl
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
-install(FILES 
-    eemd_mkl.hpp 
-    eemd_fft.hpp
-    eemd_threads.hpp
-    iceemdan_mkl.hpp
+install(FILES
+    src/core/eemd_mkl.hpp
+    src/core/iceemdan_mkl.hpp
+    src/fft/eemd_fft.hpp
+    src/threads/eemd_threads.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
@@ -464,7 +415,7 @@ message(STATUS "=== EEMD/ICEEMDAN-MKL Configuration ===")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  MKL interface: ${MKL_INTERFACE}")
 message(STATUS "  MKL threading: ${MKL_THREADING}")
-message(STATUS "  EEMD header: eemd_mkl.hpp")
-message(STATUS "  ICEEMDAN header: iceemdan_mkl.hpp")
+message(STATUS "  EEMD header: src/core/eemd_mkl.hpp")
+message(STATUS "  ICEEMDAN header: src/core/iceemdan_mkl.hpp")
 message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")
 message(STATUS "")

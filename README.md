@@ -203,6 +203,25 @@ int main() {
 }
 ```
 
+### Project Layout
+
+| Folder | What it holds |
+|--------|---------------|
+| `src/core/` | `eemd_mkl.hpp` and `iceemdan_mkl.hpp`: the decompositions. Include `iceemdan_mkl.hpp` |
+| `src/fft/` | `eemd_fft.hpp`: the FFTs of the analysis utilities (VectorFFT) |
+| `src/threads/` | `eemd_threads.hpp`: the thread pool |
+| `src/spline/` | `cubic_spline_avx2.hpp`: a hand-written cubic spline, used by `spline_bench` only |
+| `src/c_api/` | `iceemdan_c.cpp`: the C interface, built as the shared library `iceemdan` |
+| `python/` | `iceemdan.py`, the Python binding (ctypes), and a demo notebook |
+| `examples/` | `finance_csv/`: the CSV export example with its notebook |
+| `tests/` | the regression tests `ctest` runs, and test programs run by hand |
+| `benchmarks/` | the benchmarks |
+| `validation/` | the comparison with the authors' reference code |
+| `third_party/` | the VectorFFT release CMake downloads (not in git) |
+
+The headers include one another by name. CMake adds their folders to the include path; a build
+written by hand passes `-Isrc/core -Isrc/fft -Isrc/threads`.
+
 ## Processing Modes
 
 Three built-in modes optimize for different use cases:
@@ -410,7 +429,7 @@ count; across thread counts it differs only by summation rounding.
 
 ### Threads
 
-The ensemble runs on the library's own thread pool ([`eemd_threads.hpp`](eemd_threads.hpp)),
+The ensemble runs on the library's own thread pool ([`eemd_threads.hpp`](src/threads/eemd_threads.hpp)),
 built on standard C++ threads. There is no OpenMP, and `OMP_NUM_THREADS` has no effect.
 
 ```cpp
@@ -601,10 +620,10 @@ Generate CSV files and visualize with Python:
 #    iceemdan_shared target)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/example_finance_csv
+./build/example_finance_csv examples/finance_csv   # writes its CSV files there
 
 # 2. Open Jupyter notebook
-cd jupyter
+cd examples/finance_csv
 jupyter notebook iceemdan_visualization.ipynb
 ```
 
