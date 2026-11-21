@@ -194,7 +194,7 @@ void test_eemd_ensemble() {
     int32_t n_imfs = 0;
     
     std::cout << "Running EEMD with " << config.ensemble_size << " ensemble members..." << std::endl;
-    std::cout << "Threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "Threads: " << eemd::get_num_threads() << std::endl;
     
     auto t_start = std::chrono::high_resolution_clock::now();
     bool success = decomposer.decompose(signal.data(), n, imfs, n_imfs);
@@ -323,7 +323,7 @@ void benchmark() {
     config.noise_std = 0.2;
     
     std::cout << "Ensemble size: " << ensemble_size << std::endl;
-    std::cout << "Threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "Threads: " << eemd::get_num_threads() << std::endl;
     std::cout << "\nSignal Length | Time (ms) | Throughput (Msamples/s)" << std::endl;
     std::cout << "--------------|-----------|------------------------" << std::endl;
     
@@ -360,7 +360,7 @@ int main(int argc, char* argv[]) {
     
     std::cout << "EEMD-MKL Test Suite" << std::endl;
     std::cout << "===================" << std::endl;
-    std::cout << "OpenMP threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "Threads: " << eemd::get_num_threads() << std::endl;
     std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential)" << std::endl;
     
     test_basic_emd();

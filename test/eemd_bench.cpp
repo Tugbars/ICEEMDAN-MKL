@@ -78,7 +78,7 @@ BenchResult run_benchmark(int32_t n, int32_t ensemble_size, int32_t n_trials)
 void bench_signal_length()
 {
     std::cout << "\n=== Signal Length Scaling ===\n";
-    std::cout << "Ensemble: 100, Threads: " << omp_get_max_threads() << "\n\n";
+    std::cout << "Ensemble: 100, Threads: " << eemd::get_num_threads() << "\n\n";
 
     std::cout << std::setw(10) << "Length"
               << std::setw(12) << "Time (ms)"
@@ -99,7 +99,7 @@ void bench_signal_length()
 void bench_ensemble_size()
 {
     std::cout << "\n=== Ensemble Size Scaling ===\n";
-    std::cout << "Signal: 1024, Threads: " << omp_get_max_threads() << "\n\n";
+    std::cout << "Signal: 1024, Threads: " << eemd::get_num_threads() << "\n\n";
 
     std::cout << std::setw(10) << "Ensemble"
               << std::setw(12) << "Time (ms)"
@@ -122,7 +122,7 @@ void bench_thread_scaling()
     std::cout << "\n=== Thread Scaling ===\n";
     std::cout << "Signal: 1024, Ensemble: 100\n\n";
 
-    const int32_t max_threads = omp_get_max_threads();
+    const int32_t max_threads = eemd::get_num_threads();
 
     std::cout << std::setw(8) << "Threads"
               << std::setw(12) << "Time (ms)"
@@ -134,15 +134,11 @@ void bench_thread_scaling()
 
     for (int32_t threads = 1; threads <= max_threads; threads *= 2)
     {
-        omp_set_num_threads(threads);
+        eemd::set_num_threads(threads);
         mkl_set_num_threads(1); // CRITICAL: MKL sequential to avoid N² threads!
 
-// Warm up thread pool
-#pragma omp parallel
-        {
-            volatile int x = 0;
-            (void)x;
-        }
+        // Warm up the thread pool
+        eemd::threads::run(eemd::threads::team_size(), [](int) {});
 
         auto r = run_benchmark(1024, 100, 5);
 
@@ -161,7 +157,7 @@ void bench_thread_scaling()
     }
 
     // Restore defaults
-    omp_set_num_threads(max_threads);
+    eemd::set_num_threads(max_threads);
     mkl_set_num_threads(1); // Keep MKL sequential for EEMD workloads
 }
 
@@ -215,7 +211,7 @@ int main()
 
     std::cout << "\nEEMD-MKL Performance Benchmark\n";
     std::cout << "==============================\n";
-    std::cout << "Max threads: " << omp_get_max_threads() << "\n";
+    std::cout << "Max threads: " << eemd::get_num_threads() << "\n";
     std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential for EEMD)\n";
 
     bench_signal_length();

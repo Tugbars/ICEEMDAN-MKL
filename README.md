@@ -29,13 +29,13 @@ For financial and scientific applications, this means cleaner trend extraction, 
 
 - **Complete ICEEMDAN Algorithm** — Full implementation of Colominas et al. (2014), checked against the authors' own reference code (see [Accuracy](#accuracy))
 - **Intel MKL Acceleration** — Spline interpolation via MKL Data Fitting, VSL random number generation
-- **VectorFFT** — FFTs (Hilbert transform, instantaneous frequency, spectral entropy) via [VectorFFT](https://github.com/Tugbars/VectorFFT), with MKL DFTI as fallback
+- **VectorFFT** — FFTs (Hilbert transform, instantaneous frequency, spectral entropy) via [VectorFFT](https://github.com/Tugbars/VectorFFT)
 - **Reproducible** — for a given seed, identical results at any number of threads
 - **Multiple Spline Methods** — Cubic (smooth), Akima (outlier-resistant), Linear (fast)
 - **OpenMP Parallelization** — Scales across CPU cores with lock-free reduction
 - **Multiple Processing Modes** — Standard (audio/seismic), Finance (trading), Scientific (reproducible research)
-- **Header-Only** — headers only; link VectorFFT to use it for the FFTs (CMake does this)
-- **Cross-Platform** — Windows, Linux, macOS (GCC, Clang, ICX, MSVC; MSVC builds use MKL DFTI for the FFTs)
+- **Header-Only** — headers only; the FFTs link VectorFFT's ready-built library (CMake downloads and links it)
+- **Cross-Platform** — Windows and Linux on x86-64 (GCC, Clang, ICX, MSVC)
 
 ## Changes in 1.1
 
@@ -50,7 +50,7 @@ reference code. **Results differ from 1.0**, and the default is slower (see [Per
 | Noise realizations | windows of one long realization | independent realizations, the same one at every stage |
 | Envelope ends | mirrored extrema + linear end points; natural splines | symmetric extension of `emd.m`; not-a-knot splines |
 | Threads | results depended on the thread count | identical at any thread count |
-| FFT | MKL DFTI | VectorFFT (MKL DFTI fallback) |
+| FFT | MKL DFTI | VectorFFT |
 
 The 1.0 behaviour is still available: see [Speed options](#speed-options). Also fixed in 1.1:
 compilation with GCC/Clang, NaN/Inf sanitizing under `-ffast-math`, the Hilbert transform for
@@ -146,24 +146,36 @@ Time-frequency energy distribution via Hilbert-Huang Transform.
 - C++17 compiler (GCC 9+, Clang 10+, MSVC 2019+, Intel ICX)
 - Intel oneAPI MKL (free download from Intel)
 - CMake 3.20+
-- Optional: [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs, included as a git
-  submodule in `third_party/vectorfft` (built with GCC or Clang; MinGW on Windows)
+- [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs: CMake downloads its ready-built
+  library (Windows x64 or Linux x64, a CPU with AVX2 and FMA), nothing to install
 
 ### Installation
 
 ```bash
-git clone --recursive --shallow-submodules https://github.com/Tugbars/iceemdan-mkl.git
+git clone https://github.com/Tugbars/iceemdan-mkl.git
 cd iceemdan-mkl
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build      # regression tests
 ```
 
-Already cloned without `--recursive`? Run `git submodule update --init --depth 1 third_party/vectorfft`.
-Without the submodule (or with `-DICEEMDAN_USE_VECTORFFT=OFF`, or with MSVC) the FFTs use MKL DFTI;
-everything else is unchanged. To use an installed VectorFFT instead, pass
-`-DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT`. CMake prints the backend it chose
-(`FFT backend: ...`).
+The first configure downloads the VectorFFT 0.8.1 release (25 MB), checks its SHA-256 and unpacks
+it into `third_party/vectorfft-0.8.1/`, which git ignores; later configures, in any build folder,
+use that copy. CMake prints what it links (`FFT backend: ...`). Two options take VectorFFT from
+elsewhere:
+
+- `-DVECTORFFT_ROOT=<folder>`: an unpacked release you already have (no download)
+- `-DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT`: a VectorFFT you built from source, which is also
+  the way on a platform the release does not cover
+
+On Windows the build copies `libvfft.dll`, `libvfft_avx2.dll` and `libvfft_avx512.dll` beside the
+programs and into `python/`. Keep the three together with any program you move: `libvfft.dll`
+loads one of the other two, by what the CPU runs.
+
+MKL is taken from `-DMKL_DIR=<folder of MKLConfig.cmake>` when you pass it, else from `MKLROOT`
+(oneAPI's `setvars` sets it), else from oneAPI's standard install folder, else from CMake's own
+search. With MinGW GCC on Windows the build links MKL's single dynamic library (`mkl_rt`); the
+compiler must come with its OpenMP runtime (libgomp).
 
 ### Basic Usage
 
@@ -415,11 +427,12 @@ decomposer.decompose_with_diagnostics(signal, n, imfs, residue, diag);
 
 The analysis utilities (`compute_hilbert_transform`, `compute_instantaneous_frequency`,
 `compute_spectral_entropy`) use [VectorFFT](https://github.com/Tugbars/VectorFFT) real
-transforms when the build defines `EEMD_USE_VECTORFFT` (CMake does when `third_party/vectorfft`
-is present) and MKL DFTI otherwise, or for a length VectorFFT does not serve. Plans are made
+transforms at every length from 2 up; a single sample needs no transform. Plans are made
 once per thread and length, with `VFFT_FLAG_ESTIMATE` (no measuring, no wisdom files written),
 and the caller's floating-point mode (MXCSR) is restored after every VectorFFT call.
-`eemd::fft::backend_for(n)` names the backend used for length `n`.
+`eemd::fft::backend_for(n)` returns `Backend::VectorFFT` when the transform of length `n` is
+ready, and `Backend::None` when VectorFFT could not be loaded (its libraries are not beside the
+program, or the CPU has no AVX2); the utilities then return `false`.
 
 ### S-Number Sifting Criterion
 

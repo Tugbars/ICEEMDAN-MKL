@@ -435,12 +435,39 @@ ICEEMDAN_API const char *iceemdan_version()
 }
 
 /**
- * Name of the FFT backend that serves length n on the calling thread
- * ("VectorFFT", "MKL DFTI" or "none"). Used by the analysis utilities.
+ * Name of the FFT backend that transforms length n on the calling thread:
+ * "VectorFFT", or "none" for n < 2 (no transform needed) and when VectorFFT
+ * could not be loaded. Used by the analysis utilities.
  */
 ICEEMDAN_API const char *iceemdan_fft_backend(int n)
 {
     return eemd::fft::backend_name(eemd::fft::backend_for(n));
+}
+
+/**
+ * Number of threads a decomposition uses, for the whole process (the calling
+ * thread included). n < 1: every logical processor, which is also the
+ * default unless the environment variable EEMD_NUM_THREADS is set. The
+ * results do not depend on it.
+ */
+ICEEMDAN_API void iceemdan_set_num_threads(int n)
+{
+    eemd::set_num_threads(n);
+}
+
+ICEEMDAN_API int iceemdan_get_num_threads()
+{
+    return eemd::get_num_threads();
+}
+
+/**
+ * Stop the library's worker threads; the next decomposition starts them
+ * again. Call it before unloading this library from a running process. It is
+ * not needed when the process exits.
+ */
+ICEEMDAN_API void iceemdan_shutdown_threads()
+{
+    eemd::shutdown_threads();
 }
 
 /**

@@ -136,7 +136,8 @@ def _load_library() -> ctypes.CDLL:
     error_msg += f"Searched for {lib_names} in {[str(p) for p in search_paths]}.\n"
     if errors:
         error_msg += "Load errors:\n" + "\n".join(f"  - {e}" for e in errors)
-        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH."
+        error_msg += "\n\nMake sure Intel MKL runtime DLLs are in PATH, and on Windows that"
+        error_msg += "\nlibvfft.dll, libvfft_avx2.dll and libvfft_avx512.dll are beside the ICEEMDAN DLL."
     raise RuntimeError(error_msg)
 
 # Load library
@@ -225,6 +226,13 @@ _lib.iceemdan_get_error.restype = ctypes.c_char_p
 # Utility
 _lib.iceemdan_version.argtypes = []
 _lib.iceemdan_version.restype = ctypes.c_char_p
+
+_lib.iceemdan_set_num_threads.argtypes = [ctypes.c_int]
+_lib.iceemdan_set_num_threads.restype = None
+_lib.iceemdan_get_num_threads.argtypes = []
+_lib.iceemdan_get_num_threads.restype = ctypes.c_int
+_lib.iceemdan_shutdown_threads.argtypes = []
+_lib.iceemdan_shutdown_threads.restype = None
 
 _lib.iceemdan_compute_energy.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
 _lib.iceemdan_compute_energy.restype = ctypes.c_double
@@ -554,6 +562,26 @@ def version() -> str:
     return _lib.iceemdan_version().decode('utf-8')
 
 
+def set_num_threads(n: int = 0) -> None:
+    """Number of threads a decomposition uses, for the whole process.
+
+    n < 1: every logical processor, which is also the default unless the
+    environment variable EEMD_NUM_THREADS is set before the library loads.
+    The results do not depend on the thread count.
+    """
+    _lib.iceemdan_set_num_threads(int(n))
+
+
+def get_num_threads() -> int:
+    """Number of threads a decomposition uses."""
+    return _lib.iceemdan_get_num_threads()
+
+
+def shutdown_threads() -> None:
+    """Stop the library's worker threads; the next decomposition starts them again."""
+    _lib.iceemdan_shutdown_threads()
+
+
 def decompose(
     signal: np.ndarray,
     mode: ProcessingMode = ProcessingMode.STANDARD,
@@ -590,7 +618,8 @@ def decompose(
 
 
 def fft_backend(n: int = 1024) -> str:
-    """Name of the FFT backend the library uses for length n ("VectorFFT" or "MKL DFTI")."""
+    """Name of the FFT backend the library uses for length n: "VectorFFT", or "none"
+    for n < 2 (no transform needed) and when VectorFFT could not be loaded."""
     return _lib.iceemdan_fft_backend(int(n)).decode('utf-8')
 
 

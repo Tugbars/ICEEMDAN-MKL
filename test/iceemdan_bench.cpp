@@ -6,6 +6,7 @@
  */
 
 #define _USE_MATH_DEFINES
+#include <memory>
 #include <cmath>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -303,7 +304,7 @@ BenchResult run_iceemdan_benchmark(int32_t n, int32_t ensemble_size, int32_t n_t
 void bench_signal_length()
 {
     std::cout << "\n=== ICEEMDAN: Signal Length Scaling ===\n";
-    std::cout << "Ensemble: 100, Threads: " << omp_get_max_threads() << "\n\n";
+    std::cout << "Ensemble: 100, Threads: " << eemd::get_num_threads() << "\n\n";
     
     std::cout << std::setw(10) << "Length"
               << std::setw(12) << "Time (ms)"
@@ -326,7 +327,7 @@ void bench_signal_length()
 void bench_ensemble_size()
 {
     std::cout << "\n=== ICEEMDAN: Ensemble Size Scaling ===\n";
-    std::cout << "Signal: 1024, Threads: " << omp_get_max_threads() << "\n\n";
+    std::cout << "Signal: 1024, Threads: " << eemd::get_num_threads() << "\n\n";
     
     std::cout << std::setw(10) << "Ensemble"
               << std::setw(12) << "Time (ms)"
@@ -349,7 +350,7 @@ void bench_thread_scaling()
     std::cout << "\n=== ICEEMDAN: Thread Scaling ===\n";
     std::cout << "Signal: 1024, Ensemble: 100\n\n";
     
-    const int32_t max_threads = omp_get_max_threads();
+    const int32_t max_threads = eemd::get_num_threads();
     
     std::cout << std::setw(8) << "Threads"
               << std::setw(12) << "Time (ms)"
@@ -361,15 +362,11 @@ void bench_thread_scaling()
     
     for (int32_t threads = 1; threads <= max_threads; threads *= 2)
     {
-        omp_set_num_threads(threads);
+        eemd::set_num_threads(threads);
         mkl_set_num_threads(1);
         
-        // Warm up thread pool
-        #pragma omp parallel
-        {
-            volatile int x = 0;
-            (void)x;
-        }
+        // Warm up the thread pool
+        eemd::threads::run(eemd::threads::team_size(), [](int) {});
         
         auto r = run_iceemdan_benchmark(1024, 100, 5);
         
@@ -387,7 +384,7 @@ void bench_thread_scaling()
         std::cout << "\n";
     }
     
-    omp_set_num_threads(max_threads);
+    eemd::set_num_threads(max_threads);
     mkl_set_num_threads(1);
 }
 
@@ -808,21 +805,20 @@ CycleBreakdown profile_noise_bank(int32_t n, int32_t ensemble_size, int32_t max_
         all_noise[i].resize(n);
     }
     
-    #pragma omp parallel
+    eemd::threads::for_static(eemd::threads::team_size(), ensemble_size,
+                              [&](int32_t i_begin, int32_t i_end, int tid)
     {
-        const int32_t tid = omp_get_thread_num();
         VSLStreamStatePtr stream = nullptr;
         vslNewStream(&stream, VSL_BRNG_MT19937, seed + tid * 10000);
         
-        #pragma omp for schedule(static)
-        for (int32_t i = 0; i < ensemble_size; ++i)
+        for (int32_t i = i_begin; i < i_end; ++i)
         {
             vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, stream,
                           n, all_noise[i].data, 0.0, 1.0);
         }
         
         vslDeleteStream(&stream);
-    }
+    });
     
     auto t_gen_end = Clock::now();
     bd.noise_gen_ms = std::chrono::duration<double, std::milli>(t_gen_end - t_gen_start).count();
@@ -830,13 +826,18 @@ CycleBreakdown profile_noise_bank(int32_t n, int32_t ensemble_size, int32_t max_
     // Profile EMD of noise
     auto t_emd_start = Clock::now();
     
-    #pragma omp parallel
+    std::vector<std::unique_ptr<Sifter>> sifters(eemd::threads::team_size());
+    std::vector<AlignedBuffer<double>> works(sifters.size());
+    eemd::threads::for_dynamic(static_cast<int>(sifters.size()), ensemble_size,
+                               [&](int32_t i, int tid)
     {
-        Sifter sifter(n, emd_config);
-        AlignedBuffer<double> work(n);
-        
-        #pragma omp for schedule(dynamic)
-        for (int32_t i = 0; i < ensemble_size; ++i)
+        if (!sifters[tid])
+        {
+            sifters[tid].reset(new Sifter(n, emd_config));
+            works[tid].resize(n);
+        }
+        Sifter &sifter = *sifters[tid];
+        AlignedBuffer<double> &work = works[tid];
         {
             std::memcpy(work.data, all_noise[i].data, n * sizeof(double));
             
@@ -851,7 +852,7 @@ CycleBreakdown profile_noise_bank(int32_t n, int32_t ensemble_size, int32_t max_
             }
             imf_counts[i] = imf_count;
         }
-    }
+    });
     
     auto t_emd_end = Clock::now();
     bd.noise_emd_ms = std::chrono::duration<double, std::milli>(t_emd_end - t_emd_start).count();
@@ -1064,7 +1065,7 @@ void bench_cycle_breakdown()
     config.noise_std = 0.2;
     
     std::cout << "Signal: " << n << ", Ensemble: " << config.ensemble_size 
-              << ", Threads: " << omp_get_max_threads() << "\n";
+              << ", Threads: " << eemd::get_num_threads() << "\n";
     
     // Run profiled decomposition
     auto breakdown = profile_iceemdan_decomposition(signal.data(), n, config);
@@ -1357,7 +1358,7 @@ int main()
     
     std::cout << "\nICEEMDAN-MKL Performance Benchmark\n";
     std::cout << "===================================\n";
-    std::cout << "Max threads: " << omp_get_max_threads() << "\n";
+    std::cout << "Max threads: " << eemd::get_num_threads() << "\n";
     std::cout << "MKL threads: " << mkl_get_max_threads() << " (sequential for ICEEMDAN)\n";
     
     bench_signal_length();

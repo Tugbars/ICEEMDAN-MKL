@@ -50,7 +50,7 @@ struct Run
 static Run run(const std::vector<double> &x, eemd::ProcessingMode mode,
                eemd::LocalMeanMethod lm, bool adaptive, int threads)
 {
-    omp_set_num_threads(threads);
+    eemd::set_num_threads(threads);
     eemd::ICEEMDAN d(mode);
     d.config().ensemble_size = 50;
     d.config().local_mean_method = lm;
@@ -142,7 +142,7 @@ int main()
         check(one, "SingleEnvelope: exactly one iteration per trial");
 
         // max_sift_iters = 1 cannot converge the SD criterion on the first IMF
-        omp_set_num_threads(2);
+        eemd::set_num_threads(2);
         eemd::ICEEMDAN d;
         d.config().ensemble_size = 20;
         d.config().max_sift_iters = 1;
@@ -158,7 +158,7 @@ int main()
     // ------------------------------------------------------------------
     std::printf("ICEEMDAN: noise bank memory cap\n");
     {
-        omp_set_num_threads(2);
+        eemd::set_num_threads(2);
         eemd::ICEEMDAN d;
         d.config().ensemble_size = 20;
         std::vector<std::vector<double>> imfs;
@@ -188,7 +188,7 @@ int main()
         eemd::EEMD e(cfg);
         std::vector<std::vector<double>> a, b, c;
         int32_t na = 0, nb = 0, nc = 0;
-        omp_set_num_threads(2);
+        eemd::set_num_threads(2);
         e.decompose(x.data(), n, a, na);
         e.decompose(x.data(), n, b, nb);
         bool same = na == nb;
@@ -196,7 +196,7 @@ int main()
             same = std::memcmp(a[k].data(), b[k].data(), n * sizeof(double)) == 0;
         check(same, "two runs at 2 threads are bit-identical");
 
-        omp_set_num_threads(1);
+        eemd::set_num_threads(1);
         e.decompose(x.data(), n, c, nc);
         double diff = 0, amax = 0;
         bool count_ok = nc == na;
@@ -250,7 +250,7 @@ int main()
         check(std::abs(y[10] - expect) < 1e-12, "interior run linearly interpolated");
         check(y[0] == x[1] && y[n - 1] == x[n - 2], "edge samples extrapolated from the nearest finite one");
 
-        omp_set_num_threads(2);
+        eemd::set_num_threads(2);
         eemd::ICEEMDAN d(eemd::ProcessingMode::Finance);
         d.config().ensemble_size = 20;
         std::vector<std::vector<double>> imfs;

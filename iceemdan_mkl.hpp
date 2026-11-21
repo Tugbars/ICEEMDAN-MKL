@@ -18,6 +18,7 @@
 #define ICEEMDAN_MKL_OPT_HPP
 
 #include "eemd_mkl.hpp"
+#include <memory>
 #include <numeric>
 
 namespace eemd
@@ -1397,15 +1398,18 @@ namespace eemd
                 }
             }
 
-#pragma omp parallel
+            threads::for_static(threads::team_size(), ensemble_size,
+                                [&](int32_t i_begin, int32_t i_end, int)
             {
+                if (i_begin == i_end)
+                    return;
+
                 AlignedBuffer<double> noise(n);
                 AlignedBuffer<double> work(n);
 
                 Sifter sifter(n, emd_config);
 
-#pragma omp for schedule(static)
-                for (int32_t i = 0; i < ensemble_size; ++i)
+                for (int32_t i = i_begin; i < i_end; ++i)
                 {
                     // Realization i depends on (seed, i) only: the same at any thread count
                     if (!trial_gaussian(base_seed, static_cast<uint32_t>(i), n, noise.data))
@@ -1426,7 +1430,7 @@ namespace eemd
                     }
                     imf_counts_[i] = imf_count;
                 }
-            }
+            });
 
             initialized_ = true;
         }
@@ -1499,7 +1503,7 @@ namespace eemd
          * - Scientific: Global volatility, mirror boundaries, no shortcuts
          *
          * Reproducibility: for a given seed and configuration the result does
-         * not depend on the number of OpenMP threads (bit for bit). Trials are
+         * not depend on the number of threads (bit for bit). Trials are
          * summed in fixed blocks, in trial order, and the blocks are reduced in
          * block order; each realization's noise depends on (seed, trial) only.
          */
@@ -1669,68 +1673,81 @@ namespace eemd
             const SiftParams sift_params{config_.max_sift_iters, config_.sift_threshold, config_.s_number,
                                          config_.sift_stop_rule, config_.rilling};
 
-#pragma omp parallel
             {
-                // Thread-local resources with mode-specific boundary handling
-                LocalMeanComputer lm_computer(n, config_.boundary_extend,
-                                              config_.spline_fast_threshold,
-                                              config_.boundary_method,
-                                              config_.ar_lookback,
-                                              config_.ar_damping,
-                                              config_.ar_max_slope_atr,
-                                              config_.spline_method,
-                                              config_.local_mean_method,
-                                              sift_params);
-                AlignedBuffer<double> tl_perturbed(n);
-                AlignedBuffer<double> tl_local_mean(n);
+                // Per-thread resources with mode-specific boundary handling.
+                // Each thread makes its own the first time it takes a block
+                // and keeps them for every stage of this decomposition.
+                struct ThreadState
+                {
+                    LocalMeanComputer lm_computer;
+                    AlignedBuffer<double> perturbed;
+                    AlignedBuffer<double> local_mean;
+
+                    ThreadState(int32_t len, const ICEEMDANConfig &c, const SiftParams &sp)
+                        : lm_computer(len, c.boundary_extend,
+                                      c.spline_fast_threshold,
+                                      c.boundary_method,
+                                      c.ar_lookback,
+                                      c.ar_damping,
+                                      c.ar_max_slope_atr,
+                                      c.spline_method,
+                                      c.local_mean_method,
+                                      sp),
+                          perturbed(len),
+                          local_mean(len)
+                    {
+                    }
+                };
+                const int32_t n_threads = threads::team_size();
+                std::vector<std::unique_ptr<ThreadState>> thread_states(n_threads);
 
                 // =============================================================
-                // IMF EXTRACTION LOOP
+                // IMF EXTRACTION LOOP (on the calling thread; the trials of a
+                // stage and their reduction are forked to the pool)
                 // =============================================================
                 for (int32_t k = 0; k < config_.max_imfs; ++k)
                 {
-#pragma omp barrier
-
                     if (stop_decomposition)
                         break;
 
-                    // Reset for new IMF (single thread initializes shared state)
-#pragma omp single
-                    {
-                        batch_start = 0;
-                        batch_end = 0;
-                        ensemble_converged = false;
-                        stage_total = BlockStats();
-                        mean_accumulator.zero();
-                        prev_mean_estimate.zero();
+                    // Reset for new IMF
+                    batch_start = 0;
+                    batch_end = 0;
+                    ensemble_converged = false;
+                    stage_total = BlockStats();
+                    mean_accumulator.zero();
+                    prev_mean_estimate.zero();
 
-                        // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
-                        // per-trial factor std(x) / std(E_1(w)) is applied below
-                        stage_scale = (k == 0)
-                                          ? decay_factor * config_.noise_std * signal_std
-                                          : decay_factor * config_.noise_std * compute_std(r_current.data, n);
-                    } // implicit barrier
+                    // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
+                    // per-trial factor std(x) / std(E_1(w)) is applied below
+                    stage_scale = (k == 0)
+                                      ? decay_factor * config_.noise_std * signal_std
+                                      : decay_factor * config_.noise_std * compute_std(r_current.data, n);
 
                     // =============================================================
                     // BATCH PROCESSING LOOP (one batch unless adaptive)
                     // =============================================================
                     while (true)
                     {
-#pragma omp single
-                        {
-                            batch_start = batch_end;
-                            batch_end = effective_adaptive
-                                            ? std::min(batch_start + config_.adaptive_check_interval, base_trials)
-                                            : base_trials;
-                            n_blocks_batch = (batch_end - batch_start + block_trials - 1) / block_trials;
-                        } // implicit barrier
+                        batch_start = batch_end;
+                        batch_end = effective_adaptive
+                                        ? std::min(batch_start + config_.adaptive_check_interval, base_trials)
+                                        : base_trials;
+                        n_blocks_batch = (batch_end - batch_start + block_trials - 1) / block_trials;
 
                         if (batch_start >= base_trials)
                             break;
 
-#pragma omp for schedule(dynamic, 1)
-                        for (int32_t b = 0; b < n_blocks_batch; ++b)
+                        // A block goes to whichever thread is free: its sum does
+                        // not depend on the thread that computes it
+                        threads::for_dynamic(n_threads, n_blocks_batch, [&](int32_t b, int slot)
                         {
+                            if (!thread_states[slot])
+                                thread_states[slot].reset(new ThreadState(n, config_, sift_params));
+                            LocalMeanComputer &lm_computer = thread_states[slot]->lm_computer;
+                            AlignedBuffer<double> &tl_perturbed = thread_states[slot]->perturbed;
+                            AlignedBuffer<double> &tl_local_mean = thread_states[slot]->local_mean;
+
                             double *__restrict acc = block_accs[b].data;
                             std::memset(acc, 0, n * sizeof(double));
                             BlockStats st;
@@ -1806,71 +1823,74 @@ namespace eemd
                                 }
                             }
                             block_stats[b] = st;
-                        } // end omp for (implicit barrier)
+                        });
 
                         // =========================================================
                         // BATCH REDUCTION (block order) AND CONVERGENCE CHECK
+                        // Each sample sums its blocks in block order; a short
+                        // reduction is not worth a fork.
                         // =========================================================
-#pragma omp for schedule(static)
-                        for (int32_t j = 0; j < n; ++j)
+                        const int32_t reduce_threads =
+                            (static_cast<int64_t>(n) * n_blocks_batch >= (int64_t(1) << 18)) ? n_threads : 1;
+                        threads::for_static(reduce_threads, n, [&](int32_t j_begin, int32_t j_end, int)
                         {
-                            double sum = 0.0;
-                            for (int32_t b = 0; b < n_blocks_batch; ++b)
+                            for (int32_t j = j_begin; j < j_end; ++j)
                             {
-                                sum += block_accs[b].data[j];
+                                double sum = 0.0;
+                                for (int32_t b = 0; b < n_blocks_batch; ++b)
+                                {
+                                    sum += block_accs[b].data[j];
+                                }
+                                mean_accumulator.data[j] += sum;
                             }
-                            mean_accumulator.data[j] += sum;
-                        } // implicit barrier
+                        });
 
-#pragma omp single
+                        for (int32_t b = 0; b < n_blocks_batch; ++b)
                         {
-                            for (int32_t b = 0; b < n_blocks_batch; ++b)
+                            const BlockStats &st = block_stats[b];
+                            stage_total.valid += st.valid;
+                            stage_total.attempted += st.attempted;
+                            stage_total.iterations += st.iterations;
+                            stage_total.max_iterations = std::max(stage_total.max_iterations, st.max_iterations);
+                            stage_total.nonconverged += st.nonconverged;
+                        }
+
+                        if (batch_end >= base_trials)
+                        {
+                            ensemble_converged = true; // all trials done
+                        }
+                        else if (effective_adaptive &&
+                                 batch_end >= config_.adaptive_min_trials &&
+                                 stage_total.valid > 0)
+                        {
+                            // Relative L2 change of the running mean estimate
+                            const double inv_valid = 1.0 / stage_total.valid;
+                            double diff_sq = 0.0;
+                            double curr_sq = 0.0;
+
+                            for (int32_t j = 0; j < n; ++j)
                             {
-                                const BlockStats &st = block_stats[b];
-                                stage_total.valid += st.valid;
-                                stage_total.attempted += st.attempted;
-                                stage_total.iterations += st.iterations;
-                                stage_total.max_iterations = std::max(stage_total.max_iterations, st.max_iterations);
-                                stage_total.nonconverged += st.nonconverged;
+                                double curr = mean_accumulator.data[j] * inv_valid;
+                                double prev = prev_mean_estimate.data[j];
+                                double d = curr - prev;
+                                diff_sq += d * d;
+                                curr_sq += curr * curr;
                             }
 
-                            if (batch_end >= base_trials)
-                            {
-                                ensemble_converged = true; // all trials done
-                            }
-                            else if (effective_adaptive &&
-                                     batch_end >= config_.adaptive_min_trials &&
-                                     stage_total.valid > 0)
-                            {
-                                // Relative L2 change of the running mean estimate
-                                const double inv_valid = 1.0 / stage_total.valid;
-                                double diff_sq = 0.0;
-                                double curr_sq = 0.0;
+                            double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
 
+                            if (rel_change < config_.adaptive_rel_tol)
+                            {
+                                ensemble_converged = true;
+                            }
+                            else
+                            {
                                 for (int32_t j = 0; j < n; ++j)
                                 {
-                                    double curr = mean_accumulator.data[j] * inv_valid;
-                                    double prev = prev_mean_estimate.data[j];
-                                    double d = curr - prev;
-                                    diff_sq += d * d;
-                                    curr_sq += curr * curr;
-                                }
-
-                                double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
-
-                                if (rel_change < config_.adaptive_rel_tol)
-                                {
-                                    ensemble_converged = true;
-                                }
-                                else
-                                {
-                                    for (int32_t j = 0; j < n; ++j)
-                                    {
-                                        prev_mean_estimate.data[j] = mean_accumulator.data[j] * inv_valid;
-                                    }
+                                    prev_mean_estimate.data[j] = mean_accumulator.data[j] * inv_valid;
                                 }
                             }
-                        } // implicit barrier
+                        }
 
                         if (ensemble_converged)
                             break;
@@ -1879,59 +1899,56 @@ namespace eemd
                     // =========================================================
                     // FINALIZE IMF (after all batches complete)
                     // =========================================================
-#pragma omp single
+                    if (stage_total.valid > 0)
                     {
-                        if (stage_total.valid > 0)
+                        const double scale = 1.0 / stage_total.valid;
+                        double *__restrict acc = mean_accumulator.data;
+
+                        EEMD_OMP_SIMD
+                        for (int32_t j = 0; j < n; ++j)
                         {
-                            const double scale = 1.0 / stage_total.valid;
-                            double *__restrict acc = mean_accumulator.data;
-
-                            EEMD_OMP_SIMD
-                            for (int32_t j = 0; j < n; ++j)
-                            {
-                                acc[j] *= scale;
-                            }
-
-                            // Extract IMF
-                            const double *__restrict r = r_current.data;
-                            const double *__restrict m = mean_accumulator.data;
-                            double *__restrict out = imf_storage[actual_imf_count].data;
-
-                            EEMD_OMP_SIMD
-                            for (int32_t j = 0; j < n; ++j)
-                            {
-                                out[j] = r[j] - m[j];
-                            }
-
-                            ++actual_imf_count;
-
-                            // Diagnostics for this IMF
-                            last_diag_.sift_iterations.push_back(stage_total.max_iterations);
-                            last_diag_.mean_sift_iterations.push_back(
-                                static_cast<double>(stage_total.iterations) / stage_total.valid);
-                            last_diag_.nonconverged_trials.push_back(stage_total.nonconverged);
-                            last_diag_.convergence_flags.push_back(stage_total.nonconverged == 0);
-                            last_diag_.trials_per_imf.push_back(stage_total.valid);
-
-                            // Update residue
-                            std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
-
-                            decay_factor *= config_.noise_decay;
-
-                            // Check stopping criteria
-                            if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||
-                                count_extrema(r_current.data, n) < config_.min_extrema)
-                            {
-                                stop_decomposition = true;
-                            }
+                            acc[j] *= scale;
                         }
-                        else
+
+                        // Extract IMF
+                        const double *__restrict r = r_current.data;
+                        const double *__restrict m = mean_accumulator.data;
+                        double *__restrict out = imf_storage[actual_imf_count].data;
+
+                        EEMD_OMP_SIMD
+                        for (int32_t j = 0; j < n; ++j)
+                        {
+                            out[j] = r[j] - m[j];
+                        }
+
+                        ++actual_imf_count;
+
+                        // Diagnostics for this IMF
+                        last_diag_.sift_iterations.push_back(stage_total.max_iterations);
+                        last_diag_.mean_sift_iterations.push_back(
+                            static_cast<double>(stage_total.iterations) / stage_total.valid);
+                        last_diag_.nonconverged_trials.push_back(stage_total.nonconverged);
+                        last_diag_.convergence_flags.push_back(stage_total.nonconverged == 0);
+                        last_diag_.trials_per_imf.push_back(stage_total.valid);
+
+                        // Update residue
+                        std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
+
+                        decay_factor *= config_.noise_decay;
+
+                        // Check stopping criteria
+                        if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||
+                            count_extrema(r_current.data, n) < config_.min_extrema)
                         {
                             stop_decomposition = true;
                         }
                     }
+                    else
+                    {
+                        stop_decomposition = true;
+                    }
                 } // end IMF loop
-            } // end omp parallel
+            } // the per-thread resources end here
 
             // Copy to output
             imfs.resize(actual_imf_count);

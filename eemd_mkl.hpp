@@ -12,7 +12,11 @@
  * Dependencies:
  * - MKL Data Fitting (df) for cubic spline interpolation
  * - MKL VSL for Gaussian noise generation
- * - OpenMP for ensemble parallelization
+ * - VectorFFT for the FFTs (eemd_fft.hpp)
+ *
+ * Threads: the ensembles run on this library's own pool (eemd_threads.hpp),
+ * with no OpenMP runtime. MKL is called from each of those threads and does
+ * not need threads of its own: link its sequential layer.
  *
  * License: MIT
  */
@@ -23,7 +27,8 @@
 #include <mkl.h>
 #include <mkl_df.h>
 #include <mkl_vsl.h>
-#include <omp.h>
+
+#include "eemd_threads.hpp" // set_num_threads(), the fork-join pool
 
 #include <cstdint>
 #include <cstdio>
@@ -38,7 +43,7 @@
 #include <immintrin.h> // _MM_SET_FLUSH_ZERO_MODE, _MM_SET_DENORMALS_ZERO_MODE
 #endif
 
-#include "eemd_fft.hpp" // real FFTs: VectorFFT when EEMD_USE_VECTORFFT, else MKL DFTI
+#include "eemd_fft.hpp" // real FFTs (VectorFFT)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -76,52 +81,54 @@
 #define EEMD_SETENV(name, value) setenv(name, value, 1)
 #endif
 
+#ifdef EEMD_MKL_SINGLE_DYNAMIC_LIBRARY
+namespace eemd
+{
+    namespace detail
+    {
+        // MKL's single dynamic library (mkl_rt) picks its threading layer when
+        // it is first used: take the sequential one, which needs no OpenMP
+        // runtime. With MKL's layered libraries the layer is chosen at link
+        // time instead.
+        inline const int mkl_threading_layer = mkl_set_threading_layer(MKL_THREADING_SEQUENTIAL);
+    } // namespace detail
+} // namespace eemd
+#endif
+
 /**
- * Low-latency mode: P-cores only, threads never sleep
+ * Low-latency mode: n_cores threads that never sleep between decompositions
+ * (each worker keeps one core busy).
  */
 inline void eemd_init_low_latency(int n_cores = EEMD_P_CORES, bool verbose = false)
 {
-    EEMD_SETENV("KMP_AFFINITY", "granularity=fine,compact,1,0");
-
-    char subset[32];
-    snprintf(subset, sizeof(subset), "1s,%dc,1t", n_cores);
-    EEMD_SETENV("KMP_HW_SUBSET", subset);
-
-    EEMD_SETENV("KMP_BLOCKTIME", "infinite");
-    EEMD_SETENV("KMP_LIBRARY", "turnaround");
     EEMD_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
 
     mkl_set_dynamic(0);
     mkl_set_num_threads(1);
-    omp_set_num_threads(n_cores);
+    eemd::set_num_threads(n_cores);
+    eemd::set_thread_block_ms(-1.0);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
     if (verbose)
     {
-        printf("EEMD-MKL: Low-latency mode (%d cores, infinite blocktime, DAZ/FTZ)\n", n_cores);
+        printf("EEMD-MKL: Low-latency mode (%d threads, never sleeping, DAZ/FTZ)\n", n_cores);
     }
 }
 
 /**
- * Throughput mode: uses hyperthreading, allows thread sleep
+ * Throughput mode: two threads per core (hyperthreading); idle workers sleep
+ * after 200 ms.
  */
 inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = false)
 {
-    EEMD_SETENV("KMP_AFFINITY", "granularity=fine,compact,1,0");
-
-    char subset[32];
-    snprintf(subset, sizeof(subset), "1s,%dc,2t", n_cores);
-    EEMD_SETENV("KMP_HW_SUBSET", subset);
-
-    EEMD_SETENV("KMP_BLOCKTIME", "200");
-    EEMD_SETENV("KMP_LIBRARY", "throughput");
     EEMD_SETENV("MKL_ENABLE_INSTRUCTIONS", "AVX2");
 
     mkl_set_dynamic(0);
     mkl_set_num_threads(1);
-    omp_set_num_threads(n_cores * 2);
+    eemd::set_num_threads(n_cores * 2);
+    eemd::set_thread_block_ms(200.0);
 
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
@@ -1205,22 +1212,20 @@ namespace eemd
 
             int32_t global_max_imfs = 0;
 
-            // Per-thread sums, reduced afterwards in thread-id order (not in
-            // the arrival order of a critical section), so a given thread count
-            // always produces the same result bit for bit. Each trial's noise
-            // comes from its own stream (trial_gaussian), so the noise of every
+            // Per-thread sums, reduced afterwards in thread order (not in the
+            // order the threads finish), so a given thread count always
+            // produces the same result bit for bit. Each trial's noise comes
+            // from its own stream (trial_gaussian), so the noise of every
             // trial is the same at any thread count.
-            const int32_t n_threads_max = omp_get_max_threads();
-            std::vector<std::vector<AlignedBuffer<double>>> thread_sums(n_threads_max);
-            std::vector<int32_t> thread_max_imfs(n_threads_max, 0);
-            int32_t n_threads_used = 1;
+            const int32_t n_threads_used = threads::team_size();
+            std::vector<std::vector<AlignedBuffer<double>>> thread_sums(n_threads_used);
+            std::vector<int32_t> thread_max_imfs(n_threads_used, 0);
 
-#pragma omp parallel
+            // Thread tid takes the trials [trial_begin, trial_end): consecutive
+            // ranges in thread order
+            threads::for_static(n_threads_used, config_.ensemble_size,
+                                [&](int32_t trial_begin, int32_t trial_end, int tid)
             {
-                const int32_t tid = omp_get_thread_num();
-#pragma omp single
-                n_threads_used = omp_get_num_threads();
-
                 // Thread-local accumulator
                 std::vector<AlignedBuffer<double>> &thread_sum = thread_sums[tid];
                 thread_sum.resize(max_imfs);
@@ -1243,8 +1248,7 @@ namespace eemd
 
                 Sifter sifter(n, config_);
 
-#pragma omp for schedule(static)
-                for (int32_t trial = 0; trial < config_.ensemble_size; ++trial)
+                for (int32_t trial = trial_begin; trial < trial_end; ++trial)
                 {
                     // Generate this trial's noise (depends on seed and trial only)
                     if (!trial_gaussian(config_.rng_seed, static_cast<uint32_t>(trial),
@@ -1292,13 +1296,15 @@ namespace eemd
                 }
 
                 thread_max_imfs[tid] = local_max_imfs;
+            });
 
-                // Ordered reduction: element i sums threads 0, 1, 2, ... in turn
+            // Ordered reduction: element i sums threads 0, 1, 2, ... in turn
+            threads::for_static(n_threads_used, n, [&](int32_t i_begin, int32_t i_end, int)
+            {
                 for (int32_t k = 0; k < max_imfs; ++k)
                 {
                     double *__restrict gs = global_sum[k].data;
-#pragma omp for schedule(static)
-                    for (int32_t i = 0; i < n; ++i)
+                    for (int32_t i = i_begin; i < i_end; ++i)
                     {
                         double acc = 0.0;
                         for (int32_t t = 0; t < n_threads_used; ++t)
@@ -1308,7 +1314,7 @@ namespace eemd
                         gs[i] += acc;
                     }
                 }
-            }
+            });
 
             for (int32_t t = 0; t < n_threads_used; ++t)
             {
@@ -1383,7 +1389,7 @@ namespace eemd
 
     /**
      * Hilbert transform y = H{x} (imaginary part of the analytic signal).
-     * Any n >= 1; FFTs through eemd_fft.hpp (VectorFFT or MKL DFTI).
+     * Any n >= 1; FFTs through eemd_fft.hpp (VectorFFT).
      */
     inline bool compute_hilbert_transform(const double *signal, int32_t n, double *hilbert_out)
     {

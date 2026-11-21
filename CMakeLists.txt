@@ -15,7 +15,39 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # CRITICAL: Force LP64 (32-bit integers)
 set(MKL_INTERFACE "lp64" CACHE STRING "MKL interface (lp64 or ilp64)" FORCE)
-set(MKL_THREADING "intel_thread" CACHE STRING "MKL threading" FORCE)
+# Sequential MKL: the library runs its own threads (eemd_threads.hpp) and calls
+# MKL from each of them, so MKL needs no threads of its own and no OpenMP runtime.
+set(MKL_THREADING "sequential" CACHE STRING "MKL threading" FORCE)
+
+# MinGW cannot link MKL's layered libraries, import or static (they hold
+# objects built for the MSVC runtime): it links MKL's single dynamic library,
+# mkl_rt. FORCE: MKL's own configuration caches "dynamic" when it runs first.
+if(MINGW)
+    set(MKL_LINK "sdl" CACHE STRING "MKL linking: static, dynamic or sdl" FORCE)
+endif()
+
+# Where MKL comes from, first hit:
+#   -DMKL_DIR=<folder of MKLConfig.cmake>
+#   MKLROOT in the environment (oneAPI's setvars sets it)
+#   oneAPI's standard install folder
+#   CMake's own search (CMAKE_PREFIX_PATH, ...)
+if(NOT MKL_DIR)
+    set(_mkl_roots "")
+    if(DEFINED ENV{MKLROOT})
+        list(APPEND _mkl_roots "$ENV{MKLROOT}")
+    endif()
+    if(DEFINED ENV{ONEAPI_ROOT})
+        list(APPEND _mkl_roots "$ENV{ONEAPI_ROOT}/mkl/latest")
+    endif()
+    list(APPEND _mkl_roots "C:/Program Files (x86)/Intel/oneAPI/mkl/latest" "/opt/intel/oneapi/mkl/latest")
+    foreach(_mkl_root IN LISTS _mkl_roots)
+        if(EXISTS "${_mkl_root}/lib/cmake/mkl/MKLConfig.cmake")
+            file(TO_CMAKE_PATH "${_mkl_root}/lib/cmake/mkl" _mkl_dir)
+            set(MKL_DIR "${_mkl_dir}" CACHE PATH "Folder of MKLConfig.cmake")
+            break()
+        endif()
+    endforeach()
+endif()
 
 find_package(MKL CONFIG REQUIRED)
 
@@ -23,9 +55,10 @@ message(STATUS "MKL found: ${MKL_ROOT}")
 message(STATUS "MKL interface: ${MKL_INTERFACE}")
 
 # ============================================================================
-# OpenMP Support
+# Threads: the C++ standard library's (std::thread). No OpenMP runtime.
 # ============================================================================
-find_package(OpenMP REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 # ============================================================================
 # Compiler Detection & Flags
@@ -34,22 +67,28 @@ find_package(OpenMP REQUIRED)
 if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     message(STATUS "Detected Intel LLVM compiler (ICX)")
     if(WIN32)
-        set(CXX_FLAGS_RELEASE /O3 /QxHost /Qipo /fp:fast /Qopenmp /EHsc /DNDEBUG)
+        set(CXX_FLAGS_RELEASE /O3 /QxHost /Qipo /fp:fast /EHsc /DNDEBUG)
+        set(CXX_FLAGS_SIMD /Qopenmp-simd)
     else()
-        set(CXX_FLAGS_RELEASE -O3 -xHost -ipo -fp-model fast -qopenmp -DNDEBUG)
+        set(CXX_FLAGS_RELEASE -O3 -xHost -ipo -fp-model fast -DNDEBUG)
+        set(CXX_FLAGS_SIMD -qopenmp-simd)
     endif()
     set(USE_IPO TRUE)
 
 elseif(MSVC)
     message(STATUS "Detected MSVC compiler")
-    set(CXX_FLAGS_RELEASE /O2 /Ob2 /fp:fast /arch:AVX2 /GL /EHsc /DNDEBUG /openmp)
+    set(CXX_FLAGS_RELEASE /O2 /Ob2 /fp:fast /arch:AVX2 /GL /EHsc /DNDEBUG)
     set(USE_IPO TRUE)
 
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     message(STATUS "Detected GCC/Clang compiler")
-    set(CXX_FLAGS_RELEASE -O3 -march=native -ffast-math -funroll-loops -flto -fopenmp -DNDEBUG)
+    set(CXX_FLAGS_RELEASE -O3 -march=native -ffast-math -funroll-loops -flto -DNDEBUG)
+    set(CXX_FLAGS_SIMD -fopenmp-simd)
     set(USE_IPO TRUE)
 endif()
+
+# CXX_FLAGS_SIMD: the loops marked "omp simd" are vectorized as marked. That is
+# a compile-time hint only: nothing of OpenMP is linked or loaded.
 
 # ============================================================================
 # Main Interface Library (Header Only)
@@ -65,17 +104,24 @@ target_include_directories(eemd_mkl INTERFACE
 
 target_compile_options(eemd_mkl INTERFACE 
     $<$<CONFIG:Release>:${CXX_FLAGS_RELEASE}>
+    ${CXX_FLAGS_SIMD}
 )
 
 target_link_libraries(eemd_mkl INTERFACE 
     MKL::MKL 
-    OpenMP::OpenMP_CXX
+    Threads::Threads
 )
 
 target_compile_definitions(eemd_mkl INTERFACE 
     MKL_LP64 
     _USE_MATH_DEFINES
 )
+
+# mkl_rt picks its threading layer at run time: the headers ask for the
+# sequential one (with the layered libraries, MKL_THREADING above links it)
+if(MKL_LINK STREQUAL "sdl")
+    target_compile_definitions(eemd_mkl INTERFACE EEMD_MKL_SINGLE_DYNAMIC_LIBRARY=1)
+endif()
 
 # ============================================================================
 # FFT: VectorFFT (https://github.com/Tugbars/VectorFFT), required
@@ -87,8 +133,9 @@ target_compile_definitions(eemd_mkl INTERFACE
 # CMake takes it from, in this order:
 #   -DVECTORFFT_ROOT=<folder>   an unpacked release you already have
 #   -DVectorFFT_DIR=<prefix>/lib/cmake/VectorFFT   a VectorFFT built from source
-#   a download of the release pinned below (Windows x64, Linux x64), unpacked
-#   under the build folder and checked against its SHA-256
+#   third_party/vectorfft-<version>/: the release pinned below (Windows x64,
+#   Linux x64), downloaded on the first configure and checked against its
+#   SHA-256. git ignores the folder.
 # ============================================================================
 
 set(ICEEMDAN_VECTORFFT_VERSION "0.8.1")
@@ -120,11 +167,13 @@ else()
 
         set(_vfft_url
             "https://github.com/Tugbars/VectorFFT/releases/download/v${ICEEMDAN_VECTORFFT_VERSION}/${_vfft_file}")
-        set(_vfft_unpacked "${CMAKE_BINARY_DIR}/_deps/vectorfft-${ICEEMDAN_VECTORFFT_VERSION}")
-        set(_vfft_root "${_vfft_unpacked}/vectorfft")   # the archive's only top-level folder
+        # Unpacked once into the source tree (ignored by git), for every build folder
+        set(_vfft_third_party "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+        set(_vfft_root "${_vfft_third_party}/vectorfft-${ICEEMDAN_VECTORFFT_VERSION}")
 
         if(NOT EXISTS "${_vfft_root}/vfft.h")
-            set(_vfft_archive "${CMAKE_BINARY_DIR}/_deps/${_vfft_file}")
+            set(_vfft_archive "${_vfft_third_party}/${_vfft_file}")
+            set(_vfft_unpack "${_vfft_third_party}/.vectorfft-unpack")
             set(_vfft_by_hand "Or download and unpack it yourself, then pass -DVECTORFFT_ROOT=<its vectorfft folder>.")
             message(STATUS "Downloading VectorFFT ${ICEEMDAN_VECTORFFT_VERSION}: ${_vfft_url}")
             file(DOWNLOAD "${_vfft_url}" "${_vfft_archive}" STATUS _vfft_status TLS_VERIFY ON)
@@ -141,8 +190,12 @@ else()
                     "${_vfft_url}: SHA-256 is ${_vfft_got}, expected ${_vfft_sha256}. "
                     "Configure again to download it again. ${_vfft_by_hand}")
             endif()
-            file(REMOVE_RECURSE "${_vfft_unpacked}")
-            file(ARCHIVE_EXTRACT INPUT "${_vfft_archive}" DESTINATION "${_vfft_unpacked}")
+            # The archive holds one folder, vectorfft: unpack it aside, then
+            # move it into place, so a half-unpacked folder is never used.
+            file(REMOVE_RECURSE "${_vfft_unpack}" "${_vfft_root}")
+            file(ARCHIVE_EXTRACT INPUT "${_vfft_archive}" DESTINATION "${_vfft_unpack}")
+            file(RENAME "${_vfft_unpack}/vectorfft" "${_vfft_root}")
+            file(REMOVE_RECURSE "${_vfft_unpack}")
             file(REMOVE "${_vfft_archive}")
         endif()
         set(ICEEMDAN_FFT_BACKEND "VectorFFT ${ICEEMDAN_VECTORFFT_VERSION} release library (${_vfft_root})")
@@ -379,6 +432,7 @@ install(TARGETS eemd_mkl iceemdan_mkl
 install(FILES 
     eemd_mkl.hpp 
     eemd_fft.hpp
+    eemd_threads.hpp
     iceemdan_mkl.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )

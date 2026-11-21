@@ -12,3 +12,5 @@ __pycache__/
 /validation/run/
 python/*.dll
 python/*.so
+# the VectorFFT release library CMake downloads
+/third_party/

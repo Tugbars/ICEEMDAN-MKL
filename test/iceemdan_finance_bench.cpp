@@ -754,7 +754,7 @@ int main()
 {
     std::cout << "ICEEMDAN Finance Mode Benchmark\n";
     std::cout << "================================\n";
-    std::cout << "Threads: " << omp_get_max_threads() << "\n";
+    std::cout << "Threads: " << eemd::get_num_threads() << "\n";
     
     bench_processing_modes();
     bench_volatility_methods();
