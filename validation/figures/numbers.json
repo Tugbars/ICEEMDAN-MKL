@@ -9,10 +9,10 @@
       0.0765,
       0.0382
     ],
-    "library_first_ms_1_thread": 35.037,
-    "library_first_ms_8_threads": 6.095,
-    "library_ms_1_thread": 6.038,
-    "library_ms_8_threads": 1.237,
+    "library_first_ms_1_thread": 31.585,
+    "library_first_ms_8_threads": 5.302,
+    "library_ms_1_thread": 5.152,
+    "library_ms_8_threads": 1.052,
     "reference_s": 21.539
   },
   "speed": {
@@ -23,28 +23,28 @@
       8192
     ],
     "library_first_ms_1_thread": [
-      49.955,
-      110.428,
-      270.86,
-      739.011
+      45.965,
+      100.466,
+      239.918,
+      656.961
     ],
     "library_first_ms_8_threads": [
-      8.359,
-      18.728,
-      46.218,
-      115.631
+      7.637,
+      17.168,
+      43.671,
+      108.488
     ],
     "library_ms_1_thread": [
-      20.264,
-      40.757,
-      90.429,
-      206.722
+      18.518,
+      36.53,
+      78.458,
+      180.046
     ],
     "library_ms_8_threads": [
-      4.418,
-      7.517,
-      17.292,
-      36.603
+      3.29,
+      6.337,
+      14.751,
+      32.032
     ],
     "reference_s": [
       35.738,

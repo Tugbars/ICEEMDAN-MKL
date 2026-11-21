@@ -2,13 +2,13 @@
 
 **ICEEMDAN (Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise), EEMD and EMD in C++, with C and Python interfaces.** The repository, the CMake package and the Python module are named `iceemdan`.
 
-It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 8 ms on eight threads, where the authors' code takes 36 s. Every further signal of that length takes 4 ms.
+It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 8 ms on eight threads, where the authors' code takes 36 s. Every further signal of that length takes 3 ms.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/decomposition-dark.png">
-  <img src="docs/img/decomposition-light.png" width="900" alt="A sinusoid with a short burst of a higher frequency, decomposed by the authors' reference code (left, 21.5 s) and by this library (right, 6.1 ms on 8 threads). Both put the burst in IMF 1 and leave the sinusoid as the residue.">
+  <img src="docs/img/decomposition-light.png" width="900" alt="A sinusoid with a short burst of a higher frequency, decomposed by the authors' reference code (left, 21.5 s) and by this library (right, 5.3 ms on 8 threads). Both put the burst in IMF 1 and leave the sinusoid as the residue.">
 </picture>
 
 The test signal of the ICEEMDAN paper: a sinusoid with a short burst of a higher frequency, the standard example of mode mixing in plain EMD. Both codes put the burst in IMF 1 and stop there: what is left, the sinusoid, is already a mode and becomes the residue. Both are within 8 % of the true components.
@@ -58,7 +58,7 @@ The two codes draw different random numbers, so they agree statistically, not sa
 
 ## Speed
 
-![Time per decomposition as a matrix over signal length 1,024 to 8,192. The authors' code takes 35.7 to 111 s. For the first signal of a length, this library is 715 to 150 times faster on one thread and 4,280 to 959 times faster on eight; for further signals, 1,760 to 536 times on one thread and 8,090 to 3,030 times on eight.](docs/img/speed.svg)
+![Time per decomposition as a matrix over signal length 1,024 to 8,192. The authors' code takes 35.7 to 111 s. For the first signal of a length, this library is 778 to 169 times faster on one thread and 4,680 to 1,020 times faster on eight; for further signals, 1,930 to 616 times on one thread and 10,860 to 3,460 times on eight.](docs/img/speed.svg)
 
 The authors' code (`ceemdan.m` with `emd.m`, at the same settings) ran in GNU Octave 11.3 on the same cores. Like the library's first signal of a length, it decomposes the noise of the ensemble on every call. The library keeps that noise, so further signals of the same length and settings skip the step, with the same result as they would get alone.
 
@@ -69,16 +69,18 @@ Time per decomposition, ensemble of 100, default configuration:
 
 | Signal length | Authors' code | First signal, 1 thread | First signal, 8 threads | Further signals, 1 thread | Further signals, 8 threads |
 |---------------|---------------|------------------------|-------------------------|---------------------------|----------------------------|
-| 1,024 | 35.7 s | 50.0 ms | 8.36 ms | 20.3 ms | 4.42 ms |
-| 2,048 | 44.3 s | 110 ms | 18.7 ms | 40.8 ms | 7.52 ms |
-| 4,096 | 64.9 s | 271 ms | 46.2 ms | 90.4 ms | 17.3 ms |
-| 8,192 | 111 s | 739 ms | 116 ms | 207 ms | 36.6 ms |
+| 1,024 | 35.7 s | 46.0 ms | 7.64 ms | 18.5 ms | 3.29 ms |
+| 2,048 | 44.3 s | 100 ms | 17.2 ms | 36.5 ms | 6.34 ms |
+| 4,096 | 64.9 s | 240 ms | 43.7 ms | 78.5 ms | 14.8 ms |
+| 8,192 | 111 s | 657 ms | 108 ms | 180 ms | 32.0 ms |
 
 Intel Core i9-14900KF, threads on the performance cores, built with GCC 16.2; median of 7 runs on a sum of tones for the library, the faster of 2 runs for the authors' code. The measurement is described in [`validation/figures/README.md`](validation/figures/README.md).
 
 </details>
 
-The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 5 to 12 times faster again on further signals: 0.7 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
+The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 8 to 12 times faster again on further signals: 0.4 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
+
+Many signals of one length in one call, such as the channels of a recording, are 1.1 to 1.5 times faster than one call per signal (8 to 128 signals of 1,000 to 4,096 samples, on 8 or 16 threads), with the same results bit for bit. `benchmarks/batch_bench.cpp` measures it.
 
 ## Features
 
@@ -89,7 +91,7 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 - **Reproducible**: for a given seed, the same result bit for bit at any number of threads. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
 - **Three presets**: Standard, Scientific (no shortcuts, an audit trail) and Finance (Akima splines, noise scaled to the local volatility, causal boundaries, NaN and Inf cleaned from the input).
 - **Envelopes**: cubic (not-a-knot), Akima or linear splines; symmetric, mirrored, autoregressive or linear boundary extension.
-- **Batches and channels**: one call decomposes many signals of one length, such as the channels of an EEG or its epochs, from C++, C and Python. They share one noise bank and run a whole signal per thread, and every result is the same, bit for bit, as decomposing that signal alone. The decomposed noise is also kept between calls, so further signals of the same length take half the time or less.
+- **Batches and channels**: one call decomposes many signals of one length, such as the channels of an EEG or its epochs, from C++, C and Python. They share one noise bank, and their trials are interleaved on the threads, so no thread waits for the end of one signal's stage; every result is the same, bit for bit, as decomposing that signal alone. The decomposed noise is also kept between calls, so further signals of the same length take half the time or less.
 - **Speed options** for when exact agreement with the paper matters less than time (among them ± noise pairs, which halve the noise to decompose), and a memory cap for the noise bank.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
 - **Hilbert–Huang analysis**: the instantaneous amplitude, frequency and phase of every IMF, the Hilbert spectrum (energy over time and frequency) and the marginal spectrum, from C++, C and Python; spectral entropy.

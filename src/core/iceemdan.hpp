@@ -2330,14 +2330,12 @@ namespace eemd
 
         /**
          * decompose_batch() on team threads, the signals' trials interleaved.
-         * A thread takes the next block of trials of the signal it started;
-         * when that has none to hand out, it starts the next signal; when
-         * all are started, it takes a block of the earliest signal that has
-         * one. The thread that completes a batch's last block adds the blocks
-         * up and sets up that signal's next batch. So while there are signals
-         * to start each thread works on its own, and no thread waits while
-         * another signal has trials left: the last signals' trials are spread
-         * over all the threads.
+         * A thread takes the next block of trials of the earliest signal that
+         * has one; the thread that completes a batch's last block adds the
+         * blocks up and sets up that signal's next batch; a thread that finds
+         * no block starts the next signal. So no thread waits at the end of a
+         * stage while another signal has trials left, and the last signals'
+         * trials are spread over all the threads.
          */
         void run_interleaved(const double *signals, int32_t count, int32_t n, const BankUse &bank, int team,
                              std::vector<std::vector<std::vector<double>>> &imfs,
@@ -2380,17 +2378,13 @@ namespace eemd
 
             threads::run(team, [&](int slot)
             {
-                // The signal this thread started: its blocks come first, so
-                // that while there are signals to start each thread mostly
-                // works on its own; the others' blocks once there are none
-                Flight *mine = nullptr;
-                int32_t mine_signal = -1;
                 std::unique_lock<std::mutex> lock(m);
                 while (!error && finished < count)
                 {
-                    const auto has_block = [](const Flight *c)
-                    { return c && c->open && c->claimed < c->job->blocks(); };
-                    Flight *f = (has_block(mine) && mine->signal == mine_signal) ? mine : nullptr;
+                    Flight *f = nullptr; // the earliest signal with a block to hand out
+                    for (Flight &c : flights)
+                        if (c.open && c.claimed < c.job->blocks() && (!f || c.signal < f->signal))
+                            f = &c;
                     Flight *fresh = nullptr; // else a free flight for the next signal
                     if (!f && next_signal < count)
                         for (Flight &c : flights)
@@ -2399,10 +2393,6 @@ namespace eemd
                                 fresh = &c;
                                 break;
                             }
-                    if (!f && !fresh) // else a block of the earliest signal that has one
-                        for (Flight &c : flights)
-                            if (has_block(&c) && (!f || c.signal < f->signal))
-                                f = &c;
                     if (!f && !fresh)
                     {
                         wake.wait(lock); // every block handed out: wait for a batch or a free flight
@@ -2430,8 +2420,6 @@ namespace eemd
                         {
                             f = fresh;
                             f->signal = next_signal++;
-                            mine = f;
-                            mine_signal = f->signal;
                             lock.unlock();
                             if (!f->job)
                                 f->job.reset(new SignalRun(*this, bank, n));
