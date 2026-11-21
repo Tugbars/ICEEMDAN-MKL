@@ -30,6 +30,10 @@ python3 ../make_figures.py . ../../../docs/img "name of the machine"
 `make_figures.py` also writes `numbers.json` beside itself: the errors and times it read, which
 are the ones the main README quotes.
 
+The accuracy figure (`docs/img/accuracy-*.png`) is drawn from `accuracy.json`, which holds the
+numbers `../compare.py` prints for the authors' code and for this library (see
+[`../README.md`](../README.md)). After a new validation run, copy its numbers there.
+
 ## What is measured
 
 - **The signal of the figure** is the artificial signal of Torres et al. (2011) and Colominas
