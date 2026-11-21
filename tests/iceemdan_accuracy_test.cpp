@@ -7,7 +7,7 @@
  * Build: with the project (cmake --build build --target accuracy_test)
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <iostream>
 #include <iomanip>
 #include <cmath>

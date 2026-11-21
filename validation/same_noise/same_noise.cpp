@@ -19,7 +19,7 @@
  *   --ensemble M        realizations (default 100)
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 
 #include <cstdio>
 #include <cstdlib>

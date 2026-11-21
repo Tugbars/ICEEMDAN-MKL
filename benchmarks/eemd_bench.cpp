@@ -1,5 +1,5 @@
 /**
- * EEMD-MKL Performance Benchmark
+ * EEMD Performance Benchmark
  *
  * Tests scaling across signal lengths, ensemble sizes, and thread counts.
  */
@@ -11,7 +11,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#include "eemd_mkl.hpp"
+#include "eemd.hpp"
 #include <iostream>
 #include <iomanip>
 #include <chrono>

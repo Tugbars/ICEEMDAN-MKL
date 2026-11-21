@@ -5,7 +5,7 @@
  * linked with VectorFFT, its only dependency.
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <cstring>
 #include <vector>
 

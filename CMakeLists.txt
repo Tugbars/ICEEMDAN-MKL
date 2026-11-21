@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(eemd_mkl 
+project(iceemdan 
     VERSION 1.0.0
     LANGUAGES CXX
     DESCRIPTION "EEMD and ICEEMDAN (Improved Complete Ensemble EMD with Adaptive Noise)"
@@ -49,13 +49,13 @@ endif()
 # Main Interface Library (Header Only)
 # ============================================================================
 
-add_library(eemd_mkl INTERFACE)
-add_library(eemd::eemd_mkl ALIAS eemd_mkl)
+add_library(eemd INTERFACE)
+add_library(iceemdan::eemd ALIAS eemd)
 
 # The headers are grouped in folders under src/ and include one another by
 # name, so each group folder is an include directory. An install puts the
 # headers side by side in one folder.
-target_include_directories(eemd_mkl INTERFACE
+target_include_directories(eemd INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/fft>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/threads>
@@ -64,18 +64,18 @@ target_include_directories(eemd_mkl INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-target_compile_options(eemd_mkl INTERFACE 
+target_compile_options(eemd INTERFACE 
     $<$<CONFIG:Release>:${CXX_FLAGS_RELEASE}>
     ${CXX_FLAGS_SIMD}
 )
 
 # The library needs nothing else: its splines, random numbers and threads are
 # its own, and the FFTs are VectorFFT's (below).
-target_link_libraries(eemd_mkl INTERFACE
+target_link_libraries(eemd INTERFACE
     Threads::Threads
 )
 
-target_compile_definitions(eemd_mkl INTERFACE
+target_compile_definitions(eemd INTERFACE
     _USE_MATH_DEFINES
 )
 
@@ -189,7 +189,7 @@ endif()
 
 # An installed copy of these headers needs VectorFFT::vfft from whoever uses
 # them: it is not installed with them.
-target_link_libraries(eemd_mkl INTERFACE VectorFFT::vfft)
+target_link_libraries(eemd INTERFACE VectorFFT::vfft)
 
 # Windows: put the VectorFFT DLLs beside the programs. On Linux the programs
 # find libvfft.so through their build RPATH.
@@ -212,16 +212,16 @@ endif()
 # ICEEMDAN Interface Library (extends EEMD)
 # ============================================================================
 
-add_library(iceemdan_mkl INTERFACE)
-add_library(eemd::iceemdan_mkl ALIAS iceemdan_mkl)
+add_library(iceemdan INTERFACE)
+add_library(iceemdan::iceemdan ALIAS iceemdan)
 
-target_include_directories(iceemdan_mkl INTERFACE
+target_include_directories(iceemdan INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
     $<INSTALL_INTERFACE:include>
 )
 
 # ICEEMDAN depends on EEMD
-target_link_libraries(iceemdan_mkl INTERFACE eemd_mkl)
+target_link_libraries(iceemdan INTERFACE eemd)
 
 # ============================================================================
 # Executables
@@ -229,7 +229,7 @@ target_link_libraries(iceemdan_mkl INTERFACE eemd_mkl)
 
 macro(add_eemd_executable name source)
     add_executable(${name} ${source})
-    target_link_libraries(${name} PRIVATE eemd_mkl)
+    target_link_libraries(${name} PRIVATE eemd)
     if(USE_IPO)
         set_target_properties(${name} PROPERTIES
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
@@ -242,7 +242,7 @@ endmacro()
 
 macro(add_iceemdan_executable name source)
     add_executable(${name} ${source})
-    target_link_libraries(${name} PRIVATE iceemdan_mkl)
+    target_link_libraries(${name} PRIVATE iceemdan)
     if(USE_IPO)
         set_target_properties(${name} PROPERTIES
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
@@ -384,7 +384,7 @@ add_iceemdan_executable(same_noise validation/same_noise/same_noise.cpp)
 # ============================================================================
 
 add_library(iceemdan_shared SHARED src/c_api/iceemdan_c.cpp)
-target_link_libraries(iceemdan_shared PRIVATE iceemdan_mkl)
+target_link_libraries(iceemdan_shared PRIVATE iceemdan)
 set_target_properties(iceemdan_shared PROPERTIES
     OUTPUT_NAME "iceemdan"
     POSITION_INDEPENDENT_CODE ON
@@ -413,14 +413,14 @@ endif()
 
 include(GNUInstallDirs)
 
-install(TARGETS eemd_mkl iceemdan_mkl
-    EXPORT eemd_mkl_targets
+install(TARGETS eemd iceemdan
+    EXPORT iceemdan_targets
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
 install(FILES
-    src/core/eemd_mkl.hpp
-    src/core/iceemdan_mkl.hpp
+    src/core/eemd.hpp
+    src/core/iceemdan.hpp
     src/fft/eemd_fft.hpp
     src/threads/eemd_threads.hpp
     src/spline/cubic_spline.hpp
@@ -428,20 +428,20 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
-install(EXPORT eemd_mkl_targets
-    FILE eemd_mkl-targets.cmake
-    NAMESPACE eemd::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/eemd_mkl
+install(EXPORT iceemdan_targets
+    FILE iceemdan-targets.cmake
+    NAMESPACE iceemdan::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/iceemdan
 )
 
 # ============================================================================
 # Summary
 # ============================================================================
 message(STATUS "")
-message(STATUS "=== EEMD/ICEEMDAN Configuration ===")
+message(STATUS "=== ICEEMDAN Configuration ===")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")
-message(STATUS "  EEMD header: src/core/eemd_mkl.hpp")
-message(STATUS "  ICEEMDAN header: src/core/iceemdan_mkl.hpp")
+message(STATUS "  EEMD header: src/core/eemd.hpp")
+message(STATUS "  ICEEMDAN header: src/core/iceemdan.hpp")
 message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")
 message(STATUS "")

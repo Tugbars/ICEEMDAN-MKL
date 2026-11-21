@@ -5,7 +5,7 @@
  * Exits non-zero on any failure.
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 
 #include <cstdio>
 #include <cmath>

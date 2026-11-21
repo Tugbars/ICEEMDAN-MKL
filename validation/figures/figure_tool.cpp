@@ -6,7 +6,7 @@
 // options: --seed S  --threads T  --sd  --single  --circular  --mirror
 //          --no-keep   the noise bank is not kept between calls: every timed decomposition
 //                      costs what the first one of its length costs
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 
 #include <algorithm>
 #include <chrono>

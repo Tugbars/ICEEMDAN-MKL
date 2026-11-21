@@ -10,7 +10,7 @@
  *   - diagnostics.csv: Decomposition metadata
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <iostream>
 #include <fstream>
 #include <iomanip>

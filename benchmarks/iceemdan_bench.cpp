@@ -1,5 +1,5 @@
 /**
- * ICEEMDAN-MKL Performance Benchmark
+ * ICEEMDAN Performance Benchmark
  *
  * Tests scaling across signal lengths, ensemble sizes, thread counts,
  * and compares EEMD vs ICEEMDAN performance and quality.
@@ -12,7 +12,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <iostream>
 #include <iomanip>
 #include <chrono>

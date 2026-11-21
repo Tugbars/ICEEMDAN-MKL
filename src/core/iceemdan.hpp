@@ -13,10 +13,10 @@
  * License: MIT
  */
 
-#ifndef ICEEMDAN_MKL_OPT_HPP
-#define ICEEMDAN_MKL_OPT_HPP
+#ifndef ICEEMDAN_HPP
+#define ICEEMDAN_HPP
 
-#include "eemd_mkl.hpp"
+#include "eemd.hpp"
 #include <memory>
 #include <numeric>
 
@@ -2370,8 +2370,8 @@ namespace eemd
             result.energy += imf[i] * imf[i];
         }
 
-        // Simplified mean frequency (skip Hilbert for speed)
-        result.mean_frequency = 0.0;
+        // instantaneous frequency weighted by instantaneous energy, Hz
+        result.mean_frequency = hht::mean_frequency(imf, n, sample_rate);
 
         bool hurst_noise = (result.hurst > 0.4 && result.hurst < 0.6);
         bool high_entropy = (result.spectral_entropy > 0.8);
@@ -2384,4 +2384,4 @@ namespace eemd
 
 } // namespace eemd
 
-#endif // ICEEMDAN_MKL_OPT_HPP
+#endif // ICEEMDAN_HPP

@@ -1,6 +1,6 @@
-# ICEEMDAN-MKL
+# VectorEMD
 
-**Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise (ICEEMDAN) in C++, with C and Python interfaces.**
+**ICEEMDAN (Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise), EEMD and EMD in C++, with C and Python interfaces.** The repository, the CMake package and the Python module are named `iceemdan`.
 
 It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 8 ms on eight threads, where the authors' code takes 36 s. Every further signal of that length takes 4 ms.
 
@@ -125,11 +125,11 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 If you use this implementation in your research, please cite:
 
 ```bibtex
-@software{iceemdan_mkl,
+@software{vectoremd,
   author = {Tugbars Heptaskin},
-  title = {ICEEMDAN-MKL: High-Performance ICEEMDAN Implementation},
+  title = {VectorEMD: ICEEMDAN, EEMD and EMD in C++},
   year = {2025},
-  url = {https://github.com/Tugbars/iceemdan-mkl}
+  url = {https://github.com/Tugbars/iceemdan}
 }
 ```
 

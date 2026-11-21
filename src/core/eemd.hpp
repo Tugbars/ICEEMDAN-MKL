@@ -1,6 +1,6 @@
 /**
  * EEMD (Ensemble Empirical Mode Decomposition): the sifting, the envelopes and
- * the EEMD ensemble, on which ICEEMDAN (iceemdan_mkl.hpp) builds.
+ * the EEMD ensemble, on which ICEEMDAN (iceemdan.hpp) builds.
  *
  * - Envelopes evaluated at every sample in one pass (no knot search)
  * - Raw pointer hot paths (no std::vector overhead in inner loops)
@@ -17,8 +17,8 @@
  * License: MIT
  */
 
-#ifndef EEMD_MKL_HPP
-#define EEMD_MKL_HPP
+#ifndef EEMD_HPP
+#define EEMD_HPP
 
 #include "eemd_threads.hpp" // set_num_threads(), the fork-join pool
 #include "eemd_rng.hpp"     // the noise
@@ -38,6 +38,7 @@
 #endif
 
 #include "eemd_fft.hpp" // real FFTs (VectorFFT)
+#include "eemd_hht.hpp" // Hilbert-Huang analysis of the IMFs
 #include "cubic_spline.hpp" // the cubic envelopes
 
 #ifndef M_PI
@@ -1321,9 +1322,10 @@ namespace eemd
     }
 
     /**
-     * Instantaneous frequency (cycles per unit of 1/sample_rate) from the
-     * phase increments of the analytic signal x + i H{x}.
-     * inst_freq must hold n values; n >= 3.
+     * Instantaneous frequency in Hz (cycles per sample for a sample_rate of
+     * 1) from the phase of the analytic signal x + i H{x}; see
+     * hht::instantaneous() (eemd_hht.hpp), which also gives the amplitude and
+     * the phase. inst_freq must hold n values; n >= 3.
      */
     inline bool compute_instantaneous_frequency(
         const double *imf,
@@ -1333,32 +1335,9 @@ namespace eemd
     {
         if (n < 3)
             return false;
-
-        thread_local std::vector<double> h;
-        h.resize(static_cast<size_t>(n));
-        if (!fft::hilbert(imf, n, h.data()))
-            return false;
-
-        const double freq_scale = sample_rate / (2.0 * M_PI);
-
-        for (int32_t i = 1; i < n - 1; ++i)
-        {
-            double dphase = std::atan2(h[i + 1], imf[i + 1]) - std::atan2(h[i], imf[i]);
-
-            while (dphase > M_PI)
-                dphase -= 2.0 * M_PI;
-            while (dphase < -M_PI)
-                dphase += 2.0 * M_PI;
-
-            inst_freq[i] = dphase * freq_scale;
-        }
-
-        inst_freq[0] = inst_freq[1];
-        inst_freq[n - 1] = inst_freq[n - 2];
-
-        return true;
+        return hht::instantaneous(imf, n, sample_rate, nullptr, inst_freq, nullptr);
     }
 
 } // namespace eemd
 
-#endif // EEMD_MKL_HPP
+#endif // EEMD_HPP

@@ -2,7 +2,7 @@
  * Benchmark: Adaptive Ensemble vs Fixed Ensemble
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <chrono>
 #include <cstdio>
 #include <random>

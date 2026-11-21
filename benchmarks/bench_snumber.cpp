@@ -5,7 +5,7 @@
  * Lower S = faster but potentially less accurate
  */
 
-#include "iceemdan_mkl.hpp"
+#include "iceemdan.hpp"
 #include <chrono>
 #include <cstdio>
 #include <random>
