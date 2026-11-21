@@ -354,6 +354,9 @@ target_include_directories(spline_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/
 
 add_iceemdan_executable(decompose_csv validation/decompose_csv.cpp)
 
+# Data for the README figures and timings (validation/figures/README.md)
+add_iceemdan_executable(figure_tool validation/figures/figure_tool.cpp)
+
 # ============================================================================
 # C interface (src/c_api), built as the shared library the Python binding loads
 # ============================================================================

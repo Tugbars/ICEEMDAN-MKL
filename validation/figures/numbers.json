@@ -1,0 +1,34 @@
+{
+  "machine": "Intel Core i9-14900KF, P-cores",
+  "burst": {
+    "library_error": [
+      0.0759,
+      0.0425
+    ],
+    "reference_error": null,
+    "library_ms_1_thread": 114.817,
+    "library_ms_8_threads": 22.052,
+    "reference_s": null
+  },
+  "speed": {
+    "n": [
+      1024,
+      2048,
+      4096,
+      8192
+    ],
+    "library_ms_1_thread": [
+      122.885,
+      260.445,
+      582.343,
+      1529.692
+    ],
+    "library_ms_8_threads": [
+      24.33,
+      47.511,
+      106.245,
+      274.946
+    ],
+    "reference_s": null
+  }
+}

@@ -10,9 +10,12 @@ __pycache__/
 *.pyc
 /build*/
 /validation/run/
+/validation/figures/run/
 python/*.dll
 python/*.so
 # the VectorFFT release library CMake downloads
 /third_party/
 # clangd index
 /.cache/
+# working notes (README material kept for the how-to-use guide)
+/notes/
