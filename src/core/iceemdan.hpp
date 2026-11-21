@@ -26,7 +26,10 @@
 #else
 #define EEMD_NOINLINE __attribute__((noinline))
 #endif
+#include <condition_variable>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <numeric>
 
 namespace eemd
@@ -1603,16 +1606,14 @@ namespace eemd
          * for that signal alone with these settings.
          *
          * The signals share one noise bank, built once or kept from an earlier
-         * call. With at least as many signals as threads, each signal is
-         * decomposed whole on one thread, which keeps every thread busy even
-         * for short signals; with fewer, they are decomposed one after another,
-         * each on all the threads.
+         * call, and their trials are interleaved on the library's threads: a
+         * thread that would wait for the end of one signal's stage takes trials
+         * of the next signal instead (run_interleaved()).
          *
          * imfs[s] and residues[s] receive signal s's IMFs and residue; diags,
          * when given, its diagnostics.
          * last_diagnostics() afterwards holds the last signal's. False when the
-         * arguments are bad or a signal could not be decomposed (that signal's
-         * diagnostics have valid = false).
+         * arguments are bad or the noise bank cannot be built.
          */
         bool decompose_batch(
             const double *signals,
@@ -1636,24 +1637,20 @@ namespace eemd
                 return false;
 
             std::vector<DecompositionDiagnostics> d(static_cast<size_t>(count));
-            std::vector<char> ok(static_cast<size_t>(count), 0);
-            auto one = [&](int32_t s)
-            {
-                ok[s] = run(signals + static_cast<size_t>(s) * n, n, bank, imfs[s], residues[s], d[s]) ? 1 : 0;
-            };
             const int32_t team = threads::team_size();
-            if (count >= team && team > 1)
-                threads::for_dynamic(team, count, [&](int32_t s, int) { one(s); }); // a signal per thread
-            else
+            if (count == 1 || team <= 1)
+            {
                 for (int32_t s = 0; s < count; ++s)
-                    one(s); // each on all the threads
+                    run(signals + static_cast<size_t>(s) * n, n, bank, imfs[s], residues[s], d[s]);
+            }
+            else
+            {
+                run_interleaved(signals, count, n, bank, team, imfs, residues, d);
+            }
 
             last_diag_ = d.back();
             if (diags)
                 *diags = std::move(d);
-            for (char v : ok)
-                if (!v)
-                    return false;
             return true;
         }
 
@@ -1788,127 +1785,379 @@ namespace eemd
             return (auto_sum > 1e-10) ? cross_sum / auto_sum : 0.0;
         }
 
-        /**
-         * One signal's decomposition on the bank prepare_bank() made: reads
-         * the decomposer and its bank, writes only its arguments, so several
-         * can run at once (decompose_batch()).
-         */
-        EEMD_NOINLINE bool run(
-            const double *signal,
-            int32_t n,
-            const BankUse &bank,
-            std::vector<std::vector<double>> &imfs,
-            std::vector<double> &residue,
-            DecompositionDiagnostics &diag) const
+        /** The sifting settings of the trials (and of the stop test). */
+        static SiftParams sift_params(const ICEEMDANConfig &c)
         {
-            diag = DecompositionDiagnostics();
-            diag.rng_seed_used = config_.rng_seed;
-            diag.mode_used = mode_;
-            diag.local_mean_method_used = config_.local_mean_method;
-            diag.valid = false;
+            return SiftParams{c.max_sift_iters, c.sift_threshold, c.s_number, c.sift_stop_rule, c.rilling};
+        }
 
-            // Input sanitization (NaN/Inf protection)
-            AlignedBuffer<double> signal_clean(n);
-            std::memcpy(signal_clean.data, signal, n * sizeof(double));
+        /**
+         * A thread's working memory for the trials of signals of one length.
+         * Kept in the decomposer from call to call (and freed with the noise
+         * bank), so a decomposition does not allocate it again.
+         */
+        struct TrialWorkspace
+        {
+            int32_t n;
+            ICEEMDANConfig made_for; // the settings lm_computer was made with
+            LocalMeanComputer lm_computer;
+            AlignedBuffer<double> perturbed;
+            AlignedBuffer<double> local_mean;
 
-            int32_t nan_count = 0;
-            if (config_.sanitize_input)
+            TrialWorkspace(int32_t len, const ICEEMDANConfig &c)
+                : n(len), made_for(c),
+                  lm_computer(len, c.boundary_extend, c.spline_fast_threshold, c.boundary_method, c.ar_lookback,
+                              c.ar_damping, c.ar_max_slope_atr, c.spline_method, c.local_mean_method,
+                              sift_params(c)),
+                  perturbed(len), local_mean(len)
             {
-                nan_count = sanitize_signal(signal_clean.data, n);
-            }
-            diag.nan_count = nan_count;
-
-            const double *clean_signal = signal_clean.data;
-
-            // Compute volatility using unified engine
-            // Global mode returns scalar (no array allocation needed)
-            AlignedBuffer<double> local_vol_array;
-            if (config_.volatility_method != VolatilityMethod::Global)
-            {
-                local_vol_array.resize(n);
             }
 
-            VolatilityResult vol_result = compute_volatility(
-                config_.volatility_method, clean_signal, n,
-                config_.vol_window, config_.vol_ema_span,
-                config_.vol_floor,
-                local_vol_array.data); // Only written if SMA/EMA
-
-            const double signal_std = std::max(config_.vol_floor, compute_std(clean_signal, n));
-            // The noise amplitudes beta_k use the standard deviation with n - 1,
-            // as ceemdan.m (MATLAB's std) does
-            const double signal_sample_std = std::max(config_.vol_floor, compute_sample_std(clean_signal, n));
-
-            // The published algorithm (Rilling stop rule, sifted local means)
-            // follows the authors' ceemdan.m also where the paper leaves
-            // details open: a trial whose input is not sifted at all, and when
-            // the decomposition stops (see below)
-            const bool reference_path = config_.sift_stop_rule == SiftStopRule::Rilling &&
-                                        config_.local_mean_method == LocalMeanMethod::Sifted;
-
-            const int32_t base_trials = this->base_trials();
-            const bool use_circular = bank.circular;
-            diag.noise_bank_reused = bank.reused;
-            if (use_circular)
-                diag.noise_bank_multiplier = circular_bank_.multiplier();
-
-            // Capture noise bank accessor as lambda (hoisted out of hot loop)
-            const CircularNoiseBank &circular_bank = circular_bank_;
-            const StandardNoiseBank &standard_bank = standard_bank_;
-            auto get_noise = [&](int32_t trial, int32_t imf) -> const double *
+            /** Whether it serves signals of length len with the settings c. */
+            bool fits(int32_t len, const ICEEMDANConfig &c) const
             {
-                return use_circular ? circular_bank.get_noise_slice(trial, imf) : standard_bank.get_noise_imf(trial, imf);
-            };
+                const ICEEMDANConfig &m = made_for;
+                return n == len && m.boundary_extend == c.boundary_extend &&
+                       m.spline_fast_threshold == c.spline_fast_threshold && m.boundary_method == c.boundary_method &&
+                       m.ar_lookback == c.ar_lookback && m.ar_damping == c.ar_damping &&
+                       m.ar_max_slope_atr == c.ar_max_slope_atr && m.spline_method == c.spline_method &&
+                       m.local_mean_method == c.local_mean_method && m.max_sift_iters == c.max_sift_iters &&
+                       m.sift_threshold == c.sift_threshold && m.s_number == c.s_number &&
+                       m.sift_stop_rule == c.sift_stop_rule && m.rilling.theta1 == c.rilling.theta1 &&
+                       m.rilling.theta2 == c.rilling.theta2 && m.rilling.alpha == c.rilling.alpha;
+            }
+        };
 
-            // Prepare output
-            imfs.clear();
-            imfs.reserve(config_.max_imfs);
+        /** The threads' workspaces, by slot. A copy of the decomposer starts without any. */
+        struct Workspaces
+        {
+            std::vector<std::unique_ptr<TrialWorkspace>> slots;
 
-            AlignedBuffer<double> r_current(n);
-            std::memcpy(r_current.data, clean_signal, n * sizeof(double));
-
-            AlignedBuffer<double> mean_accumulator(n);
-
-            std::vector<AlignedBuffer<double>> imf_storage(config_.max_imfs);
-            for (auto &buf : imf_storage)
+            Workspaces() = default;
+            Workspaces(const Workspaces &) {}
+            Workspaces &operator=(const Workspaces &)
             {
-                buf.resize(n);
+                slots.clear();
+                return *this;
+            }
+            Workspaces(Workspaces &&) = default;
+            Workspaces &operator=(Workspaces &&) = default;
+        };
+
+        /** Room for team workspaces; called before a fork, inside which each slot touches its own only. */
+        void reserve_workspaces(int team)
+        {
+            if (static_cast<int>(workspaces_.slots.size()) < team)
+                workspaces_.slots.resize(static_cast<size_t>(team));
+        }
+
+        /** The workspace of a slot, for signals of length n with the current settings. */
+        TrialWorkspace &workspace(int slot, int32_t n)
+        {
+            std::unique_ptr<TrialWorkspace> &w = workspaces_.slots[static_cast<size_t>(slot)];
+            if (!w || !w->fits(n, config_))
+                w.reset(new TrialWorkspace(n, config_));
+            return *w;
+        }
+
+        /**
+         * One signal's decomposition on the bank prepare_bank() made, step by
+         * step: start(); then, while next_batch() gives a batch of trials, its
+         * blocks (block(), in any order, on any thread), their sum (reduce(),
+         * over any split of the samples) and end_batch(); finally finish().
+         * It reads the decomposer and its bank and writes only its own
+         * buffers, so several signals can be decomposed at once. A block's sum
+         * depends only on its trials and the blocks are added in block order,
+         * so the result does not depend on which thread does what.
+         */
+        class SignalRun
+        {
+        public:
+            SignalRun(const ICEEMDAN &d, const BankUse &bank, int32_t n)
+                : d_(d), c_(d.config_), bank_(bank), n_(n), base_trials_(d.base_trials()),
+                  reference_path_(d.config_.sift_stop_rule == SiftStopRule::Rilling &&
+                                  d.config_.local_mean_method == LocalMeanMethod::Sifted),
+                  // Heuristic: disable adaptive for short signals (overhead > benefit)
+                  adaptive_(d.config_.adaptive_ensemble && n >= d.config_.adaptive_min_signal_len),
+                  signal_clean_(n), r_current_(n), mean_acc_(n), prev_mean_(n),
+                  imf_storage_(static_cast<size_t>(d.config_.max_imfs))
+            {
+                if (c_.volatility_method != VolatilityMethod::Global)
+                    local_vol_.resize(n);
+                for (auto &buf : imf_storage_)
+                    buf.resize(n);
+
+                // Deterministic reduction layout: trials are summed in blocks
+                // of block_trials (in trial order), blocks are reduced in
+                // block order. Nothing here depends on the number of threads.
+                const int32_t batch_max = adaptive_ ? std::max(1, std::min(c_.adaptive_check_interval, base_trials_))
+                                                    : base_trials_;
+                block_trials_ = std::max(4, (batch_max + 63) / 64); // at most 64 blocks
+                const int32_t n_blocks_max = (batch_max + block_trials_ - 1) / block_trials_;
+                block_accs_ = std::vector<AlignedBuffer<double>>(static_cast<size_t>(n_blocks_max));
+                for (auto &acc : block_accs_)
+                    acc.resize(n);
+                block_stats_.resize(static_cast<size_t>(n_blocks_max));
             }
 
-            int32_t actual_imf_count = 0;
-            bool stop_decomposition = false;
-
-            const bool use_scalar_vol = vol_result.is_scalar;
-
-            // Noise decay multiplier (decreases each IMF)
-            double decay_factor = 1.0;
-
-            // Stage amplitude of the noise mode (see the formula above)
-            double stage_scale = 0.0;
-
-            // Adaptive ensemble tracking
-            AlignedBuffer<double> prev_mean_estimate(n);
-
-            // Heuristic: disable adaptive for short signals (overhead > benefit)
-            const bool effective_adaptive = config_.adaptive_ensemble &&
-                                            (n >= config_.adaptive_min_signal_len);
-
-            // =================================================================
-            // Deterministic reduction layout: trials are summed in blocks of
-            // block_trials (in trial order), blocks are reduced in block order.
-            // Nothing here depends on the number of threads.
-            // =================================================================
-            const int32_t batch_max = effective_adaptive
-                                          ? std::max(1, std::min(config_.adaptive_check_interval, base_trials))
-                                          : base_trials;
-            const int32_t block_trials = std::max(4, (batch_max + 63) / 64); // at most 64 blocks
-            const int32_t n_blocks_max = (batch_max + block_trials - 1) / block_trials;
-
-            std::vector<AlignedBuffer<double>> block_accs(n_blocks_max);
-            for (auto &acc : block_accs)
+            /** Begins the decomposition of signal (n samples); diag receives its diagnostics. */
+            EEMD_NOINLINE void start(const double *signal, DecompositionDiagnostics &diag)
             {
-                acc.resize(n);
+                diag_ = &diag;
+                diag = DecompositionDiagnostics();
+                diag.rng_seed_used = c_.rng_seed;
+                diag.mode_used = d_.mode_;
+                diag.local_mean_method_used = c_.local_mean_method;
+                diag.valid = false;
+
+                // Input sanitization (NaN/Inf protection)
+                std::memcpy(signal_clean_.data, signal, n_ * sizeof(double));
+                int32_t nan_count = 0;
+                if (c_.sanitize_input)
+                    nan_count = sanitize_signal(signal_clean_.data, n_);
+                diag.nan_count = nan_count;
+                const double *clean_signal = signal_clean_.data;
+
+                // Compute volatility using unified engine
+                // Global mode returns scalar (no array allocation needed)
+                const VolatilityResult vol_result = compute_volatility(
+                    c_.volatility_method, clean_signal, n_,
+                    c_.vol_window, c_.vol_ema_span,
+                    c_.vol_floor,
+                    local_vol_.data); // Only written if SMA/EMA
+                use_scalar_vol_ = vol_result.is_scalar;
+
+                signal_std_ = std::max(c_.vol_floor, compute_std(clean_signal, n_));
+                // The noise amplitudes beta_k use the standard deviation with n - 1,
+                // as ceemdan.m (MATLAB's std) does
+                signal_sample_std_ = std::max(c_.vol_floor, compute_sample_std(clean_signal, n_));
+
+                diag.noise_bank_reused = bank_.reused;
+                if (bank_.circular)
+                    diag.noise_bank_multiplier = d_.circular_bank_.multiplier();
+
+                std::memcpy(r_current_.data, clean_signal, n_ * sizeof(double));
+                actual_imf_count_ = 0;
+                stop_ = false;
+                decay_factor_ = 1.0; // Noise decay multiplier (decreases each IMF)
+                stage_scale_ = 0.0;
+                k_ = 0;
+                begin_stage();
             }
+
+            /** Sets up the next batch of trials; false when the decomposition is complete. */
+            bool next_batch()
+            {
+                if (finished_)
+                    return false;
+                batch_start_ = batch_end_;
+                batch_end_ = adaptive_ ? std::min(batch_start_ + c_.adaptive_check_interval, base_trials_)
+                                       : base_trials_;
+                n_blocks_ = (batch_end_ - batch_start_ + block_trials_ - 1) / block_trials_;
+                return true;
+            }
+
+            /** Blocks of trials in the current batch. */
+            int32_t blocks() const { return n_blocks_; }
+
+            /** The trials of block b: their local means summed in trial order. */
+            EEMD_NOINLINE void block(int32_t b, TrialWorkspace &ws)
+            {
+                const int32_t n = n_;
+                const int32_t k = k_;
+                LocalMeanComputer &lm_computer = ws.lm_computer;
+                AlignedBuffer<double> &tl_perturbed = ws.perturbed;
+                AlignedBuffer<double> &tl_local_mean = ws.local_mean;
+
+                double *__restrict acc = block_accs_[b].data;
+                std::memset(acc, 0, n * sizeof(double));
+                BlockStats st;
+
+                const int32_t t_begin = batch_start_ + b * block_trials_;
+                const int32_t t_end = std::min(batch_end_, t_begin + block_trials_);
+
+                for (int32_t i = t_begin; i < t_end; ++i)
+                {
+                    const double *noise_imf = noise(i, k);
+
+                    // Amplitude of this trial's noise mode
+                    double amp = stage_scale_;
+                    if (noise_imf && k == 0)
+                    {
+                        // beta_0 = eps * std(x) / std(E_1(w^(i)))
+                        const double sw = compute_sample_std(noise_imf, n);
+                        amp = (sw > 1e-300) ? stage_scale_ / sw : 0.0;
+                    }
+                    // Local-volatility modes keep their time profile,
+                    // scaled to the stage level: lv[j] / std(x) * amp
+                    const double lv_scale = use_scalar_vol_ ? 0.0 : amp / signal_std_;
+
+                    const int32_t n_branches = (c_.use_antithetic && noise_imf) ? 2 : 1;
+                    for (int32_t branch = 0; branch < n_branches; ++branch)
+                    {
+                        const double sign = (branch == 0) ? 1.0 : -1.0;
+                        const double *__restrict r = r_current_.data;
+                        double *__restrict p = tl_perturbed.data;
+
+                        if (!noise_imf)
+                        {
+                            std::memcpy(p, r, n * sizeof(double));
+                        }
+                        else if (use_scalar_vol_)
+                        {
+                            const double a = sign * amp;
+                            const double *__restrict nz = noise_imf;
+                            EEMD_OMP_SIMD
+                            for (int32_t j = 0; j < n; ++j)
+                            {
+                                p[j] = r[j] + a * nz[j];
+                            }
+                        }
+                        else
+                        {
+                            const double a = sign * lv_scale;
+                            const double *__restrict nz = noise_imf;
+                            const double *__restrict lv = local_vol_.data;
+                            EEMD_OMP_SIMD
+                            for (int32_t j = 0; j < n; ++j)
+                            {
+                                p[j] = r[j] + a * lv[j] * nz[j];
+                            }
+                        }
+
+                        SiftStats ss;
+                        ++st.attempted;
+                        const bool lm_ok = lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data, &ss);
+                        if (reference_path_ && ss.unsifted)
+                        {
+                            // emd.m returned one row, the input itself:
+                            // ceemdan.m's first stage takes the input
+                            // minus that row (a local mean of 0), the
+                            // later stages that row (the input)
+                            ++st.valid;
+                            if (k > 0)
+                            {
+                                const double *__restrict pin = tl_perturbed.data;
+                                EEMD_OMP_SIMD
+                                for (int32_t j = 0; j < n; ++j)
+                                {
+                                    acc[j] += pin[j];
+                                }
+                            }
+                            continue;
+                        }
+                        if (lm_ok)
+                        {
+                            ++st.valid;
+                            st.iterations += ss.iterations;
+                            st.max_iterations = std::max(st.max_iterations, ss.iterations);
+                            st.nonconverged += ss.converged ? 0 : 1;
+
+                            const double *__restrict lm = tl_local_mean.data;
+                            EEMD_OMP_SIMD
+                            for (int32_t j = 0; j < n; ++j)
+                            {
+                                acc[j] += lm[j];
+                            }
+                        }
+                    }
+                }
+                block_stats_[b] = st;
+            }
+
+            /** Adds the batch's blocks, in block order, to the stage sum: samples [j_begin, j_end). */
+            EEMD_NOINLINE void reduce(int32_t j_begin, int32_t j_end)
+            {
+                for (int32_t j = j_begin; j < j_end; ++j)
+                {
+                    double sum = 0.0;
+                    for (int32_t b = 0; b < n_blocks_; ++b)
+                    {
+                        sum += block_accs_[b].data[j];
+                    }
+                    mean_acc_.data[j] += sum;
+                }
+            }
+
+            /**
+             * After reduce(): the batch's statistics, whether the stage's
+             * ensemble is complete, and if so the stage's IMF and whether
+             * the decomposition goes on (stop_test: a LocalMeanComputer this
+             * thread may use).
+             */
+            EEMD_NOINLINE void end_batch(LocalMeanComputer &stop_test)
+            {
+                for (int32_t b = 0; b < n_blocks_; ++b)
+                {
+                    const BlockStats &st = block_stats_[b];
+                    stage_total_.valid += st.valid;
+                    stage_total_.attempted += st.attempted;
+                    stage_total_.iterations += st.iterations;
+                    stage_total_.max_iterations = std::max(stage_total_.max_iterations, st.max_iterations);
+                    stage_total_.nonconverged += st.nonconverged;
+                }
+
+                bool ensemble_converged = false;
+                if (batch_end_ >= base_trials_)
+                {
+                    ensemble_converged = true; // all trials done
+                }
+                else if (adaptive_ &&
+                         batch_end_ >= c_.adaptive_min_trials &&
+                         stage_total_.valid > 0)
+                {
+                    // Relative L2 change of the running mean estimate
+                    const double inv_valid = 1.0 / stage_total_.valid;
+                    double diff_sq = 0.0;
+                    double curr_sq = 0.0;
+
+                    for (int32_t j = 0; j < n_; ++j)
+                    {
+                        double curr = mean_acc_.data[j] * inv_valid;
+                        double prev = prev_mean_.data[j];
+                        double d = curr - prev;
+                        diff_sq += d * d;
+                        curr_sq += curr * curr;
+                    }
+
+                    double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
+
+                    if (rel_change < c_.adaptive_rel_tol)
+                    {
+                        ensemble_converged = true;
+                    }
+                    else
+                    {
+                        for (int32_t j = 0; j < n_; ++j)
+                        {
+                            prev_mean_.data[j] = mean_acc_.data[j] * inv_valid;
+                        }
+                    }
+                }
+
+                if (ensemble_converged)
+                    end_stage(stop_test);
+            }
+
+            /** The IMFs and the residue; the diagnostics complete. */
+            EEMD_NOINLINE void finish(std::vector<std::vector<double>> &imfs, std::vector<double> &residue)
+            {
+                imfs.clear();
+                imfs.resize(static_cast<size_t>(actual_imf_count_));
+                for (int32_t k = 0; k < actual_imf_count_; ++k)
+                {
+                    imfs[k].resize(n_);
+                    std::memcpy(imfs[k].data(), imf_storage_[k].data, n_ * sizeof(double));
+                }
+
+                residue.resize(n_);
+                std::memcpy(residue.data(), r_current_.data, n_ * sizeof(double));
+
+                diag_->orthogonality_index = orthogonality_index(imf_storage_.data(), actual_imf_count_, n_);
+                diag_->valid = true;
+            }
+
+        private:
             struct BlockStats
             {
                 int32_t valid = 0;
@@ -1917,342 +2166,304 @@ namespace eemd
                 int32_t max_iterations = 0;
                 int32_t nonconverged = 0;
             };
-            std::vector<BlockStats> block_stats(n_blocks_max);
 
-            // Batch processing state (shared across threads)
-            int32_t batch_start = 0;
-            int32_t batch_end = 0;
-            int32_t n_blocks_batch = 0;
-            bool ensemble_converged = false;
-            BlockStats stage_total;
-
-            const SiftParams sift_params{config_.max_sift_iters, config_.sift_threshold, config_.s_number,
-                                         config_.sift_stop_rule, config_.rilling};
-
+            /** Noise mode imf of trial's realization (the bank's). */
+            const double *noise(int32_t trial, int32_t imf) const
             {
-                // Per-thread resources with mode-specific boundary handling.
-                // Each thread makes its own the first time it takes a block
-                // and keeps them for every stage of this decomposition.
-                struct ThreadState
-                {
-                    LocalMeanComputer lm_computer;
-                    AlignedBuffer<double> perturbed;
-                    AlignedBuffer<double> local_mean;
-
-                    ThreadState(int32_t len, const ICEEMDANConfig &c, const SiftParams &sp)
-                        : lm_computer(len, c.boundary_extend,
-                                      c.spline_fast_threshold,
-                                      c.boundary_method,
-                                      c.ar_lookback,
-                                      c.ar_damping,
-                                      c.ar_max_slope_atr,
-                                      c.spline_method,
-                                      c.local_mean_method,
-                                      sp),
-                          perturbed(len),
-                          local_mean(len)
-                    {
-                    }
-                };
-                const int32_t n_threads = threads::team_size();
-                std::vector<std::unique_ptr<ThreadState>> thread_states(n_threads);
-
-                // The stop test of the published path, on the calling thread
-                LocalMeanComputer stop_test(n, config_.boundary_extend, config_.spline_fast_threshold,
-                                            config_.boundary_method, config_.ar_lookback, config_.ar_damping,
-                                            config_.ar_max_slope_atr, config_.spline_method,
-                                            config_.local_mean_method, sift_params);
-
-                // =============================================================
-                // IMF EXTRACTION LOOP (on the calling thread; the trials of a
-                // stage and their reduction are forked to the pool)
-                // =============================================================
-                for (int32_t k = 0; k < config_.max_imfs; ++k)
-                {
-                    if (stop_decomposition)
-                        break;
-
-                    // Reset for new IMF
-                    batch_start = 0;
-                    batch_end = 0;
-                    ensemble_converged = false;
-                    stage_total = BlockStats();
-                    mean_accumulator.zero();
-                    prev_mean_estimate.zero();
-
-                    // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
-                    // per-trial factor std(x) / std(E_1(w)) is applied below
-                    stage_scale = (k == 0)
-                                      ? decay_factor * config_.noise_std * signal_sample_std
-                                      : decay_factor * config_.noise_std * compute_sample_std(r_current.data, n);
-
-                    // =============================================================
-                    // BATCH PROCESSING LOOP (one batch unless adaptive)
-                    // =============================================================
-                    while (true)
-                    {
-                        batch_start = batch_end;
-                        batch_end = effective_adaptive
-                                        ? std::min(batch_start + config_.adaptive_check_interval, base_trials)
-                                        : base_trials;
-                        n_blocks_batch = (batch_end - batch_start + block_trials - 1) / block_trials;
-
-                        if (batch_start >= base_trials)
-                            break;
-
-                        // A block goes to whichever thread is free: its sum does
-                        // not depend on the thread that computes it
-                        threads::for_dynamic(n_threads, n_blocks_batch, [&](int32_t b, int slot)
-                        {
-                            if (!thread_states[slot])
-                                thread_states[slot].reset(new ThreadState(n, config_, sift_params));
-                            LocalMeanComputer &lm_computer = thread_states[slot]->lm_computer;
-                            AlignedBuffer<double> &tl_perturbed = thread_states[slot]->perturbed;
-                            AlignedBuffer<double> &tl_local_mean = thread_states[slot]->local_mean;
-
-                            double *__restrict acc = block_accs[b].data;
-                            std::memset(acc, 0, n * sizeof(double));
-                            BlockStats st;
-
-                            const int32_t t_begin = batch_start + b * block_trials;
-                            const int32_t t_end = std::min(batch_end, t_begin + block_trials);
-
-                            for (int32_t i = t_begin; i < t_end; ++i)
-                            {
-                                const double *noise_imf = get_noise(i, k);
-
-                                // Amplitude of this trial's noise mode
-                                double amp = stage_scale;
-                                if (noise_imf && k == 0)
-                                {
-                                    // beta_0 = eps * std(x) / std(E_1(w^(i)))
-                                    const double sw = compute_sample_std(noise_imf, n);
-                                    amp = (sw > 1e-300) ? stage_scale / sw : 0.0;
-                                }
-                                // Local-volatility modes keep their time profile,
-                                // scaled to the stage level: lv[j] / std(x) * amp
-                                const double lv_scale = use_scalar_vol ? 0.0 : amp / signal_std;
-
-                                const int32_t n_branches = (config_.use_antithetic && noise_imf) ? 2 : 1;
-                                for (int32_t branch = 0; branch < n_branches; ++branch)
-                                {
-                                    const double sign = (branch == 0) ? 1.0 : -1.0;
-                                    const double *__restrict r = r_current.data;
-                                    double *__restrict p = tl_perturbed.data;
-
-                                    if (!noise_imf)
-                                    {
-                                        std::memcpy(p, r, n * sizeof(double));
-                                    }
-                                    else if (use_scalar_vol)
-                                    {
-                                        const double a = sign * amp;
-                                        const double *__restrict nz = noise_imf;
-                                        EEMD_OMP_SIMD
-                                        for (int32_t j = 0; j < n; ++j)
-                                        {
-                                            p[j] = r[j] + a * nz[j];
-                                        }
-                                    }
-                                    else
-                                    {
-                                        const double a = sign * lv_scale;
-                                        const double *__restrict nz = noise_imf;
-                                        const double *__restrict lv = local_vol_array.data;
-                                        EEMD_OMP_SIMD
-                                        for (int32_t j = 0; j < n; ++j)
-                                        {
-                                            p[j] = r[j] + a * lv[j] * nz[j];
-                                        }
-                                    }
-
-                                    SiftStats ss;
-                                    ++st.attempted;
-                                    const bool lm_ok = lm_computer.compute(tl_perturbed.data, n, tl_local_mean.data, &ss);
-                                    if (reference_path && ss.unsifted)
-                                    {
-                                        // emd.m returned one row, the input itself:
-                                        // ceemdan.m's first stage takes the input
-                                        // minus that row (a local mean of 0), the
-                                        // later stages that row (the input)
-                                        ++st.valid;
-                                        if (k > 0)
-                                        {
-                                            const double *__restrict pin = tl_perturbed.data;
-                                            EEMD_OMP_SIMD
-                                            for (int32_t j = 0; j < n; ++j)
-                                            {
-                                                acc[j] += pin[j];
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    if (lm_ok)
-                                    {
-                                        ++st.valid;
-                                        st.iterations += ss.iterations;
-                                        st.max_iterations = std::max(st.max_iterations, ss.iterations);
-                                        st.nonconverged += ss.converged ? 0 : 1;
-
-                                        const double *__restrict lm = tl_local_mean.data;
-                                        EEMD_OMP_SIMD
-                                        for (int32_t j = 0; j < n; ++j)
-                                        {
-                                            acc[j] += lm[j];
-                                        }
-                                    }
-                                }
-                            }
-                            block_stats[b] = st;
-                        });
-
-                        // =========================================================
-                        // BATCH REDUCTION (block order) AND CONVERGENCE CHECK
-                        // Each sample sums its blocks in block order; a short
-                        // reduction is not worth a fork.
-                        // =========================================================
-                        const int32_t reduce_threads =
-                            (static_cast<int64_t>(n) * n_blocks_batch >= (int64_t(1) << 18)) ? n_threads : 1;
-                        threads::for_static(reduce_threads, n, [&](int32_t j_begin, int32_t j_end, int)
-                        {
-                            for (int32_t j = j_begin; j < j_end; ++j)
-                            {
-                                double sum = 0.0;
-                                for (int32_t b = 0; b < n_blocks_batch; ++b)
-                                {
-                                    sum += block_accs[b].data[j];
-                                }
-                                mean_accumulator.data[j] += sum;
-                            }
-                        });
-
-                        for (int32_t b = 0; b < n_blocks_batch; ++b)
-                        {
-                            const BlockStats &st = block_stats[b];
-                            stage_total.valid += st.valid;
-                            stage_total.attempted += st.attempted;
-                            stage_total.iterations += st.iterations;
-                            stage_total.max_iterations = std::max(stage_total.max_iterations, st.max_iterations);
-                            stage_total.nonconverged += st.nonconverged;
-                        }
-
-                        if (batch_end >= base_trials)
-                        {
-                            ensemble_converged = true; // all trials done
-                        }
-                        else if (effective_adaptive &&
-                                 batch_end >= config_.adaptive_min_trials &&
-                                 stage_total.valid > 0)
-                        {
-                            // Relative L2 change of the running mean estimate
-                            const double inv_valid = 1.0 / stage_total.valid;
-                            double diff_sq = 0.0;
-                            double curr_sq = 0.0;
-
-                            for (int32_t j = 0; j < n; ++j)
-                            {
-                                double curr = mean_accumulator.data[j] * inv_valid;
-                                double prev = prev_mean_estimate.data[j];
-                                double d = curr - prev;
-                                diff_sq += d * d;
-                                curr_sq += curr * curr;
-                            }
-
-                            double rel_change = (curr_sq > 1e-20) ? std::sqrt(diff_sq / curr_sq) : 0.0;
-
-                            if (rel_change < config_.adaptive_rel_tol)
-                            {
-                                ensemble_converged = true;
-                            }
-                            else
-                            {
-                                for (int32_t j = 0; j < n; ++j)
-                                {
-                                    prev_mean_estimate.data[j] = mean_accumulator.data[j] * inv_valid;
-                                }
-                            }
-                        }
-
-                        if (ensemble_converged)
-                            break;
-                    } // end batch loop
-
-                    // =========================================================
-                    // FINALIZE IMF (after all batches complete)
-                    // =========================================================
-                    if (stage_total.valid > 0)
-                    {
-                        const double scale = 1.0 / stage_total.valid;
-                        double *__restrict acc = mean_accumulator.data;
-
-                        EEMD_OMP_SIMD
-                        for (int32_t j = 0; j < n; ++j)
-                        {
-                            acc[j] *= scale;
-                        }
-
-                        // Extract IMF
-                        const double *__restrict r = r_current.data;
-                        const double *__restrict m = mean_accumulator.data;
-                        double *__restrict out = imf_storage[actual_imf_count].data;
-
-                        EEMD_OMP_SIMD
-                        for (int32_t j = 0; j < n; ++j)
-                        {
-                            out[j] = r[j] - m[j];
-                        }
-
-                        ++actual_imf_count;
-
-                        // Diagnostics for this IMF
-                        diag.sift_iterations.push_back(stage_total.max_iterations);
-                        diag.mean_sift_iterations.push_back(
-                            static_cast<double>(stage_total.iterations) / stage_total.valid);
-                        diag.nonconverged_trials.push_back(stage_total.nonconverged);
-                        diag.convergence_flags.push_back(stage_total.nonconverged == 0);
-                        diag.trials_per_imf.push_back(stage_total.valid);
-
-                        // Update residue
-                        std::memcpy(r_current.data, mean_accumulator.data, n * sizeof(double));
-
-                        decay_factor *= config_.noise_decay;
-
-                        // Check stopping criteria
-                        if (reference_path)
-                        {
-                            // ceemdan.m goes on while emd(r, 'MAXMODES', 1) gives a
-                            // mode and a residue: r has enough extrema and is not
-                            // already a mode as it stands
-                            if (!stop_test.sifting_needed(r_current.data, n))
-                                stop_decomposition = true;
-                        }
-                        else if (is_monotonic(r_current.data, n, config_.monotonic_threshold) ||
-                                 count_extrema(r_current.data, n) < config_.min_extrema)
-                        {
-                            stop_decomposition = true;
-                        }
-                    }
-                    else
-                    {
-                        stop_decomposition = true;
-                    }
-                } // end IMF loop
-            } // the per-thread resources end here
-
-            // Copy to output
-            imfs.resize(actual_imf_count);
-            for (int32_t k = 0; k < actual_imf_count; ++k)
-            {
-                imfs[k].resize(n);
-                std::memcpy(imfs[k].data(), imf_storage[k].data, n * sizeof(double));
+                return bank_.circular ? d_.circular_bank_.get_noise_slice(trial, imf)
+                                      : d_.standard_bank_.get_noise_imf(trial, imf);
             }
 
-            residue.resize(n);
-            std::memcpy(residue.data(), r_current.data, n * sizeof(double));
+            /** Stage k_: its accumulators reset and its noise amplitude; or the end. */
+            void begin_stage()
+            {
+                finished_ = stop_ || k_ >= c_.max_imfs;
+                if (finished_)
+                    return;
+                batch_end_ = 0;
+                stage_total_ = BlockStats();
+                mean_acc_.zero();
+                prev_mean_.zero();
 
-            diag.orthogonality_index = orthogonality_index(imf_storage.data(), actual_imf_count, n);
-            diag.valid = true;
+                // beta_k = eps * std(r_k) for k >= 1; for k = 0 the
+                // per-trial factor std(x) / std(E_1(w)) is applied in block()
+                stage_scale_ = (k_ == 0)
+                                   ? decay_factor_ * c_.noise_std * signal_sample_std_
+                                   : decay_factor_ * c_.noise_std * compute_sample_std(r_current_.data, n_);
+            }
+
+            /** The stage's IMF and residue, whether to go on, and the next stage. */
+            void end_stage(LocalMeanComputer &stop_test)
+            {
+                const int32_t n = n_;
+                if (stage_total_.valid > 0)
+                {
+                    const double scale = 1.0 / stage_total_.valid;
+                    double *__restrict acc = mean_acc_.data;
+
+                    EEMD_OMP_SIMD
+                    for (int32_t j = 0; j < n; ++j)
+                    {
+                        acc[j] *= scale;
+                    }
+
+                    // Extract IMF
+                    const double *__restrict r = r_current_.data;
+                    const double *__restrict m = mean_acc_.data;
+                    double *__restrict out = imf_storage_[actual_imf_count_].data;
+
+                    EEMD_OMP_SIMD
+                    for (int32_t j = 0; j < n; ++j)
+                    {
+                        out[j] = r[j] - m[j];
+                    }
+
+                    ++actual_imf_count_;
+
+                    // Diagnostics for this IMF
+                    DecompositionDiagnostics &diag = *diag_;
+                    diag.sift_iterations.push_back(stage_total_.max_iterations);
+                    diag.mean_sift_iterations.push_back(
+                        static_cast<double>(stage_total_.iterations) / stage_total_.valid);
+                    diag.nonconverged_trials.push_back(stage_total_.nonconverged);
+                    diag.convergence_flags.push_back(stage_total_.nonconverged == 0);
+                    diag.trials_per_imf.push_back(stage_total_.valid);
+
+                    // Update residue
+                    std::memcpy(r_current_.data, mean_acc_.data, n * sizeof(double));
+
+                    decay_factor_ *= c_.noise_decay;
+
+                    // Check stopping criteria
+                    if (reference_path_)
+                    {
+                        // ceemdan.m goes on while emd(r, 'MAXMODES', 1) gives a
+                        // mode and a residue: r has enough extrema and is not
+                        // already a mode as it stands
+                        if (!stop_test.sifting_needed(r_current_.data, n))
+                            stop_ = true;
+                    }
+                    else if (is_monotonic(r_current_.data, n, c_.monotonic_threshold) ||
+                             count_extrema(r_current_.data, n) < c_.min_extrema)
+                    {
+                        stop_ = true;
+                    }
+                }
+                else
+                {
+                    stop_ = true;
+                }
+                ++k_;
+                begin_stage();
+            }
+
+            const ICEEMDAN &d_;
+            const ICEEMDANConfig &c_;
+            const BankUse bank_;
+            const int32_t n_;
+            const int32_t base_trials_;
+            // The published algorithm (Rilling stop rule, sifted local means)
+            // follows the authors' ceemdan.m also where the paper leaves
+            // details open: a trial whose input is not sifted at all, and when
+            // the decomposition stops (end_stage())
+            const bool reference_path_;
+            const bool adaptive_;
+            int32_t block_trials_ = 4;
+
+            AlignedBuffer<double> signal_clean_;
+            AlignedBuffer<double> local_vol_;
+            AlignedBuffer<double> r_current_;
+            AlignedBuffer<double> mean_acc_;
+            AlignedBuffer<double> prev_mean_; // adaptive ensemble: the last estimate
+            std::vector<AlignedBuffer<double>> imf_storage_;
+            std::vector<AlignedBuffer<double>> block_accs_;
+            std::vector<BlockStats> block_stats_;
+
+            DecompositionDiagnostics *diag_ = nullptr;
+            bool use_scalar_vol_ = true;
+            double signal_std_ = 0.0;
+            double signal_sample_std_ = 0.0;
+            double decay_factor_ = 1.0;
+            double stage_scale_ = 0.0;
+            int32_t k_ = 0;
+            int32_t actual_imf_count_ = 0;
+            bool stop_ = false;
+            bool finished_ = true;
+            int32_t batch_start_ = 0;
+            int32_t batch_end_ = 0;
+            int32_t n_blocks_ = 0;
+            BlockStats stage_total_;
+        };
+
+        /** One signal's decomposition, its trials forked to the library's threads. */
+        EEMD_NOINLINE bool run(
+            const double *signal,
+            int32_t n,
+            const BankUse &bank,
+            std::vector<std::vector<double>> &imfs,
+            std::vector<double> &residue,
+            DecompositionDiagnostics &diag)
+        {
+            SignalRun job(*this, bank, n);
+            job.start(signal, diag);
+            const int32_t n_threads = threads::team_size();
+            reserve_workspaces(n_threads);
+            while (job.next_batch())
+            {
+                // A block goes to whichever thread is free: its sum does
+                // not depend on the thread that computes it
+                threads::for_dynamic(n_threads, job.blocks(), [&](int32_t b, int slot)
+                                     { job.block(b, workspace(slot, n)); });
+
+                // Each sample sums its blocks in block order; a short
+                // reduction is not worth a fork
+                const int32_t reduce_threads =
+                    (static_cast<int64_t>(n) * job.blocks() >= (int64_t(1) << 18)) ? n_threads : 1;
+                threads::for_static(reduce_threads, n, [&](int32_t j_begin, int32_t j_end, int)
+                                    { job.reduce(j_begin, j_end); });
+
+                job.end_batch(workspace(0, n).lm_computer); // the stop test, on this thread
+            }
+            job.finish(imfs, residue);
             return true;
+        }
+
+        /**
+         * decompose_batch() on team threads, the signals' trials interleaved.
+         * A thread takes the next block of trials of the signal it started;
+         * when that has none to hand out, it starts the next signal; when
+         * all are started, it takes a block of the earliest signal that has
+         * one. The thread that completes a batch's last block adds the blocks
+         * up and sets up that signal's next batch. So while there are signals
+         * to start each thread works on its own, and no thread waits while
+         * another signal has trials left: the last signals' trials are spread
+         * over all the threads.
+         */
+        void run_interleaved(const double *signals, int32_t count, int32_t n, const BankUse &bank, int team,
+                             std::vector<std::vector<std::vector<double>>> &imfs,
+                             std::vector<std::vector<double>> &residues,
+                             std::vector<DecompositionDiagnostics> &diags)
+        {
+            struct Flight // a signal being decomposed
+            {
+                std::unique_ptr<SignalRun> job; // made on first use, then reused
+                int32_t signal = -1;            // -1: free
+                bool open = false;              // the current batch's blocks are handed out
+                int32_t claimed = 0;            // blocks of the batch handed out
+                int32_t done = 0;               // ... and completed
+            };
+            std::vector<Flight> flights(static_cast<size_t>(std::min<int32_t>(count, team)));
+            reserve_workspaces(team);
+
+            std::mutex m; // guards the flights' signal, open, claimed, done; next_signal; finished; error
+            std::condition_variable wake;
+            int32_t next_signal = 0;
+            int32_t finished = 0;
+            std::exception_ptr error;
+
+            // The flight's next batch with blocks (true), or its result handed in (false)
+            const auto advance = [&](Flight &f, int slot) -> bool
+            {
+                for (;;)
+                {
+                    if (!f.job->next_batch())
+                    {
+                        f.job->finish(imfs[f.signal], residues[f.signal]);
+                        return false;
+                    }
+                    if (f.job->blocks() > 0)
+                        return true;
+                    f.job->reduce(0, n);
+                    f.job->end_batch(workspace(slot, n).lm_computer);
+                }
+            };
+
+            threads::run(team, [&](int slot)
+            {
+                // The signal this thread started: its blocks come first, so
+                // that while there are signals to start each thread mostly
+                // works on its own; the others' blocks once there are none
+                Flight *mine = nullptr;
+                int32_t mine_signal = -1;
+                std::unique_lock<std::mutex> lock(m);
+                while (!error && finished < count)
+                {
+                    const auto has_block = [](const Flight *c)
+                    { return c && c->open && c->claimed < c->job->blocks(); };
+                    Flight *f = (has_block(mine) && mine->signal == mine_signal) ? mine : nullptr;
+                    Flight *fresh = nullptr; // else a free flight for the next signal
+                    if (!f && next_signal < count)
+                        for (Flight &c : flights)
+                            if (c.signal < 0)
+                            {
+                                fresh = &c;
+                                break;
+                            }
+                    if (!f && !fresh) // else a block of the earliest signal that has one
+                        for (Flight &c : flights)
+                            if (has_block(&c) && (!f || c.signal < f->signal))
+                                f = &c;
+                    if (!f && !fresh)
+                    {
+                        wake.wait(lock); // every block handed out: wait for a batch or a free flight
+                        continue;
+                    }
+                    try
+                    {
+                        bool open;
+                        if (f)
+                        {
+                            const int32_t b = f->claimed++;
+                            lock.unlock();
+                            f->job->block(b, workspace(slot, n));
+                            lock.lock();
+                            if (++f->done < f->job->blocks())
+                                continue;
+                            // the batch's last block: its sum and the signal's next step, here
+                            f->open = false;
+                            lock.unlock();
+                            f->job->reduce(0, n);
+                            f->job->end_batch(workspace(slot, n).lm_computer);
+                            open = advance(*f, slot);
+                        }
+                        else
+                        {
+                            f = fresh;
+                            f->signal = next_signal++;
+                            mine = f;
+                            mine_signal = f->signal;
+                            lock.unlock();
+                            if (!f->job)
+                                f->job.reset(new SignalRun(*this, bank, n));
+                            f->job->start(signals + static_cast<size_t>(f->signal) * n, diags[f->signal]);
+                            open = advance(*f, slot);
+                        }
+                        lock.lock();
+                        if (open)
+                        {
+                            f->claimed = 0;
+                            f->done = 0;
+                            f->open = true;
+                        }
+                        else
+                        {
+                            f->signal = -1;
+                            ++finished;
+                        }
+                        wake.notify_all();
+                    }
+                    catch (...)
+                    {
+                        if (!lock.owns_lock())
+                            lock.lock();
+                        if (!error)
+                            error = std::current_exception();
+                        wake.notify_all();
+                    }
+                }
+            });
+            if (error)
+                std::rethrow_exception(error);
         }
 
     public:
@@ -2304,13 +2515,15 @@ namespace eemd
 
         /**
          * Frees the noise bank kept from the last decomposition
-         * (config.keep_noise_bank). The next decomposition builds it again.
+         * (config.keep_noise_bank), and the threads' working memory kept with
+         * it. The next decomposition builds them again.
          */
         void release_noise_bank()
         {
             circular_bank_.release();
             standard_bank_.release();
             bank_valid_ = false;
+            workspaces_.slots.clear();
         }
 
     private:
@@ -2351,6 +2564,8 @@ namespace eemd
         StandardNoiseBank standard_bank_;
         NoiseBankKey bank_key_;
         bool bank_valid_ = false;
+
+        Workspaces workspaces_; // the threads' working memory, kept with the noise bank
     };
 
     // ============================================================================

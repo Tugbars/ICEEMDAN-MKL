@@ -394,8 +394,9 @@ ICEEMDAN_API int iceemdan_get_all_imfs(ICEEMDANHandle *h, double *out)
  * Decompose count signals of n samples each, stored one after another
  * (count x n, row-major): the channels of a recording, or its epochs. Each
  * result is the same, bit for bit, as iceemdan_decompose() gives for that
- * signal alone. The signals share one noise bank and are spread over the
- * library's threads, a whole signal per thread when there are enough of them.
+ * signal alone. The signals share one noise bank, and their trials are
+ * interleaved on the library's threads: a thread that would wait for the end
+ * of one signal's stage takes trials of the next signal instead.
  * The results stay in the handle until the next batch; read them with
  * iceemdan_batch_get() (the single-signal getters keep referring to the last
  * iceemdan_decompose()).

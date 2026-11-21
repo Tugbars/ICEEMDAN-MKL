@@ -540,10 +540,11 @@ class ICEEMDAN:
         recording, or its epochs.
 
         Each result is the same, bit for bit, as decompose() gives for that
-        signal alone. The signals share one noise bank and are spread over
-        the library's threads, a whole signal per thread when there are
-        enough of them, which uses the threads better than decomposing short
-        signals one after another.
+        signal alone. The signals share one noise bank, and their trials are
+        interleaved on the library's threads: a thread that would wait for
+        the end of one signal's stage takes trials of the next signal
+        instead, which uses the threads better than decomposing the signals
+        one after another.
 
         Parameters
         ----------

@@ -1,8 +1,9 @@
 /**
  * Batch benchmark: many channels of one length, decomposed one after another
  * with decompose() (each on all threads) and in one decompose_batch() call
- * (each channel on one thread). The noise bank is built before timing, as it
- * is kept between calls; both give the same results bit for bit.
+ * (the channels' trials interleaved on the threads). The noise bank is built
+ * before timing, as it is kept between calls; both give the same results bit
+ * for bit.
  *
  *   batch_bench [threads]      (default: the library's default thread count)
  *
