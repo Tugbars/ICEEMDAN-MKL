@@ -37,6 +37,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h> // _MM_SET_FLUSH_ZERO_MODE, _MM_SET_DENORMALS_ZERO_MODE
 #endif
+#include "eemd_fft.hpp" // real FFTs: VectorFFT when EEMD_USE_VECTORFFT, else MKL DFTI
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -980,79 +981,39 @@ namespace eemd
     // Hilbert Transform - Instantaneous Frequency
     // ============================================================================
 
+    /**
+     * Hilbert transform y = H{x} (imaginary part of the analytic signal).
+     * Any n >= 1; FFTs through eemd_fft.hpp (VectorFFT or MKL DFTI).
+     */
+    inline bool compute_hilbert_transform(const double *signal, int32_t n, double *hilbert_out)
+    {
+        return fft::hilbert(signal, n, hilbert_out);
+    }
+
+    /**
+     * Instantaneous frequency (cycles per unit of 1/sample_rate) from the
+     * phase increments of the analytic signal x + i H{x}.
+     * inst_freq must hold n values; n >= 3.
+     */
     inline bool compute_instantaneous_frequency(
         const double *imf,
         int32_t n,
         double *inst_freq,
         double sample_rate = 1.0)
     {
-        AlignedBuffer<MKL_Complex16> fft_in(n);
-        AlignedBuffer<MKL_Complex16> fft_out(n);
-        AlignedBuffer<MKL_Complex16> analytic(n);
-
-        for (int32_t i = 0; i < n; ++i)
-        {
-            fft_in[i].real = imf[i];
-            fft_in[i].imag = 0.0;
-        }
-
-        DFTI_DESCRIPTOR_HANDLE desc = nullptr;
-        MKL_LONG status = DftiCreateDescriptor(&desc, DFTI_DOUBLE, DFTI_COMPLEX, 1, n);
-        if (status != DFTI_NO_ERROR)
+        if (n < 3)
             return false;
 
-        DftiSetValue(desc, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-        status = DftiCommitDescriptor(desc);
-        if (status != DFTI_NO_ERROR)
-        {
-            DftiFreeDescriptor(&desc);
-            return false;
-        }
-
-        status = DftiComputeForward(desc, fft_in.data, fft_out.data);
-        if (status != DFTI_NO_ERROR)
-        {
-            DftiFreeDescriptor(&desc);
-            return false;
-        }
-
-        // Hilbert transform
-        analytic[0] = fft_out[0];
-        const int32_t half = n / 2;
-
-        for (int32_t i = 1; i < half; ++i)
-        {
-            analytic[i].real = 2.0 * fft_out[i].real;
-            analytic[i].imag = 2.0 * fft_out[i].imag;
-        }
-
-        if (n % 2 == 0)
-        {
-            analytic[half] = fft_out[half];
-        }
-
-        for (int32_t i = half + 1; i < n; ++i)
-        {
-            analytic[i].real = 0.0;
-            analytic[i].imag = 0.0;
-        }
-
-        status = DftiComputeBackward(desc, analytic.data, fft_in.data);
-        DftiFreeDescriptor(&desc);
-        if (status != DFTI_NO_ERROR)
+        thread_local std::vector<double> h;
+        h.resize(static_cast<size_t>(n));
+        if (!fft::hilbert(imf, n, h.data()))
             return false;
 
-        const double scale = 1.0 / n;
         const double freq_scale = sample_rate / (2.0 * M_PI);
 
         for (int32_t i = 1; i < n - 1; ++i)
         {
-            const double ar = fft_in[i].real * scale;
-            const double ai = fft_in[i].imag * scale;
-            const double ar_next = fft_in[i + 1].real * scale;
-            const double ai_next = fft_in[i + 1].imag * scale;
-
-            double dphase = std::atan2(ai_next, ar_next) - std::atan2(ai, ar);
+            double dphase = std::atan2(h[i + 1], imf[i + 1]) - std::atan2(h[i], imf[i]);
 
             while (dphase > M_PI)
                 dphase -= 2.0 * M_PI;

@@ -1,0 +1,4 @@
+[submodule "third_party/vectorfft"]
+	path = third_party/vectorfft
+	url = https://github.com/Tugbars/VectorFFT.git
+	shallow = true

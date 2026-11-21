@@ -1846,46 +1846,32 @@ namespace eemd
         return std::max(0.0, std::min(1.0, H));
     }
 
+    /**
+     * Normalized spectral entropy of the one-sided power spectrum (bins
+     * 0..n/2) of the mean-removed signal: 0 = a single tone, 1 = flat.
+     */
     inline double compute_spectral_entropy(const double *signal, int32_t n)
     {
         if (n < 4)
             return 1.0;
-
-        AlignedBuffer<MKL_Complex16> fft_in(n);
-        AlignedBuffer<MKL_Complex16> fft_out(n);
 
         double mean = 0.0;
         for (int32_t i = 0; i < n; ++i)
             mean += signal[i];
         mean /= n;
 
+        std::vector<double> centered(n);
         for (int32_t i = 0; i < n; ++i)
-        {
-            fft_in[i].real = signal[i] - mean;
-            fft_in[i].imag = 0.0;
-        }
+            centered[i] = signal[i] - mean;
 
-        DFTI_DESCRIPTOR_HANDLE desc = nullptr;
-        MKL_LONG status = DftiCreateDescriptor(&desc, DFTI_DOUBLE, DFTI_COMPLEX, 1, n);
-        if (status != DFTI_NO_ERROR)
+        const int32_t n_freq = n / 2 + 1;
+        std::vector<double> psd(n_freq);
+        if (!fft::power_spectrum(centered.data(), n, psd.data()))
             return 1.0;
 
-        DftiSetValue(desc, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-        DftiCommitDescriptor(desc);
-        DftiComputeForward(desc, fft_in.data, fft_out.data);
-        DftiFreeDescriptor(&desc);
-
-        int32_t n_freq = n / 2 + 1;
-        std::vector<double> psd(n_freq);
         double total_power = 0.0;
-
         for (int32_t i = 0; i < n_freq; ++i)
-        {
-            double re = fft_out[i].real;
-            double im = fft_out[i].imag;
-            psd[i] = re * re + im * im;
             total_power += psd[i];
-        }
 
         if (total_power < 1e-15)
             return 1.0;
