@@ -2,7 +2,7 @@
 
 **Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise (ICEEMDAN) in C++, with C and Python interfaces.**
 
-It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 24 ms on eight threads.
+It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 7 ms on eight threads, and every further signal of that length in 4 ms.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -60,16 +60,18 @@ The two codes draw different random numbers, so they agree statistically, not sa
 
 Time per decomposition with an ensemble of 100, in the default configuration:
 
-| Signal length | 1 thread | 8 threads |
-|---------------|----------|-----------|
-| 1,024 | 123 ms | 24 ms |
-| 2,048 | 260 ms | 48 ms |
-| 4,096 | 582 ms | 106 ms |
-| 8,192 | 1,530 ms | 275 ms |
+| Signal length | First signal, 1 thread | First signal, 8 threads | Further signals, 1 thread | Further signals, 8 threads |
+|---------------|------------------------|-------------------------|---------------------------|----------------------------|
+| 1,024 | 36 ms | 7.2 ms | 21 ms | 4.1 ms |
+| 2,048 | 77 ms | 15 ms | 42 ms | 7.5 ms |
+| 4,096 | 177 ms | 36 ms | 90 ms | 16 ms |
+| 8,192 | 467 ms | 92 ms | 212 ms | 44 ms |
+
+The first signal of a given length also decomposes the noise of the ensemble. The library keeps that noise, so every further signal of the same length and settings skips the step, with the same result as it would get alone.
 
 Measured on an Intel Core i9-14900KF, threads on the performance cores, built with GCC 16.2; median of 7 runs on a sum of tones. The measurement is described in [`validation/figures/README.md`](validation/figures/README.md).
 
-The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 5 to 15 times faster again: 4.7 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
+The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 7 to 13 times faster again on further signals: 0.5 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
 
 ## Features
 
@@ -80,6 +82,7 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 - **Reproducible**: for a given seed, the same result bit for bit at any number of threads.
 - **Three presets**: Standard, Scientific (no shortcuts, an audit trail) and Finance (Akima splines, noise scaled to the local volatility, causal boundaries, NaN and Inf cleaned from the input).
 - **Envelopes**: cubic (not-a-knot), Akima or linear splines; symmetric, mirrored, autoregressive or linear boundary extension.
+- **Made for batches**: the decomposed noise of the ensemble is kept between calls, so further signals of the same length take about half the time.
 - **Speed options** for when exact agreement with the paper matters less than time, and a memory cap for the noise bank.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
 - **Analysis utilities**: Hilbert transform, instantaneous frequency, spectral entropy.
@@ -88,8 +91,8 @@ The speed options (a simpler stop rule, one envelope mean for each noisy copy, o
 
 - **Three interfaces**: C++17 headers, a C interface built as a shared library, and a Python binding on NumPy arrays.
 - **Multithreaded without OpenMP**: the ensemble runs on the library's own thread pool. The thread count is one setting, and idle threads use no processor.
-- **Little to install**: Intel MKL (splines and random numbers). The FFT library, [VectorFFT](https://github.com/Tugbars/VectorFFT), is downloaded by CMake as a ready-built binary.
-- **Windows and Linux** on x86-64 processors with AVX2; builds with MSVC and GCC (MinGW included), with configurations for Clang and Intel ICX.
+- **Little to install**: Intel MKL (the random numbers, and the Akima and linear envelopes). The FFT library, [VectorFFT](https://github.com/Tugbars/VectorFFT), is downloaded by CMake as a ready-built binary.
+- **Windows and Linux** on x86-64 processors with AVX2. Developed and tested with GCC (MinGW included); it also builds with MSVC, and CMake has configurations for Clang and Intel ICX.
 - **Tested**: regression tests run with `ctest`, and the validation against the authors' code is in the repository.
 
 ## References
@@ -131,5 +134,5 @@ Contributions welcome! Please open an issue or PR.
 
 - Colominas, Schlotthauer and Torres for the ICEEMDAN algorithm and its reference code
 - Rilling, Flandrin and Gonçalves for `emd.m`, whose stop rule and boundary extension the defaults follow
-- Intel MKL for the splines and the random numbers
+- Intel MKL for the random numbers
 - [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs

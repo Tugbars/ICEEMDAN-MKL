@@ -1,7 +1,7 @@
 # The figure and the timings of the main README
 
 These scripts make the figure of the main README (`docs/img/decomposition-*.png`) and measure
-its timing table. Once the authors' code has been run as well, they add its decomposition
+its table of times. Once the authors' code has been run as well, they add its decomposition
 beside the library's in the figure and draw the speed comparison (`docs/img/speed-*.png`).
 
 Requirements: Python 3 with NumPy and Matplotlib, and a build of this repository
@@ -16,7 +16,8 @@ for s in 1 2 3 4 5; do
   ../../../build/figure_tool decompose burst.csv lib_burst_$s.csv --seed $s
 done
 for sig in burst tones_1024 tones_2048 tones_4096 tones_8192; do for t in 1 8; do
-  ../../../build/figure_tool time $sig.csv 7 --threads $t >> lib_times.csv
+  ../../../build/figure_tool time $sig.csv 7 --threads $t           >> lib_times.csv
+  ../../../build/figure_tool time $sig.csv 7 --threads $t --no-keep >> lib_times_first.csv
 done; done
 
 # the authors' code (optional)
@@ -44,6 +45,13 @@ numbers `../compare.py` prints for the authors' code and for this library (see
   validation (8, 32 and 128 cycles on a trend) at four lengths, in the default configuration
   with an ensemble of 100. `figure_tool time` prints `n, threads, median ms, fastest ms, IMFs`;
   when the loop is run more than once, the best median counts.
+- **Two times for each length.** The library keeps the decomposed noise of the ensemble between
+  calls. `lib_times.csv` is timed that way: what every further signal of a length costs.
+  `lib_times_first.csv` is timed with `--no-keep`, which decomposes the noise on every call:
+  what the first signal of a length costs. The first-signal time is the one in the figure and
+  the one set against the authors' code, which decomposes its noise on every call too.
+- **The speed options** of the main README are timed the same way, with
+  `--sd --single --circular` added.
 - **The authors' code** runs with the same settings (noise 0.2, 100 realizations, at most 5000
   sifting iterations, `SNRFlag` 1) and is timed with `tic`/`toc` around `ceemdan`.
 
