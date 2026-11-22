@@ -55,9 +55,9 @@ namespace eemd
     /** Sifting parameters of the Sifted local-mean operator. */
     struct SiftParams
     {
-        int32_t max_iters = 100;
-        double threshold = 0.05; // SD rule: sum(m^2) / sum(h^2)
-        int32_t s_number = 6;    // SD rule: stop after S iterations with a stable extrema count (0 = off)
+        int32_t max_iters = 2000; // as emd.m (MAXITERATIONS)
+        double threshold = 0.05;  // SD rule: sum(m^2) / sum(h^2)
+        int32_t s_number = 6;     // SD rule: stop after S iterations with a stable extrema count (0 = off)
         SiftStopRule rule = SiftStopRule::Rilling;
         RillingThresholds rilling;
     };

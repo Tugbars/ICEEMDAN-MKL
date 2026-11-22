@@ -2,12 +2,28 @@
   "machine": "Intel Core i9-14900KF, performance cores",
   "burst": {
     "library_error": [
-      0.0774,
-      0.0386
+      0.077409,
+      0.038627
     ],
     "reference_error": [
-      0.0765,
-      0.0382
+      0.076503,
+      0.038175
+    ],
+    "fast_error": [
+      0.591055,
+      0.292705
+    ],
+    "library_modes": [
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "reference_modes": [
+      1,
+      1,
+      1
     ],
     "library_first_ms_1_thread": 31.585,
     "library_first_ms_8_threads": 5.302,

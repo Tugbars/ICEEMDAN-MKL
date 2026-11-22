@@ -45,7 +45,7 @@ extern "C"
     int copies;             /**< the noisy copies averaged for this IMF */
     int iterations_max;     /**< the most sifting iterations any copy needed */
     double iterations_mean; /**< their mean over the copies */
-    int unconverged;        /**< the copies that reached the iteration limit (100) before
+    int unconverged;        /**< the copies that reached the iteration limit (2000) before
                                  the stop rule was met; 0 is the normal case */
   } iceemdan_imf_stats_t;
 

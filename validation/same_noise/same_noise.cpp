@@ -1,5 +1,5 @@
 /**
- * The library side of the same-noise comparison (validation/same_noise/README.md):
+ * The library side of the same-noise comparison (validation/README.md):
  * the library and the authors' code decompose the same signal with the same
  * noise realizations, so that what differs is the algorithms, sample by sample.
  *

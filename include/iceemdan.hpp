@@ -84,7 +84,7 @@ namespace iceemdan
         int copies = 0;               ///< the noisy copies averaged for this IMF
         int iterations_max = 0;       ///< the most sifting iterations any copy needed
         double iterations_mean = 0.0; ///< their mean over the copies
-        int unconverged = 0;          ///< the copies that reached the iteration limit (100) before
+        int unconverged = 0;          ///< the copies that reached the iteration limit (2000) before
                                       ///< the stop rule was met; 0 is the normal case
     };
 

@@ -4,8 +4,9 @@
                                   short burst of a higher frequency) decomposed by this library,
                                   beside the authors' reference code when its output is there;
                                   the amplitude of the true components lies underneath
-  accuracy-{light,dark}.png       this library beside the authors' code on the two tests of
-                                  ../compare.py, from the numbers in accuracy.json
+  accuracy-{light,dark}.png       this library beside the authors' code and beside the true
+                                  components, in six panels: the numbers ../compare.py writes
+                                  to accuracy.json, and the burst's from the files below
   speed.svg, speed.png            time per decomposition as a speedup matrix over the reference
                                   code, in the style of VectorFFT's heatmaps (black on white, one
                                   version for both themes; drawn only with the reference times)
@@ -16,8 +17,8 @@ Usage: python make_figures.py <run dir> <image dir> [machine name] [what ran the
 
 The run dir holds, from make_signals.py: burst.csv, burst_truth.csv; from figure_tool:
 lib_burst_<seed>.csv, lib_times.csv (the lines "figure_tool time" prints) and, optional,
-lib_times_first.csv (the same with --no-keep); and, optional, from run_reference.m:
-ref_burst_<seed>.csv and ref_times.csv.
+lib_times_first.csv (the same with --no-keep) and fast_burst_<seed>.csv (the fast option);
+and, optional, from run_reference.m: ref_burst_<seed>.csv and ref_times.csv.
 """
 import csv
 import glob
@@ -30,6 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FixedLocator, NullLocator
 
@@ -37,14 +39,15 @@ run_dir, out_dir = sys.argv[1], sys.argv[2]
 machine = sys.argv[3] if len(sys.argv) > 3 else ""
 reference_runtime = sys.argv[4] if len(sys.argv) > 4 else "GNU Octave"  # what ran the authors' code
 
-# Colours by role: this library is blue, the reference code is neutral ink, text never takes a
-# data colour. Light and dark steps of one palette, checked for contrast on their own surface.
+# Colours by role: this library is blue, its fast option orange (and a diamond), the reference
+# code is neutral ink, text never takes a data colour. Light and dark steps of one palette,
+# checked for contrast on their own surface.
 THEMES = {
     "light": dict(surface="#fcfcfb", ink="#0b0b0b", ink2="#52514e", muted="#898781", grid="#e1e0d9",
-                  axis="#c3c2b7", lib="#2a78d6", ref="#52514e", truth="#e3e2db",
+                  axis="#c3c2b7", lib="#2a78d6", ref="#52514e", truth="#e3e2db", fast="#eb6834",
                   lib_1t="#6da7ec", lib_8t="#1c5cab"),
     "dark": dict(surface="#1a1a19", ink="#f0efec", ink2="#c3c2b7", muted="#898781", grid="#2c2c2a",
-                 axis="#383835", lib="#3987e5", ref="#c3c2b7", truth="#343431",
+                 axis="#383835", lib="#3987e5", ref="#c3c2b7", truth="#343431", fast="#d95926",
                  lib_1t="#256abf", lib_8t="#86b6ef"),
 }
 
@@ -76,7 +79,12 @@ def burst_error(prefix):
         return None
     errors = [[min(np.linalg.norm(m - c) / np.linalg.norm(c) for m in load_modes(p).T) for c in truth.T]
               for p in files]
-    return [round(float(v), 4) for v in np.mean(errors, axis=0)]
+    return [round(float(v), 6) for v in np.mean(errors, axis=0)]
+
+
+def burst_modes(prefix):
+    """Number of IMFs of every seed (the residue not counted)."""
+    return [load_modes(p).shape[1] - 1 for p in sorted(glob.glob(f"{run_dir}/{prefix}_burst_*.csv"))]
 
 
 def read_times(name):
@@ -109,6 +117,9 @@ numbers = {
     "burst": {
         "library_error": burst_error("lib"),
         "reference_error": burst_error("ref"),
+        "fast_error": burst_error("fast"),
+        "library_modes": burst_modes("lib"),
+        "reference_modes": burst_modes("ref"),
         "library_first_ms_1_thread": first_ms.get((1000, 1)),
         "library_first_ms_8_threads": first_ms.get((1000, 8)),
         "library_ms_1_thread": lib_ms.get((1000, 1)),
@@ -341,67 +352,175 @@ def speed_matrix():
 
 
 def accuracy(mode):
-    """Authors' code (an open ring) and this library (a dot) on each item: where the dot sits
-    in the ring, the two agree."""
+    """Six panels in two rows. Against the authors' code: the mean frequency of every mode of
+    white noise, the number of modes, and the authors' code on the library's own noise. Against
+    the true components of three signals: the authors' code (an open ring), this library (a
+    dot: where it sits in the ring, the two agree) and the library's fast option (a diamond)."""
     c = THEMES[mode]
     a = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "accuracy.json")))
-    wn, tones = a["white_noise"], a["tones"]
+    b = numbers["burst"]
 
-    fig, (left, right) = plt.subplots(1, 2, figsize=(10, 3.5), facecolor=c["surface"],
-                                      gridspec_kw=dict(width_ratios=[1.25, 1]))
+    fig, axes = plt.subplots(2, 3, figsize=(10, 6.9), facecolor=c["surface"],
+                             gridspec_kw=dict(width_ratios=[1.05, 1, 1], height_ratios=[1.35, 1]))
 
-    def paired(ax, ref, lib, names):
-        rows = np.arange(len(names))[::-1]  # first item on top
+    def panel(ax, names, title, sub, slots=None):
+        """The rows of a panel, first on top, centred in its slots; returns their heights."""
+        slots = slots or len(names)
+        rows = (slots - 1) / 2 + (len(names) - 1) / 2 - np.arange(len(names))
         style_axes(ax, c)
-        for y, r, v in zip(rows, ref, lib):
-            ax.plot([r, v], [y, y], color=c["axis"], linewidth=1.2, solid_capstyle="round", zorder=1)
-        ax.plot(ref, rows, linestyle="none", marker="o", markersize=11, markerfacecolor=c["surface"],
-                markeredgecolor=c["ref"], markeredgewidth=1.7, label="Authors' code", zorder=2)
-        ax.plot(lib, rows, linestyle="none", marker="o", markersize=6, markerfacecolor=c["lib"],
-                markeredgecolor=c["lib"], label="This library", zorder=3)
-        ax.set_yticks(rows)
-        ax.set_yticklabels(names, color=c["ink"], fontsize=9.5)
-        ax.set_ylim(-0.7, len(names) - 0.3)
-        ax.tick_params(axis="y", length=0, pad=8)
         ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", length=0, pad=6)
+        ax.set_yticks(rows)
+        ax.set_yticklabels(names, color=c["ink"], fontsize=9)
+        ax.set_ylim(-0.7, slots - 0.3)
         ax.grid(axis="x", color=c["grid"], linewidth=0.8)
         ax.set_axisbelow(True)
+        ax.set_title(title, loc="left", color=c["ink"], fontsize=11, fontweight="semibold", pad=22)
+        ax.text(0, 1.035, sub, transform=ax.transAxes, color=c["ink2"], fontsize=8.5, va="bottom")
+        return rows
 
-    # white noise: the modes sit one octave apart
-    paired(left, wn["reference"], wn["library"], [f"IMF {k}" for k in range(1, len(wn["library"]) + 1)])
-    left.set_xscale("log", base=2)
-    ticks = [0.01, 0.02, 0.04, 0.08, 0.16, 0.32]
-    left.xaxis.set_major_locator(FixedLocator(ticks))
-    left.xaxis.set_minor_locator(NullLocator())
-    left.set_xticklabels([f"{v:g}" for v in ticks])
-    left.set_xlim(0.0072, 0.45)
-    left.set_xlabel("mean frequency of the mode, cycles per sample (each step is one octave)", color=c["ink2"],
-                    fontsize=9)
-    left.set_title("White noise", loc="left", color=c["ink"], fontsize=12, fontweight="semibold", pad=24)
-    left.text(0, 1.06, f"the six bands agree within {wn['mean_octave_distance']:g} octave on average",
-              transform=left.transAxes, color=c["ink2"], fontsize=9, va="bottom")
+    def ring(ax, x, y):
+        ax.plot(x, y, linestyle="none", marker="o", markersize=10.5, markerfacecolor=c["surface"],
+                markeredgecolor=c["ref"], markeredgewidth=1.6, zorder=2)
 
-    # tones on a trend: how well one mode holds each tone
-    paired(right, tones["reference"], tones["library"], tones["names"])
-    right.set_xlim(0, 0.41)
-    right.xaxis.set_major_locator(FixedLocator([0, 0.1, 0.2, 0.3, 0.4]))
-    right.set_xticklabels(["0", "0.1", "0.2", "0.3", "0.4"])
-    right.set_xlabel("relative error of the mode nearest the tone", color=c["ink2"], fontsize=9)
-    right.set_title("Three tones on a trend", loc="left", color=c["ink"], fontsize=12, fontweight="semibold", pad=24)
-    gap = max(abs(r - v) for r, v in zip(tones["reference"], tones["library"]))
-    right.text(0, 1.06, f"within {np.ceil(gap * 100) / 100:g} of the authors' code on every tone",
-               transform=right.transAxes, color=c["ink2"], fontsize=9, va="bottom")
+    def dot(ax, x, y):
+        ax.plot(x, y, linestyle="none", marker="o", markersize=5.8, markerfacecolor=c["lib"],
+                markeredgecolor=c["lib"], zorder=4)
 
-    handles, labels = left.get_legend_handles_labels()
-    legend = fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.985, 0.985), frameon=False,
-                        fontsize=9, ncol=2, columnspacing=1.8, handletextpad=0.5, borderaxespad=0)
+    def diamond(ax, x, y):
+        ax.plot(x, y, linestyle="none", marker="D", markersize=5.6, markerfacecolor=c["fast"],
+                markeredgecolor=c["surface"], markeredgewidth=0.9, zorder=3)
+
+    def link(ax, xs, y):
+        xs = [v for v in xs if v is not None]
+        if len(xs) > 1:
+            ax.plot([min(xs), max(xs)], [y, y], color=c["axis"], linewidth=1.1, solid_capstyle="round", zorder=1)
+
+    def label(ax, text):
+        ax.set_xlabel(text, color=c["ink2"], fontsize=8.5)
+
+    no_reference = "the authors' code was not run"
+
+    # white noise: every mode's mean frequency, one octave apart
+    ax = axes[0, 0]
+    wn = a["white_noise"]
+    lib, ref = wn.get("library", []), wn.get("reference", [])
+    k = max(len(lib), len(ref))
+    sub = (f"the {min(len(lib), len(ref))} bands agree within {wn['mean_octave_distance']:g} octave on average"
+           if "mean_octave_distance" in wn else no_reference)
+    rows = panel(ax, [f"IMF {i}" for i in range(1, k + 1)], "White noise: every band", sub)
+    for i in range(min(len(lib), len(ref))):
+        link(ax, [lib[i], ref[i]], rows[i])
+    ring(ax, ref, rows[:len(ref)])
+    dot(ax, lib, rows[:len(lib)])
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_locator(FixedLocator([2.0 ** -e for e in (2, 4, 6, 8, 10)]))
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.set_xticklabels(["1/4", "1/16", "1/64", "1/256", "1/1024"])
+    ax.set_xlim(2.0 ** -11, 0.5)
+    label(ax, "mean frequency of the mode, cycles per sample")
+
+    # how many modes: every count a seed gave
+    ax = axes[0, 1]
+    m = a["modes"]
+    counts = {"Burst\n1,000": (b.get("reference_modes") or [], b.get("library_modes") or [])}
+    for name, text in (("tones", "Tones\n2,048"), ("baseline", "Baseline\n2,048"), ("white noise", "White noise\n4,096")):
+        i = m["names"].index(name)
+        counts[text] = (m["reference"][i] if "reference" in m else [], m["library"][i] if "library" in m else [])
+    if all(r and v for r, v in counts.values()):
+        gap = max(abs(np.mean(r) - np.mean(v)) for r, v in counts.values())
+        sub = ("the same counts as the authors' code" if all(set(r) == set(v) for r, v in counts.values())
+               else f"mean counts within {gap:.1f} of the authors' code")
+    else:
+        sub = "the counts of every seed"
+    rows = panel(ax, list(counts), "Number of modes", sub)
+    for y, (r, v) in zip(rows, counts.values()):
+        r, v = sorted(set(r)), sorted(set(v))
+        link(ax, r + v, y)
+        ring(ax, r, [y] * len(r))
+        dot(ax, v, [y] * len(v))
+    most = max([1] + [max(r + v) for r, v in counts.values() if r + v])
+    ax.set_xlim(0, max(13, most + 1.5))
+    ax.xaxis.set_major_locator(FixedLocator(range(0, int(max(13, most + 1.5)) + 1, 2)))
+    label(ax, "IMFs (the residue not counted)")
+
+    # the authors' code on the library's noise: every mode's largest difference
+    ax = axes[0, 2]
+    same = a.get("same_noise", {"names": [], "difference": []})
+    names = {"burst": "Burst", "sines": "Tones", "baseline": "Baseline", "wn": "White noise"}
+    shown = [s for s in names if s in same["names"]] or list(names)
+    worst = max((max(d) for d in same["difference"]), default=None)
+    if worst is not None:
+        mantissa, exponent = f"{worst:.0e}".split("e")
+        power = str(int(exponent)).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
+        sub = f"no mode differs by more than {mantissa} × 10{power}"
+    else:
+        sub = no_reference
+    rows = panel(ax, [names[s] for s in shown], "Same noise, sample by sample", sub)
+    for y, s in zip(rows, shown):
+        if s in same["names"]:
+            d = np.maximum(same["difference"][same["names"].index(s)], 1e-17)
+            link(ax, list(d), y)
+            ax.plot(d, [y] * len(d), linestyle="none", marker="o", markersize=5.0, markerfacecolor=c["lib"],
+                    markeredgecolor=c["surface"], markeredgewidth=0.8, zorder=3)
+    ax.set_xscale("log")
+    ax.set_xlim(1e-17, 3)
+    ax.xaxis.set_major_locator(FixedLocator([1e-16, 1e-12, 1e-8, 1e-4, 1]))
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.set_xticklabels(["10\u207b\u00b9\u2076", "10\u207b\u00b9\u00b2", "10\u207b\u2078", "10\u207b\u2074", "1"])
+    label(ax, "largest difference of a mode / its peak")
+
+    # known components: how well each is recovered
+    def truth(ax, title, names, lib, ref, fast):
+        pairs = [(r, v) for r, v in zip(ref or [], lib) if r is not None]
+        sub = (f"within {np.ceil(max(abs(r - v) for r, v in pairs) * 100) / 100:g} of the authors' code"
+               if pairs else no_reference)
+        rows = panel(ax, names, title, sub, slots=4)
+        for i, y in enumerate(rows):
+            r = ref[i] if ref else None
+            f = fast[i] if fast else None
+            link(ax, [lib[i], r, f], y)
+            if r is not None:
+                ring(ax, [r], [y])
+            if f is not None:
+                diamond(ax, [f], [y])
+            dot(ax, [lib[i]], [y])
+        ax.set_xscale("log")
+        ax.set_xlim(0.0012, 1.4)
+        ax.xaxis.set_major_locator(FixedLocator([0.01, 0.1, 1]))
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.set_xticklabels(["1 %", "10 %", "100 %"])
+        label(ax, "error of the recovered component")
+
+    truth(axes[1, 0], "A burst on a sinusoid", ["Burst", "Sinusoid"], b["library_error"], b["reference_error"],
+          b.get("fast_error"))
+    tones, base = a["tones"], a["baseline"]
+    truth(axes[1, 1], "Three tones on a trend", ["128 cycles", "32 cycles", "8 cycles", "Trend"], tones["library"],
+          tones.get("reference"), tones.get("fast"))
+    truth(axes[1, 2], "Rhythm on a wandering baseline", ["Rhythm", "Baseline"], base["library"], base.get("reference"),
+          base.get("fast"))
+
+    # the two sections, and the marks named once
+    fig.subplots_adjust(left=0.085, right=0.975, top=0.855, bottom=0.075, wspace=0.46, hspace=0.72)
+    for r, text in ((0, "Against the authors' code"), (1, "Against the true components")):
+        box = axes[r, 0].get_position()
+        fig.text(0.012, box.y1 + (0.082 if r == 0 else 0.09), text, color=c["ink"], fontsize=12.5,
+                 fontweight="semibold", va="bottom")
+    handles = [
+        Line2D([], [], linestyle="none", marker="o", markersize=10.5, markerfacecolor=c["surface"],
+               markeredgecolor=c["ref"], markeredgewidth=1.6, label="Authors' code"),
+        Line2D([], [], linestyle="none", marker="o", markersize=5.8, markerfacecolor=c["lib"],
+               markeredgecolor=c["lib"], label="This library"),
+        Line2D([], [], linestyle="none", marker="D", markersize=5.6, markerfacecolor=c["fast"],
+               markeredgecolor=c["surface"], markeredgewidth=0.9, label="This library, fast option"),
+    ]
+    legend = fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.985, 0.992), frameon=False,
+                        fontsize=9, ncol=3, columnspacing=1.6, handletextpad=0.4, borderaxespad=0)
     for text in legend.get_texts():
         text.set_color(c["ink2"])
 
-    fig.subplots_adjust(left=0.07, right=0.985, top=0.76, bottom=0.17, wspace=0.3)
     fig.savefig(f"{out_dir}/accuracy-{mode}.png", dpi=200, facecolor=c["surface"])
     plt.close(fig)
-
 
 made = []
 for mode in ("light", "dark"):

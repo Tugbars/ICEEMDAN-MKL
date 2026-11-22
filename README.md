@@ -28,33 +28,57 @@ ICEEMDAN averages the *local mean* of each noisy copy instead of its modes. The 
 
 ## Accuracy
 
-The default configuration is the published algorithm as the authors' own code computes it (`ceemdan.m` with `emd.m`, run in GNU Octave), and it agrees with that code at the same settings:
+The default configuration is the published algorithm as the authors' own code computes it (`ceemdan.m` with `emd.m`, run in GNU Octave). Given the same noise, it returns the authors' modes sample by sample. With its own noise it agrees with their code statistically: in the frequency bands, in the number of modes, and in how well the true components of test signals are recovered.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/accuracy-dark.png">
-  <img src="docs/img/accuracy-light.png" width="900" alt="This library beside the authors' code. On white noise the mean frequencies of the first six modes coincide, one octave apart. On three tones on a trend the error of the mode nearest each tone is within 0.03 of the authors' code.">
+  <img src="docs/img/accuracy-light.png" width="900" alt="Six panels. Against the authors' code: on white noise the mean frequencies of the 10 modes, one octave apart, agree within 0.079 octave on average; the number of modes is the same on four signals; and on the same noise no mode of any signal differs from the authors' by more than 5 × 10⁻¹³ of its peak. Against the true components of three signals (a burst on a sinusoid, three tones on a trend, a rhythm on a wandering baseline): the error of this library is within 0.03 of that of the authors' code on every component, and its fast option is further from the truth on 7 of the 8.">
 </picture>
 
 <details>
 <summary>The numbers</summary>
 
-White noise, N = 4096: mean frequency of the first six modes, in cycles per sample.
+The same noise: the authors' code run on this library's noise realizations. Largest difference of any mode from the authors' mode, relative to the mode's peak.
 
-| | IMF 1 | IMF 2 | IMF 3 | IMF 4 | IMF 5 | IMF 6 |
-|---|---|---|---|---|---|---|
-| Authors' code | 0.3421 | 0.1568 | 0.0788 | 0.0422 | 0.0201 | 0.0095 |
-| This library | 0.3422 | 0.1568 | 0.0788 | 0.0422 | 0.0203 | 0.0095 |
+| Signal | Modes, both codes | Largest difference |
+|---|---|---|
+| Burst on a sinusoid | 1 IMF and the residue | 1 × 10⁻¹⁵ |
+| Tones on a trend | 6 IMFs and the residue | 5 × 10⁻¹³ |
+| Rhythm on a wandering baseline | 8 IMFs and the residue | 5 × 10⁻¹⁴ |
+| White noise | 11 IMFs and the residue | 3 × 10⁻¹⁵ |
 
-Tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the mode nearest each tone, edges excluded.
+White noise, N = 4096: mean frequency of every mode, in cycles per sample.
 
-| | 128 cycles | 32 cycles | 8 cycles |
+| | IMF 1 | IMF 2 | IMF 3 | IMF 4 | IMF 5 | IMF 6 | IMF 7 | IMF 8 | IMF 9 | IMF 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Authors' code | 0.3421 | 0.1568 | 0.0788 | 0.0422 | 0.0201 | 0.0095 | 0.0053 | 0.0028 | 0.0020 | 0.0008 |
+| This library | 0.3422 | 0.1568 | 0.0789 | 0.0422 | 0.0203 | 0.0095 | 0.0055 | 0.0027 | 0.0017 | 0.0006 |
+
+Number of IMFs over the seeds (the residue not counted).
+
+| | Authors' code | This library |
+|---|---|---|
+| Burst on a sinusoid, 1,000 | 1 | 1 |
+| Tones on a trend, 2,048 | 6 to 7 | 6 to 7 |
+| Rhythm on a wandering baseline, 2,048 | 7 to 8 | 7 to 8 |
+| White noise, 4,096 | 10 to 11 | 10 to 11 |
+
+True components: relative error of the recovered component, edges excluded.
+
+| | Authors' code | This library | This library, fast option |
 |---|---|---|---|
-| Authors' code | 0.269 | 0.302 | 0.058 |
-| This library | 0.265 | 0.306 | 0.080 |
+| Burst | 7.7 % | 7.7 % | 59.1 % |
+| Sinusoid under the burst | 3.8 % | 3.9 % | 29.3 % |
+| Tone of 128 cycles | 26.9 % | 26.5 % | 41.0 % |
+| Tone of 32 cycles | 30.2 % | 30.6 % | 52.1 % |
+| Tone of 8 cycles | 5.8 % | 8.1 % | 18.0 % |
+| Trend under the tones | 5.8 % | 7.7 % | 7.4 % |
+| Rhythm on the baseline | 5.0 % | 5.5 % | 7.2 % |
+| Wandering baseline | 0.3 % | 0.3 % | 1.0 % |
 
 </details>
 
-The two codes draw different random numbers, so they agree statistically, not sample by sample. The modes and the residue add up to the signal to rounding (2 × 10⁻¹⁶). Method: [`validation/README.md`](validation/README.md).
+With their own random numbers the two codes agree statistically: the first six bands of white noise within 0.005 octave on average, all 10 within 0.079, the last ones varying most because not every seed has them. The modes and the residue add up to the signal to rounding (2 × 10⁻¹⁶). A baseline slower than two cycles is not a single mode; its error is that of the slow modes summed. Method: [`validation/README.md`](validation/README.md).
 
 ## Speed
 
@@ -78,7 +102,7 @@ Intel Core i9-14900KF, threads on the performance cores, built with GCC 16.2; me
 
 </details>
 
-The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 8 to 12 times faster again on further signals: 0.4 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm.
+The speed options (a simpler stop rule, one envelope mean for each noisy copy, one shared noise decomposition) are 8 to 12 times faster again on further signals: 0.4 ms for 1,024 samples on 8 threads. They no longer reproduce the published algorithm: the accuracy figure shows what they give up.
 
 Many signals of one length in one call, such as the channels of a recording, are 1.1 to 1.5 times faster than one call per signal (8 to 128 signals of 1,000 to 4,096 samples, on 8 or 16 threads), with the same results bit for bit. `benchmarks/batch_bench.cpp` measures it.
 

@@ -409,7 +409,7 @@ add_iceemdan_executable(decompose_csv validation/decompose_csv.cpp)
 # Data for the README figures and timings (validation/figures/README.md)
 add_iceemdan_executable(figure_tool validation/figures/figure_tool.cpp)
 
-# The library and the authors' code on the same noise (validation/same_noise/README.md)
+# The library and the authors' code on the same noise (validation/README.md)
 add_iceemdan_executable(same_noise validation/same_noise/same_noise.cpp)
 
 # ============================================================================

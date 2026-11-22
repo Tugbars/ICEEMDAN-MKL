@@ -1,7 +1,7 @@
 % Run the authors' ICEEMDAN (ceemdan.m, with Rilling & Flandrin's emd.m) on
 % the validation signals: noise std 0.2, 100 realizations, MaxIter 5000,
 % SNRFlag 1 (beta_k = eps * std(r_k)), seeds 1..3.
-sigs = {'wn', 'sines'};
+sigs = {'wn', 'sines', 'baseline'};
 for si = 1:numel(sigs)
   x = dlmread([sigs{si} '.csv'])';
   for s = 1:3

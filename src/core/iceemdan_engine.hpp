@@ -43,7 +43,11 @@ namespace eemd
         // the residue needs no sifting, after about log2(N) modes; 32 is a
         // safety net that a signal does not reach in practice.
         int32_t max_imfs = 32;
-        int32_t max_sift_iters = 100;
+        // Sifting iterations at most, for a local mean and for a mode of the
+        // noise: the default of emd.m (MAXITERATIONS), with which the authors'
+        // code decomposes its noise. A safety net: the stop rule ends the
+        // sifting long before (a few hundred iterations at the very most).
+        int32_t max_sift_iters = 2000;
         int32_t ensemble_size = 100;
         // The noise amplitude, the paper's epsilon: beta_k = noise_std * std(r_k)
         double noise_std = 0.2;

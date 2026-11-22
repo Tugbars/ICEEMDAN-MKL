@@ -1,15 +1,224 @@
 {
-  "source": "validation/compare.py: the authors' code run in GNU Octave (3 seeds), this library in its default configuration (5 seeds)",
+  "source": "validation/compare.py: the authors' code run in GNU Octave (3 seeds), this library (5 seeds)",
+  "seeds": {
+    "reference": 3,
+    "library": 5,
+    "fast": 5
+  },
   "white_noise": {
-    "what": "white noise, N = 4096: mean frequency of IMF 1..6 in cycles per sample",
-    "reference": [0.3421, 0.1568, 0.0788, 0.0422, 0.0201, 0.0095],
-    "library": [0.3422, 0.1568, 0.0788, 0.0422, 0.0203, 0.0095],
-    "mean_octave_distance": 0.002
+    "what": "white noise, N = 4096: mean frequency of every mode in cycles per sample (the modes every seed has)",
+    "reference": [
+      0.342089,
+      0.156791,
+      0.078816,
+      0.042195,
+      0.020051,
+      0.009497,
+      0.005306,
+      0.002774,
+      0.001954,
+      0.000846
+    ],
+    "library": [
+      0.342162,
+      0.156835,
+      0.078854,
+      0.042224,
+      0.020349,
+      0.009536,
+      0.005528,
+      0.002731,
+      0.001742,
+      0.000594
+    ],
+    "fast": [
+      0.318372,
+      0.100029,
+      0.038256,
+      0.015494,
+      0.005974,
+      0.002928,
+      0.000766
+    ],
+    "mean_octave_distance": 0.079
   },
   "tones": {
-    "what": "tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the nearest IMF, edges excluded",
-    "names": ["128 cycles", "32 cycles", "8 cycles"],
-    "reference": [0.269, 0.302, 0.058],
-    "library": [0.265, 0.306, 0.080]
+    "what": "tones of 128, 32 and 8 cycles on a trend, N = 2048: relative error of the mode nearest each tone, and of the mode nearest the trend against the trend's own variation; edges excluded",
+    "names": [
+      "128 cycles",
+      "32 cycles",
+      "8 cycles",
+      "trend"
+    ],
+    "reference": [
+      0.268731,
+      0.302216,
+      0.057549,
+      0.057629
+    ],
+    "library": [
+      0.265351,
+      0.306139,
+      0.08064,
+      0.077147
+    ],
+    "fast": [
+      0.409703,
+      0.520551,
+      0.180285,
+      0.07427
+    ]
+  },
+  "baseline": {
+    "what": "a rhythm of 40 cycles on a baseline that wanders and drifts, N = 2048: relative error of the mode nearest the rhythm, and of the slow modes together against the baseline's own variation; edges excluded",
+    "names": [
+      "rhythm",
+      "baseline"
+    ],
+    "reference": [
+      0.050051,
+      0.00343
+    ],
+    "library": [
+      0.054632,
+      0.002962
+    ],
+    "fast": [
+      0.072039,
+      0.010487
+    ]
+  },
+  "modes": {
+    "what": "number of IMFs of every seed, the residue not counted",
+    "names": [
+      "tones",
+      "baseline",
+      "white noise"
+    ],
+    "reference": [
+      [
+        6,
+        6,
+        7
+      ],
+      [
+        7,
+        8,
+        8
+      ],
+      [
+        10,
+        11,
+        11
+      ]
+    ],
+    "library": [
+      [
+        6,
+        7,
+        6,
+        7,
+        6
+      ],
+      [
+        8,
+        7,
+        8,
+        8,
+        7
+      ],
+      [
+        11,
+        11,
+        11,
+        10,
+        10
+      ]
+    ],
+    "fast": [
+      [
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      [
+        6,
+        6,
+        6,
+        6,
+        6
+      ],
+      [
+        7,
+        7,
+        7,
+        7,
+        7
+      ]
+    ]
+  },
+  "completeness": 2.2e-16,
+  "same_noise": {
+    "what": "the authors' code on the library's noise realizations: largest difference of each mode (IMF 1 .., the residue last) from the authors' mode, relative to that mode's peak",
+    "names": [
+      "baseline",
+      "burst",
+      "sines",
+      "wn"
+    ],
+    "difference": [
+      [
+        1.8e-14,
+        3.9e-14,
+        3.2e-14,
+        4.6e-15,
+        4.6e-14,
+        4.8e-14,
+        3.6e-15,
+        6.3e-15,
+        9.9e-16
+      ],
+      [
+        9.4e-16,
+        1.1e-15
+      ],
+      [
+        1.8e-13,
+        4.6e-13,
+        4.2e-13,
+        1.9e-13,
+        1.1e-13,
+        2.9e-14,
+        1.2e-15
+      ],
+      [
+        7.3e-16,
+        1.2e-15,
+        1.4e-15,
+        1.3e-15,
+        2.1e-15,
+        2.1e-15,
+        2.2e-15,
+        1.5e-15,
+        2.5e-15,
+        3e-15,
+        1.5e-15,
+        3.4e-15
+      ]
+    ],
+    "reference_modes": [
+      8,
+      1,
+      6,
+      11
+    ],
+    "library_modes": [
+      8,
+      1,
+      6,
+      11
+    ]
   }
 }

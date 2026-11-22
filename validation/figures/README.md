@@ -15,6 +15,7 @@ python3 ../make_signals.py        # burst.csv, burst_truth.csv, tones_<N>.csv
 # this library: the decompositions of the figure, then the times at 1 and 8 threads
 for s in 1 2 3 4 5; do
   ../../../build/figure_tool decompose burst.csv lib_burst_$s.csv --seed $s
+  ../../../build/figure_tool decompose burst.csv fast_burst_$s.csv --seed $s --sd --single --circular
 done
 for sig in burst tones_1024 tones_2048 tones_4096 tones_8192; do for t in 1 8; do
   ../../../build/figure_tool time $sig.csv 7 --threads $t           >> lib_times.csv
@@ -32,9 +33,10 @@ python3 ../make_figures.py . ../../../docs/img "name of the machine" "GNU Octave
 `make_figures.py` also writes `numbers.json` beside itself: the errors and times it read, which
 are the ones the main README quotes.
 
-The accuracy figure (`docs/img/accuracy-*.png`) is drawn from `accuracy.json`, which holds the
-numbers `../compare.py` prints for the authors' code and for this library (see
-[`../README.md`](../README.md)). After a new validation run, copy its numbers there.
+The accuracy figure (`docs/img/accuracy-*.png`) is drawn from `accuracy.json`, which
+`../compare.py --json` writes after a validation run (see [`../README.md`](../README.md)), and,
+for the burst, from the files of this folder: `ref_burst_*`, `lib_burst_*` and `fast_burst_*`
+(the library's fast option).
 
 ## What is measured
 
@@ -55,9 +57,9 @@ numbers `../compare.py` prints for the authors' code and for this library (see
   the one set against the authors' code, which decomposes its noise on every call too.
 - **The speed options** of the main README are timed the same way, with
   `--sd --single --circular` added.
-- **The authors' code** runs with the same settings (noise 0.2, 100 realizations, at most 5000
-  sifting iterations, `SNRFlag` 1) and is timed with `tic`/`toc` around `ceemdan`, twice per
-  length; the faster run counts. The times of the main README are from GNU Octave 11.3.
+- **The authors' code** runs with the same settings (noise 0.2, 100 realizations, `SNRFlag` 1;
+  at most 5000 sifting iterations, where the library allows 2000 and neither comes near its
+  limit) and is timed with `tic`/`toc` around `ceemdan`, twice per length; the faster run counts. The times of the main README are from GNU Octave 11.3.
 
 The times of the main README were taken on Windows with the process held on the performance
 cores, at high priority, for example:
