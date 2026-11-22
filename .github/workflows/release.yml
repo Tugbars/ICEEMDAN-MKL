@@ -5,8 +5,8 @@
 #
 # The tag must be the version of include/iceemdan.h (v0.9.0-beta for 0.9.0-beta): the package is named after that
 # version, and a tag that is not stops before anything is published. The release takes its title and its text
-# from release/release_notes.md (its first line is the title; @VERSION@ is the tag without its v). A version with
-# a "-" in it (0.9.0-beta) is marked as a pre-release.
+# from release/release_notes.md (its first line is the title; @VERSION@ is the tag without its v). It is an
+# ordinary release, the repository's latest, a beta too: "beta" is in its version and its title, not a flag.
 #
 # The package is built for every x86-64 processor with AVX2 and FMA, tested, and compiled against as a user
 # would, with GCC and with Visual Studio's cl, before it is packed: all of that is the script.
@@ -85,8 +85,6 @@ jobs:
             printf '\nBuilt from %s on %s UTC.\nSHA-256 of the files:\n' "$GITHUB_SHA" "$(date -u '+%Y-%m-%d %H:%M')"
             cat dist/*.sha256
           } > notes.md
-          PRE=""
-          case "$VERSION" in *-*) PRE="--prerelease" ;; esac
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" $PRE --title "$TITLE" --notes-file notes.md
-          gh release edit "$TAG" $PRE --title "$TITLE" --notes-file notes.md
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TITLE" --notes-file notes.md
+          gh release edit "$TAG" --prerelease=false --latest --title "$TITLE" --notes-file notes.md
           gh release upload "$TAG" dist/*.zip dist/*.sha256 --clobber
