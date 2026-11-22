@@ -8,7 +8,7 @@ The library is built for every x86-64 processor with AVX2 and FMA
 libraries, an example, a short guide and the licences:
 
     dist/iceemdan-<version>-windows-x64.zip        (or -linux-x64.tar.gz)
-      include/iceemdan.h, include/iceemdan_diagnostics.h
+      include/iceemdan.h, include/iceemdan_diagnostics.h, include/emd.h
       bin/iceemdan.dll, bin/libvfft*.dll           (Linux: lib/libiceemdan.so, lib/libvfft.so)
       lib/iceemdan.lib                             the import library for Visual Studio
       examples/decompose.c
@@ -48,13 +48,13 @@ def run(cmd, cwd=None, quiet=False):
     return out.stdout
 
 
-HEADERS = ("iceemdan.h", "iceemdan_diagnostics.h")
+HEADERS = ("iceemdan.h", "iceemdan_diagnostics.h", "emd.h")
 
 
 def header_version_and_functions():
     text = "".join(open(os.path.join(ROOT, "include", h), encoding="utf-8").read() for h in HEADERS)
     version = re.search(r'#define ICEEMDAN_VERSION_STRING "([0-9.]+)"', text).group(1)
-    functions = re.findall(r"ICEEMDAN_API\s+[^;(]*?\b(iceemdan_\w+)\s*\(", text)
+    functions = re.findall(r"(?:ICEEMDAN|EMD)_API\s+[^;(]*?\b((?:iceemdan|emd)_\w+)\s*\(", text)
     return version, sorted(set(functions))
 
 

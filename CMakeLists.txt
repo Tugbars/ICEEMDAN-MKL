@@ -298,6 +298,7 @@ add_iceemdan_executable(test_spline tests/test_spline.cpp)
 add_iceemdan_executable(test_rng tests/test_rng.cpp)
 add_iceemdan_executable(test_hht tests/test_hht.cpp)
 add_iceemdan_executable(test_cpp_api tests/test_cpp_api.cpp)
+add_iceemdan_executable(test_emd tests/test_emd.cpp)
 add_iceemdan_executable(cpp_example examples/cpp/decompose.cpp)
 
 enable_testing()
@@ -308,17 +309,17 @@ add_test(NAME spline COMMAND test_spline)
 add_test(NAME rng COMMAND test_rng)
 add_test(NAME hht COMMAND test_hht)
 add_test(NAME cpp_api COMMAND test_cpp_api)
+add_test(NAME emd COMMAND test_emd)
 add_test(NAME cpp_example COMMAND cpp_example)
 
 # --- Test programs run by hand ---
-add_eemd_executable(eemd_test tests/eemd_test.cpp)
 add_iceemdan_executable(accuracy_test tests/iceemdan_accuracy_test.cpp)
 
 # ============================================================================
 # Benchmarks (benchmarks/)
 # ============================================================================
 
-add_eemd_executable(eemd_bench benchmarks/eemd_bench.cpp)
+add_iceemdan_executable(emd_bench benchmarks/emd_bench.cpp)
 add_iceemdan_executable(iceemdan_bench benchmarks/iceemdan_bench.cpp)
 # batch_bench: many channels one by one against one decompose_batch() call
 add_iceemdan_executable(batch_bench benchmarks/batch_bench.cpp)
@@ -493,8 +494,10 @@ install(TARGETS eemd iceemdan
 # The C++ interface (iceemdan.hpp) and the implementation headers it stands on
 install(FILES
     include/iceemdan.hpp
+    include/emd.hpp
     src/core/iceemdan_engine.hpp
-    src/core/eemd.hpp
+    src/core/emd_engine.hpp
+    src/core/eemd_signal.hpp
     src/core/eemd_base.hpp
     src/core/eemd_extrema.hpp
     src/core/eemd_sift.hpp
@@ -516,7 +519,8 @@ install(TARGETS iceemdan_shared
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(FILES include/iceemdan.h include/iceemdan_diagnostics.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/iceemdan.h include/iceemdan_diagnostics.h include/emd.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT iceemdan_targets
     FILE iceemdan-targets.cmake
@@ -533,7 +537,7 @@ message(STATUS "  Version: ${PROJECT_VERSION}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  Portable (AVX2 + FMA, for release binaries): ${ICEEMDAN_PORTABLE}")
 message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")
-message(STATUS "  C++ interface: include/iceemdan.hpp")
-message(STATUS "  C interface: include/iceemdan.h (the shared library iceemdan)")
+message(STATUS "  C++ interfaces: include/iceemdan.hpp, include/emd.hpp")
+message(STATUS "  C interfaces: include/iceemdan.h, include/emd.h (the shared library iceemdan)")
 message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")
 message(STATUS "")

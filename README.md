@@ -86,9 +86,10 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 **The decomposition**
 
-- **ICEEMDAN as published**, by default, computed the way the authors' code computes it: its stop rule for sifting, its boundary extension, cubic spline envelopes, independent noise for every copy. EEMD and plain EMD as well, from C++.
+- **ICEEMDAN as published**, by default, computed the way the authors' code computes it: its stop rule for sifting, its boundary extension, cubic spline envelopes, independent noise for every copy.
+- **EMD and EEMD** as well, in a header of their own: plain EMD by the rules of `emd.m` (Rilling, Flandrin and Gonçalves), the EMD the ICEEMDAN authors' code is built on, and EEMD as the mean of such EMDs of noisy copies.
 - **Complete**: the IMFs and the residue add up to the signal to rounding.
-- **Reproducible**: for a given seed, the same result bit for bit at any number of threads. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
+- **Reproducible**: for a given seed, the same result bit for bit at any number of threads, for ICEEMDAN and EEMD alike. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
 - **Gaps in the data**: NaN and Inf samples are filled in from their neighbours by straight lines, and counted.
 - **Batches and channels**: one call decomposes many signals of one length, such as the channels of an EEG or its epochs, from C++, C and Python. They share one noise bank, and their trials are interleaved on the threads, so no thread waits for the end of one signal's stage; every result is the same, bit for bit, as decomposing that signal alone. The decomposed noise is also kept between calls, so further signals of the same length take half the time or less.
 - **A fast option** for when exact agreement with the paper matters less than time: a simpler stop rule, one envelope mean for each noisy copy and one shared noise decomposition, 8 to 12 times faster.
@@ -98,7 +99,12 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 **The library**
 
-- **Three interfaces**: C++17 headers; a C interface of eight functions in one header ([`include/iceemdan.h`](include/iceemdan.h); example in [`examples/c/decompose.c`](examples/c/decompose.c)), built as a shared library that any language can call; and a Python module on NumPy arrays.
+- **Three interfaces with the same settings and the same results**:
+  - C++17, header-only: [`include/iceemdan.hpp`](include/iceemdan.hpp) (example: [`examples/cpp/decompose.cpp`](examples/cpp/decompose.cpp));
+  - C, eight functions in one header: [`include/iceemdan.h`](include/iceemdan.h) (example: [`examples/c/decompose.c`](examples/c/decompose.c)), built as a shared library that any language can call;
+  - Python, a module on NumPy arrays: [`python/iceemdan.py`](python/iceemdan.py).
+
+  EMD and EEMD have headers of the same shape, [`include/emd.hpp`](include/emd.hpp) and [`include/emd.h`](include/emd.h), and `emd()` and `eemd()` in Python.
 - **Multithreaded without OpenMP**: the ensemble runs on the library's own thread pool. The thread count is one setting, and idle threads use no processor.
 - **Little to install**: a C++17 compiler and CMake. The splines, the noise and the threads are the library's own; the one library it uses, [VectorFFT](https://github.com/Tugbars/VectorFFT) for the FFTs, is downloaded by CMake as a ready-built binary.
 - **Windows and Linux** on x86-64 processors with AVX2. Developed and tested with GCC (MinGW included); it also builds with MSVC, and CMake has configurations for Clang and Intel ICX.

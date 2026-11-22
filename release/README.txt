@@ -11,6 +11,7 @@ In this folder
   include/iceemdan.h     the header your program includes: eight functions, each described there
   include/iceemdan_diagnostics.h
                          extra facts for logs and reports; not needed to decompose a signal
+  include/emd.h          plain EMD and EEMD, six functions of the same shape
   bin/iceemdan.dll       the library
   bin/libvfft.dll, bin/libvfft_avx2.dll, bin/libvfft_avx512.dll
                          the FFT library it uses (VectorFFT)

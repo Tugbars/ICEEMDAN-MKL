@@ -1,10 +1,13 @@
 """
-VectorEMD for Python: ICEEMDAN decomposition and Hilbert-Huang analysis.
+VectorEMD for Python: ICEEMDAN, EEMD and EMD decomposition, and Hilbert-Huang analysis.
 
     import iceemdan
 
     imfs, residue = iceemdan.decompose(signal)             # one signal: imfs (k, n), residue (n,)
     batch = iceemdan.decompose_batch(eeg)                   # (channels, n): batch.imfs, .residues, .num_imfs
+
+    imfs, residue = iceemdan.emd(signal)                    # plain EMD
+    imfs, residue = iceemdan.eemd(signal)                   # EEMD, 100 noisy copies
 
     amplitude, frequency, phase = iceemdan.instantaneous(imfs, sample_rate=250.0)
     hs = iceemdan.hilbert_spectrum(imfs, sample_rate=250.0, fmax=40.0)   # hs.spectrum, .frequencies, .times, .marginal
@@ -14,7 +17,7 @@ VectorEMD for Python: ICEEMDAN decomposition and Hilbert-Huang analysis.
 
 With no arguments the decomposition is ICEEMDAN as published (Colominas et
 al., 2014), computed as the authors' code computes it. The module calls the
-shared library's C interface (include/iceemdan.h).
+shared library's C interfaces (include/iceemdan.h, include/emd.h).
 """
 
 import ctypes
@@ -24,8 +27,8 @@ from typing import Dict, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 
-__all__ = ["ICEEMDAN", "BatchDecomposition", "HilbertSpectrum", "decompose", "decompose_batch", "instantaneous",
-           "mean_frequency", "hilbert_spectrum", "version", "info"]
+__all__ = ["ICEEMDAN", "BatchDecomposition", "HilbertSpectrum", "decompose", "decompose_batch", "emd", "eemd",
+           "instantaneous", "mean_frequency", "hilbert_spectrum", "version", "info"]
 
 
 # ============================================================================
@@ -107,6 +110,11 @@ class _ImfStats(ctypes.Structure):  # iceemdan_imf_stats_t
                 ("unconverged", ctypes.c_int)]
 
 
+class _EmdConfig(ctypes.Structure):  # emd_config_t
+    _fields_ = [("ensemble_size", ctypes.c_int), ("noise", ctypes.c_double), ("max_imfs", ctypes.c_int),
+                ("seed", ctypes.c_uint), ("nthreads", ctypes.c_int)]
+
+
 _FLAG_FAST = 1 << 0
 
 _lib.iceemdan_create.argtypes = [ctypes.POINTER(_Config)]
@@ -130,6 +138,16 @@ _lib.iceemdan_signal_stats.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POI
 _lib.iceemdan_signal_stats.restype = ctypes.c_int
 _lib.iceemdan_imf_stats.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_ImfStats)]
 _lib.iceemdan_imf_stats.restype = ctypes.c_int
+
+
+_lib.emd_create.argtypes = [ctypes.POINTER(_EmdConfig)]
+_lib.emd_create.restype = ctypes.c_void_p
+_lib.emd_decompose.argtypes = [ctypes.c_void_p, _double_p, ctypes.c_int, ctypes.c_int]
+_lib.emd_decompose.restype = ctypes.c_int
+_lib.emd_result.argtypes = [ctypes.c_void_p, _double_p, _double_p, ctypes.POINTER(ctypes.c_int)]
+_lib.emd_result.restype = ctypes.c_int
+_lib.emd_destroy.argtypes = [ctypes.c_void_p]
+_lib.emd_destroy.restype = None
 
 
 def _error() -> str:
@@ -348,6 +366,86 @@ def decompose_batch(signals, **config) -> BatchDecomposition:
     """Decompose many signals of one length, (count, n). Keyword arguments as ICEEMDAN()."""
     with ICEEMDAN(**config) as d:
         return d.decompose_batch(signals)
+
+
+# ============================================================================
+# EMD and EEMD
+# ============================================================================
+
+def _emd_family(signal, config: _EmdConfig):
+    """One signal (n,) -> (imfs, residue); many (count, n) -> BatchDecomposition."""
+    rows = np.ascontiguousarray(signal, dtype=np.float64)
+    one = rows.ndim == 1
+    if one:
+        rows = rows[None, :]
+    if rows.ndim != 2:
+        raise ValueError("signal must be 1D, or 2D: (count, n), one signal per row")
+    count, n = rows.shape
+    if count < 1 or n < 4:
+        raise ValueError("need at least one signal of at least 4 samples")
+    handle = _lib.emd_create(ctypes.byref(config))
+    if not handle:
+        raise ValueError(_error())
+    try:
+        most = _lib.emd_decompose(handle, _ptr(rows), count, n)
+        if most < 0:
+            raise ValueError(_error())
+        imfs = np.zeros((count, most, n))
+        residues = np.zeros((count, n))
+        num_imfs = np.zeros(count, dtype=np.intc)
+        _lib.emd_result(handle, _ptr(imfs), _ptr(residues), num_imfs.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+    finally:
+        _lib.emd_destroy(handle)
+    if one:
+        return imfs[0], residues[0]
+    return BatchDecomposition(imfs, residues, num_imfs.astype(int))
+
+
+def emd(signal, max_imfs: int = 0, threads: int = 0):
+    """
+    Plain EMD (Huang et al., 1998) by the rules of emd.m of Rilling, Flandrin
+    and Goncalves: its stop rule for sifting, cubic spline envelopes, its
+    boundary extension.
+
+    Parameters
+    ----------
+    signal : one signal (n,), or many of one length (count, n), one per row
+    max_imfs : the most IMFs to extract (default: as many as the signal has)
+    threads : the threads a batch runs on (default: every logical processor)
+
+    Returns
+    -------
+    One signal: imfs (k, n) and residue (n,); imfs.sum(axis=0) + residue is
+    the signal. Many: a BatchDecomposition (imfs, residues, num_imfs), each
+    signal as it would be alone.
+    """
+    return _emd_family(signal, _EmdConfig(0, 0.0, int(max_imfs), 0, int(threads)))
+
+
+def eemd(signal, ensemble_size: int = 100, noise: float = 0.0, max_imfs: int = 0, seed: int = 0, threads: int = 0):
+    """
+    EEMD (Wu & Huang, 2009): the mean of the EMDs of the signal with white
+    noise added, a different realization for every copy.
+
+    Parameters
+    ----------
+    signal : one signal (n,), or many of one length (count, n), one per row
+    ensemble_size : the noisy copies averaged (default 100)
+    noise : the standard deviation of the noise, relative to the signal's (default 0.2)
+    max_imfs : the most IMFs to extract (default: as many as the signal has)
+    seed : the seed of the noise (default 42); the same seed gives the same result
+    threads : the threads it runs on (default: every logical processor); the
+        result does not depend on it
+
+    Returns
+    -------
+    One signal: imfs (k, n) and residue (n,). They add up to the signal plus
+    the mean of the noise that was added, which shrinks with the ensemble
+    size (ICEEMDAN, decompose(), adds up exactly). Many: a BatchDecomposition.
+    """
+    if int(ensemble_size) < 1:
+        raise ValueError("ensemble_size must be 1 or more (emd() is the decomposition without noise)")
+    return _emd_family(signal, _EmdConfig(int(ensemble_size), float(noise), int(max_imfs), int(seed), int(threads)))
 
 
 def version() -> str:

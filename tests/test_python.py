@@ -115,6 +115,23 @@ d.close()
 d.close()
 check(raises(ValueError, lambda: d.decompose(x)), "a closed decomposer: ValueError")
 
+print("EMD and EEMD")
+e_imfs, e_res = iceemdan.emd(x)
+check(e_imfs.ndim == 2 and e_imfs.shape[1] == n and np.abs(e_imfs.sum(axis=0) + e_res - x).max() < 1e-10,
+      f"emd(): imfs {e_imfs.shape}; they and the residue add up to the signal")
+e_batch = iceemdan.emd(eeg)
+same = all(np.array_equal(iceemdan.emd(eeg[c])[0], e_batch.imfs[c, :e_batch.num_imfs[c]]) and
+           np.array_equal(iceemdan.emd(eeg[c])[1], e_batch.residues[c]) and not e_batch.imfs[c, e_batch.num_imfs[c]:].any()
+           for c in range(count))
+check(same, "emd() of many signals: every one bit for bit as alone")
+ee_imfs, ee_res = iceemdan.eemd(x, ensemble_size=30)
+gap = np.abs(ee_imfs.sum(axis=0) + ee_res - x).max()
+check(1e-6 < gap < 0.5 and np.array_equal(iceemdan.eemd(x, ensemble_size=30, seed=42, threads=1)[0], ee_imfs) and
+      not np.array_equal(iceemdan.eemd(x, ensemble_size=30, seed=7)[1], ee_res),
+      "eemd(): the same at any thread count, another with another seed")
+check(raises(ValueError, lambda: iceemdan.eemd(x, ensemble_size=0)) and raises(ValueError, lambda: iceemdan.emd(x[:3])) and
+      raises(ValueError, lambda: iceemdan.emd(x, max_imfs=99)), "refused: no ensemble, 3 samples, a setting out of range")
+
 print("Hilbert-Huang analysis")
 fs = 1000.0
 tone_t = np.arange(1000) / fs  # 1 s: 6 and 30 whole cycles

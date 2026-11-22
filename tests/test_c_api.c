@@ -1,8 +1,9 @@
 /*
- * The C interface from C: include/iceemdan.h and include/iceemdan_diagnostics.h
- * compiled as C, against the shared library. Everything a user can call, and
- * every way a call is refused.
+ * The C interfaces from C: include/iceemdan.h, include/iceemdan_diagnostics.h
+ * and include/emd.h compiled as C, against the shared library. Everything a
+ * user can call, and every way a call is refused.
  */
+#include "emd.h"
 #include "iceemdan.h"
 #include "iceemdan_diagnostics.h"
 
@@ -282,6 +283,78 @@ int main(void)
                   iceemdan_instantaneous(NULL, N, fs, amp, NULL, NULL) == -1,
               "refused: fmin above fmax, no IMFs, 1 sample, no sample rate, NULL");
         free(spectrum);
+    }
+
+    printf("EMD and EEMD (emd.h)\n");
+    {
+        emd_info_t facts;
+        check(emd_info(NULL, &facts) == 0 && strcmp(facts.version, ICEEMDAN_VERSION_STRING) == 0 &&
+                  facts.cpu_supported == 1 && facts.processors >= 1,
+              "emd_info(NULL): the same library");
+        emd_t *e = emd_create(NULL);
+        check(e != NULL && emd_info(e, &facts) == 0 && facts.ensemble_size == 0 && facts.nthreads == facts.processors &&
+                  facts.signals == 0,
+              "emd_create(NULL): plain EMD, on every processor");
+        check(emd_result(e, imfs, residue, NULL) == -1 && emd_error()[0] != '\0',
+              "emd_result() before a decomposition: refused, with a reason");
+        const int ke = emd_decompose(e, x, 1, N);
+        check(ke > 0 && ke <= MAX_ROWS && emd_result(e, imfs, residue, NULL) == 0 && emd_error()[0] == '\0' &&
+                  sum_error(x, imfs, residue, ke) < 1e-10,
+              "EMD of one signal: the IMFs and the residue add up to it");
+        check(emd_info(e, &facts) == 0 && facts.signals == 1 && facts.n == N && facts.imfs == ke && facts.repaired == 0,
+              "emd_info(): 1 signal, its length and IMFs");
+
+        const int erows = emd_decompose(e, x, COUNT, N);
+        double *eimfs = malloc(sizeof(double) * COUNT * (erows > 0 ? erows : 1) * N);
+        double *eres = malloc(sizeof(double) * COUNT * N);
+        int ecounts[COUNT];
+        int each = erows > 0 && emd_result(e, eimfs, eres, ecounts) == 0;
+        emd_t *single = emd_create(NULL);
+        for (int c = 0; each && c < COUNT; ++c)
+        {
+            const int kc = emd_decompose(single, x + c * N, 1, N);
+            each = kc == ecounts[c] && emd_result(single, other, other_res, NULL) == 0 &&
+                   memcmp(other, eimfs + (size_t)c * erows * N, sizeof(double) * kc * N) == 0 &&
+                   memcmp(other_res, eres + c * N, sizeof(double) * N) == 0;
+            for (int j = kc; j < erows; ++j)
+                for (int i = 0; i < N; ++i)
+                    each = each && eimfs[((size_t)c * erows + j) * N + i] == 0.0;
+        }
+        check(each, "a batch of 5 channels: every one bit for bit as alone; zeros after its own IMFs");
+        emd_destroy(single);
+        emd_destroy(e);
+        free(eimfs);
+        free(eres);
+
+        emd_config_t ec;
+        memset(&ec, 0, sizeof(ec));
+        ec.ensemble_size = 20;
+        emd_t *ee = emd_create(&ec);
+        const int kk = ee ? emd_decompose(ee, x, 1, N) : -1;
+        const double gap = kk > 0 && emd_result(ee, other, other_res, NULL) == 0 ? sum_error(x, other, other_res, kk) : -1.0;
+        check(kk > 0 && emd_info(ee, &facts) == 0 && facts.ensemble_size == 20 && gap > 1e-6 && gap < 0.5,
+              "ensemble_size 20: EEMD; IMFs + residue = the signal + the mean noise");
+        ec.nthreads = 1;
+        emd_t *ee1 = emd_create(&ec);
+        check(ee1 && emd_decompose(ee1, x, 1, N) == kk && emd_result(ee1, imfs, residue, NULL) == 0 &&
+                  memcmp(imfs, other, sizeof(double) * kk * N) == 0 && memcmp(residue, other_res, sizeof(double) * N) == 0,
+              "nthreads 1: the same result, bit for bit");
+        emd_destroy(ee1);
+        emd_destroy(ee);
+
+        memset(&ec, 0, sizeof(ec));
+        ec.ensemble_size = -1;
+        int refused_emd = emd_create(&ec) == NULL && strstr(emd_error(), "ensemble_size") != NULL;
+        memset(&ec, 0, sizeof(ec));
+        ec.max_imfs = 65;
+        refused_emd = refused_emd && emd_create(&ec) == NULL && strstr(emd_error(), "max_imfs") != NULL;
+        e = emd_create(NULL);
+        refused_emd = refused_emd && emd_decompose(e, x, 1, 3) == -1 && strstr(emd_error(), "samples") != NULL &&
+                      emd_decompose(e, NULL, 1, N) == -1 && emd_decompose(NULL, x, 1, N) == -1 &&
+                      emd_info(e, NULL) == -1;
+        emd_destroy(e);
+        emd_destroy(NULL);
+        check(refused_emd, "refused: a value out of range, 3 samples, NULL");
     }
 
     free(x);

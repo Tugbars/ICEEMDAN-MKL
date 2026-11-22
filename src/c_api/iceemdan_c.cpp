@@ -1,10 +1,11 @@
 /**
- * The C interface: include/iceemdan.h (eight functions) and
- * include/iceemdan_diagnostics.h (two), as a shared library.
+ * The C interfaces as a shared library: include/iceemdan.h (ICEEMDAN and
+ * Hilbert-Huang analysis, eight functions), include/iceemdan_diagnostics.h
+ * (two) and include/emd.h (EMD and EEMD, six).
  *
- * Everything is computed by the C++ interface, include/iceemdan.hpp; a call
- * it refuses with an exception is refused here with -1 or NULL and its text
- * in iceemdan_error(). This file adds what only a ready-built library needs:
+ * Everything is computed by the C++ interfaces, include/iceemdan.hpp and
+ * include/emd.hpp; a call they refuse with an exception is refused here with
+ * -1 or NULL and its text in iceemdan_error() / emd_error(). This file adds what only a ready-built library needs:
  * the check that the processor can run it, and stopping the worker threads
  * when the last decomposer is gone, so that the library can be unloaded.
  * CMake builds it as the shared library "iceemdan" (target iceemdan_shared),
@@ -13,9 +14,11 @@
  */
 
 #define ICEEMDAN_BUILD // export, not import
+#include "emd.h"
 #include "iceemdan.h"
 #include "iceemdan_diagnostics.h"
 
+#include "emd.hpp"
 #include "iceemdan.hpp"
 
 #include <algorithm>
@@ -29,6 +32,7 @@
 // Every definition is extern "C" once more: one that does not match its
 // declaration in the header is then a compile error, not a second function.
 #define ICEEMDAN_EXPORT extern "C" ICEEMDAN_API
+#define EMD_EXPORT extern "C" EMD_API
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define ICEEMDAN_NOINLINE __declspec(noinline)
@@ -421,4 +425,167 @@ ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_spectrum(const double *imfs, int 
     if (!cpu_has_avx2_fma())
         return refuse_processor();
     return spectrum_of(imfs, n_imfs, n, sample_rate, options, spectrum, marginal);
+}
+
+// ============================================================================
+// EMD and EEMD (include/emd.h), on the C++ interface include/emd.hpp
+// ============================================================================
+
+struct emd_s
+{
+    emd::Decomposer decomposer;
+    std::vector<emd::Decomposition> last; // the last decomposition, a signal each; empty: none
+    int n = 0;
+    int rows = 0; // the most IMFs of any signal
+
+    explicit emd_s(const emd::Config &config) : decomposer(config) {}
+};
+
+EMD_EXPORT ICEEMDAN_BASELINE const char *emd_error(void)
+{
+    return t_error;
+}
+
+static ICEEMDAN_NOINLINE emd_t *emd_make(const emd_config_t *config)
+{
+    emd::Config c; // zeros: plain EMD
+    if (config)
+    {
+        c.ensemble_size = config->ensemble_size;
+        c.noise = config->noise;
+        c.max_imfs = config->max_imfs;
+        c.seed = config->seed;
+        c.nthreads = config->nthreads;
+    }
+    try
+    {
+        emd_t *d = new emd_s(c);
+        g_decomposers.fetch_add(1, std::memory_order_relaxed);
+        return d;
+    }
+    catch (...)
+    {
+        return refuse_exception(), nullptr;
+    }
+}
+
+EMD_EXPORT ICEEMDAN_BASELINE emd_t *emd_create(const emd_config_t *config)
+{
+    set_error("");
+    if (!cpu_has_avx2_fma())
+    {
+        refuse_processor();
+        return nullptr;
+    }
+    return emd_make(config);
+}
+
+static ICEEMDAN_NOINLINE void emd_free(emd_t *d)
+{
+    delete d;
+    if (g_decomposers.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        eemd::shutdown_threads();
+}
+
+EMD_EXPORT ICEEMDAN_BASELINE void emd_destroy(emd_t *d)
+{
+    if (d)
+        emd_free(d);
+}
+
+static ICEEMDAN_NOINLINE int emd_run(emd_t *d, const double *signals, int count, int n)
+{
+    try
+    {
+        std::vector<emd::Decomposition> result = d->decomposer.decompose(signals, count, n);
+        size_t rows = 0;
+        for (const emd::Decomposition &r : result)
+            rows = std::max(rows, r.imfs.size());
+        d->last = std::move(result);
+        d->n = n;
+        d->rows = static_cast<int>(rows);
+        return d->rows;
+    }
+    catch (...)
+    {
+        return refuse_exception();
+    }
+}
+
+EMD_EXPORT ICEEMDAN_BASELINE int emd_decompose(emd_t *d, const double *signals, int count, int n)
+{
+    set_error("");
+    return d ? emd_run(d, signals, count, n) : refuse_null();
+}
+
+static ICEEMDAN_NOINLINE int emd_copy(const emd_t *d, double *imfs, double *residues, int *imf_counts)
+{
+    if (d->last.empty())
+        return refuse("the decomposer holds no decomposition: emd_decompose() first");
+    const size_t n = static_cast<size_t>(d->n);
+    const size_t rows = static_cast<size_t>(d->rows);
+    for (size_t s = 0; s < d->last.size(); ++s)
+    {
+        const emd::Decomposition &r = d->last[s];
+        if (imfs)
+        {
+            double *out = imfs + s * rows * n;
+            for (size_t j = 0; j < rows; ++j)
+            {
+                if (j < r.imfs.size())
+                    std::memcpy(out + j * n, r.imfs[j].data(), n * sizeof(double));
+                else
+                    std::memset(out + j * n, 0, n * sizeof(double));
+            }
+        }
+        if (residues)
+            std::memcpy(residues + s * n, r.residue.data(), n * sizeof(double));
+        if (imf_counts)
+            imf_counts[s] = static_cast<int>(r.imfs.size());
+    }
+    return 0;
+}
+
+EMD_EXPORT ICEEMDAN_BASELINE int emd_result(const emd_t *d, double *imfs, double *residues, int *imf_counts)
+{
+    set_error("");
+    return d ? emd_copy(d, imfs, residues, imf_counts) : refuse_null();
+}
+
+static ICEEMDAN_NOINLINE void emd_fill_info(const emd_t *d, emd_info_t *out)
+{
+    out->processors = emd::Decomposer::processors();
+    if (!d)
+        return;
+    out->nthreads = d->decomposer.threads();
+    out->ensemble_size = d->decomposer.ensemble_size();
+    if (d->last.empty())
+        return;
+    out->signals = static_cast<int>(d->last.size());
+    out->n = d->n;
+    out->imfs = d->rows;
+    for (const emd::Decomposition &r : d->last)
+        out->repaired += r.repaired;
+}
+
+EMD_EXPORT ICEEMDAN_BASELINE int emd_info(const emd_t *d, emd_info_t *out)
+{
+    set_error("");
+    if (!out)
+    {
+        set_error("out is NULL");
+        return -1;
+    }
+    out->version = ICEEMDAN_VERSION_STRING;
+    out->cpu_supported = cpu_has_avx2_fma();
+    out->processors = 0;
+    out->nthreads = 0;
+    out->ensemble_size = 0;
+    out->signals = 0;
+    out->n = 0;
+    out->imfs = 0;
+    out->repaired = 0;
+    if (out->cpu_supported)
+        emd_fill_info(d, out);
+    return 0;
 }
