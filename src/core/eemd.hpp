@@ -180,6 +180,10 @@ namespace eemd
         // symmetric extension of emd.m (extend_extrema_symmetric), which stays
         // stable when sifting runs for many iterations.
         bool symmetric_boundary = false;
+
+        // Threads to use: 0 = the process's thread setting (set_num_threads).
+        // The result does not depend on it.
+        int32_t num_threads = 0;
     };
 
     // ============================================================================
@@ -1096,7 +1100,8 @@ namespace eemd
                 bool env_ok[2] = {false, false};
                 if (knots_ok)
                 {
-                    const int env_threads = (n >= envelope_fork_min) ? std::min(2, threads::team_size()) : 1;
+                    const int env_threads =
+                        (n >= envelope_fork_min) ? std::min(2, threads::team_size(config_.num_threads)) : 1;
                     if (env_threads == 1)
                     {
                         env_ok[0] = env_ok[1] =
@@ -1263,7 +1268,7 @@ namespace eemd
             // produces the same result bit for bit. Each trial's noise comes
             // from its own stream (trial_gaussian), so the noise of every
             // trial is the same at any thread count.
-            const int32_t n_threads_used = threads::team_size();
+            const int32_t n_threads_used = threads::team_size(config_.num_threads);
             std::vector<std::vector<AlignedBuffer<double>>> thread_sums(n_threads_used);
             std::vector<int32_t> thread_max_imfs(n_threads_used, 0);
 

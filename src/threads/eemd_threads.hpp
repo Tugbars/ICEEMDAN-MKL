@@ -368,6 +368,18 @@ namespace eemd
             return detail::Pool::inside_team() ? 1 : detail::Pool::instance().setting();
         }
 
+        /**
+         * The same for a caller with a thread count of its own: `requested`
+         * when it is 1 or more, the thread setting when it is 0; 1 inside a
+         * fork either way.
+         */
+        inline int team_size(int requested)
+        {
+            if (detail::Pool::inside_team())
+                return 1;
+            return requested >= 1 ? requested : detail::Pool::instance().setting();
+        }
+
         /** Calls body(slot) for every slot in [0, team), slot 0 on the calling thread. */
         template <class Body>
         void run(int team, Body &&body)

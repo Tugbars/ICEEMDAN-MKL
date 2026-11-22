@@ -1,726 +1,478 @@
 /**
- * The C interface, include/iceemdan.h: what each function does is described
- * there. CMake builds it as the shared library "iceemdan" (target
+ * The C interface: include/iceemdan.h (eight functions) and
+ * include/iceemdan_diagnostics.h (two). What each function does is described
+ * there. CMake builds this file as the shared library "iceemdan" (target
  * iceemdan_shared), linked with VectorFFT, its only dependency. The Python
  * module (python/iceemdan.py) calls the same functions.
  */
 
 #define ICEEMDAN_BUILD // export, not import
 #include "iceemdan.h"
+#include "iceemdan_diagnostics.h"
 
 #include "iceemdan.hpp"
+
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 // Every definition is extern "C" once more: one that does not match its
-// declaration in iceemdan.h is then a compile error, not a second function.
+// declaration in the header is then a compile error, not a second function.
 #define ICEEMDAN_EXPORT extern "C" ICEEMDAN_API
 
-// The setting values of iceemdan.h are those of the C++ enums
-static_assert(ICEEMDAN_STANDARD == static_cast<int>(eemd::ProcessingMode::Standard) &&
-                  ICEEMDAN_FINANCE == static_cast<int>(eemd::ProcessingMode::Finance) &&
-                  ICEEMDAN_SCIENTIFIC == static_cast<int>(eemd::ProcessingMode::Scientific),
-              "presets");
-static_assert(ICEEMDAN_SPLINE_CUBIC == static_cast<int>(eemd::SplineMethod::Cubic) &&
-                  ICEEMDAN_SPLINE_AKIMA == static_cast<int>(eemd::SplineMethod::Akima) &&
-                  ICEEMDAN_SPLINE_LINEAR == static_cast<int>(eemd::SplineMethod::Linear),
-              "splines");
-static_assert(ICEEMDAN_BOUNDARY_MIRROR == static_cast<int>(eemd::BoundaryMethod::Mirror) &&
-                  ICEEMDAN_BOUNDARY_AR == static_cast<int>(eemd::BoundaryMethod::AR) &&
-                  ICEEMDAN_BOUNDARY_LINEAR == static_cast<int>(eemd::BoundaryMethod::Linear) &&
-                  ICEEMDAN_BOUNDARY_SYMMETRIC == static_cast<int>(eemd::BoundaryMethod::Symmetric),
-              "boundaries");
-static_assert(ICEEMDAN_VOLATILITY_GLOBAL == static_cast<int>(eemd::VolatilityMethod::Global) &&
-                  ICEEMDAN_VOLATILITY_SMA == static_cast<int>(eemd::VolatilityMethod::SMA) &&
-                  ICEEMDAN_VOLATILITY_EMA == static_cast<int>(eemd::VolatilityMethod::EMA),
-              "volatility");
-static_assert(ICEEMDAN_LOCAL_MEAN_SIFTED == static_cast<int>(eemd::LocalMeanMethod::Sifted) &&
-                  ICEEMDAN_LOCAL_MEAN_SINGLE_ENVELOPE == static_cast<int>(eemd::LocalMeanMethod::SingleEnvelope),
-              "local mean");
-static_assert(ICEEMDAN_STOP_SD == static_cast<int>(eemd::SiftStopRule::SD) &&
-                  ICEEMDAN_STOP_RILLING == static_cast<int>(eemd::SiftStopRule::Rilling),
-              "stop rules");
+#if defined(_MSC_VER) && !defined(__clang__)
+#define ICEEMDAN_NOINLINE __declspec(noinline)
+#else
+#define ICEEMDAN_NOINLINE __attribute__((noinline))
+#endif
 
 // ============================================================================
-// Opaque handle for ICEEMDAN instance
+// The processor
+//
+// The library is compiled for AVX2 and FMA (ICEEMDAN_PORTABLE; for the build
+// machine otherwise). On an older processor its first such instruction would
+// end the program. What is marked ICEEMDAN_BASELINE is compiled for any
+// x86-64 processor instead: every exported function that can be called
+// without a decomposer starts there, and refuses before anything else runs.
 // ============================================================================
 
-struct ICEEMDANHandle
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#define ICEEMDAN_X86_GNU 1
+#define ICEEMDAN_BASELINE __attribute__((target("arch=x86-64"), noinline))
+#else
+#define ICEEMDAN_BASELINE
+#endif
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
+
+static ICEEMDAN_BASELINE int cpu_has_avx2_fma()
 {
-    eemd::ICEEMDAN *decomposer;
-    std::vector<std::vector<double>> imfs;
-    std::vector<double> residue;
-    eemd::DecompositionDiagnostics diagnostics;
-    // the last iceemdan_decompose_batch()
-    std::vector<std::vector<std::vector<double>>> batch_imfs;
-    std::vector<std::vector<double>> batch_residues;
-    std::vector<eemd::DecompositionDiagnostics> batch_diagnostics;
-    int batch_max_imfs = 0;
-    char error_msg[256];
+#if defined(ICEEMDAN_X86_GNU)
+    // also checks that the operating system saves the AVX registers
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    int r[4];
+    __cpuid(r, 0);
+    if (r[0] < 7)
+        return 0;
+    __cpuid(r, 1);
+    const bool fma = (r[2] >> 12) & 1, osxsave = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1;
+    if (!(fma && osxsave && avx) || (_xgetbv(0) & 6) != 6) // the OS saves the YMM registers
+        return 0;
+    __cpuidex(r, 7, 0);
+    return (r[1] >> 5) & 1; // AVX2
+#else
+    return 1; // not x86: built for the machine it runs on
+#endif
+}
+
+// ============================================================================
+// Why the last call on this thread was refused
+// ============================================================================
+
+static thread_local char t_error[256] = "";
+
+/** Sets the reason; for the baseline functions, so nothing but a byte copy. */
+static ICEEMDAN_BASELINE void set_error(const char *text)
+{
+    size_t i = 0;
+    for (; text[i] != '\0' && i + 1 < sizeof(t_error); ++i)
+        t_error[i] = text[i];
+    t_error[i] = '\0';
+}
+
+static ICEEMDAN_BASELINE int refuse_processor()
+{
+    set_error("this processor has no AVX2 and FMA, which the library is built for (Intel since 2013, AMD since 2015)");
+    return -1;
+}
+
+/** Records the reason and returns -1. */
+static int refuse(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(t_error, sizeof(t_error), format, args);
+    va_end(args);
+    return -1;
+}
+
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE const char *iceemdan_error(void)
+{
+    return t_error;
+}
+
+// ============================================================================
+// A decomposer
+// ============================================================================
+
+struct iceemdan_s
+{
+    eemd::ICEEMDAN decomposer;
+    int nthreads = 1;
+    // the last decomposition; count == 0: none
+    std::vector<std::vector<std::vector<double>>> imfs; // [signal][imf][sample]
+    std::vector<std::vector<double>> residues;
+    std::vector<eemd::DecompositionDiagnostics> diagnostics;
+    int count = 0;
+    int n = 0;
+    int rows = 0; // the most IMFs of any signal
 };
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
+// Decomposers alive: the worker threads stop with the last one, so that the
+// library can be unloaded from a running process
+static std::atomic<int> g_decomposers{0};
 
-ICEEMDAN_EXPORT ICEEMDANHandle *iceemdan_create(int mode)
+/**
+ * This machine's logical processors: the default thread count. Measured on a
+ * hybrid CPU (8 performance and 16 efficiency cores): a batch on all 32 takes
+ * half the time it takes on the 8 performance cores, a single signal the same.
+ */
+static int logical_processors()
 {
+    const int n = static_cast<int>(std::thread::hardware_concurrency());
+    return n >= 1 ? n : 1;
+}
+
+static ICEEMDAN_NOINLINE iceemdan_t *create(const iceemdan_config_t *config)
+{
+    iceemdan_config_t c;
+    std::memset(&c, 0, sizeof(c));
+    if (config)
+        c = *config;
+
+    if (c.ensemble_size < 0)
+        return refuse("ensemble_size %d: 0 (100 copies) or more", c.ensemble_size), nullptr;
+    if (!eemd::is_finite_bits(c.noise) || !(c.noise >= 0.0))
+        return refuse("noise %g: 0 (0.2) or more", c.noise), nullptr;
+    if (c.max_imfs < 0 || c.max_imfs > 64)
+        return refuse("max_imfs %d: 0 (as many as the signal has) to 64", c.max_imfs), nullptr;
+    if (c.nthreads < 0 || c.nthreads > 1024)
+        return refuse("nthreads %d: 0 (every processor) to 1024", c.nthreads), nullptr;
+    if (c.flags & ~static_cast<unsigned>(ICEEMDAN_FLAG_FAST))
+        return refuse("flags 0x%x: unknown flag", c.flags), nullptr;
+
     try
     {
-        auto *handle = new ICEEMDANHandle();
-        eemd::ProcessingMode pm;
-        switch (mode)
+        iceemdan_t *d = new iceemdan_s();
+        eemd::ICEEMDANConfig &k = d->decomposer.config(); // starts as the published algorithm
+        k.ensemble_size = c.ensemble_size > 0 ? c.ensemble_size : 100;
+        k.noise_std = c.noise > 0.0 ? c.noise : 0.2;
+        k.max_imfs = c.max_imfs > 0 ? c.max_imfs : 32;
+        k.rng_seed = c.seed != 0 ? c.seed : 42u;
+        d->nthreads = c.nthreads > 0 ? c.nthreads : logical_processors();
+        k.num_threads = d->nthreads;
+        k.sanitize_input = true; // NaN and Inf filled in; finite samples are left as they are
+        k.keep_noise_bank = true;
+        if (c.flags & ICEEMDAN_FLAG_FAST)
         {
-        case ICEEMDAN_FINANCE:
-            pm = eemd::ProcessingMode::Finance;
-            break;
-        case ICEEMDAN_SCIENTIFIC:
-            pm = eemd::ProcessingMode::Scientific;
-            break;
-        default:
-            pm = eemd::ProcessingMode::Standard;
-            break;
+            k.sift_stop_rule = eemd::SiftStopRule::SD;
+            k.local_mean_method = eemd::LocalMeanMethod::SingleEnvelope;
+            k.use_circular_bank = true;
         }
-        handle->decomposer = new eemd::ICEEMDAN(pm);
-        handle->error_msg[0] = '\0';
-        return handle;
+        g_decomposers.fetch_add(1, std::memory_order_relaxed);
+        return d;
+    }
+    catch (const std::exception &e)
+    {
+        return refuse("no decomposer: %s", e.what()), nullptr;
     }
     catch (...)
     {
+        return refuse("no decomposer: out of memory"), nullptr;
+    }
+}
+
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE iceemdan_t *iceemdan_create(const iceemdan_config_t *config)
+{
+    set_error("");
+    if (!cpu_has_avx2_fma())
+    {
+        refuse_processor();
         return nullptr;
     }
+    return create(config);
 }
 
-/**
- * Destroy ICEEMDAN instance
- */
-ICEEMDAN_EXPORT void iceemdan_destroy(ICEEMDANHandle *handle)
+static ICEEMDAN_BASELINE int refuse_null()
 {
-    if (handle)
-    {
-        delete handle->decomposer;
-        delete handle;
-    }
+    set_error("no decomposer (NULL)");
+    return -1;
 }
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
-ICEEMDAN_EXPORT void iceemdan_set_ensemble_size(ICEEMDANHandle *h, int size)
+static ICEEMDAN_NOINLINE void destroy(iceemdan_t *d)
 {
-    if (h && h->decomposer)
-        h->decomposer->config().ensemble_size = size;
+    delete d;
+    if (g_decomposers.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        eemd::shutdown_threads();
 }
 
-ICEEMDAN_EXPORT void iceemdan_set_noise_std(ICEEMDANHandle *h, double std)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE void iceemdan_destroy(iceemdan_t *d)
 {
-    if (h && h->decomposer)
-        h->decomposer->config().noise_std = std;
+    if (d)
+        destroy(d);
 }
 
-ICEEMDAN_EXPORT void iceemdan_set_max_imfs(ICEEMDANHandle *h, int max_imfs)
+static ICEEMDAN_NOINLINE int decompose(iceemdan_t *d, const double *signals, int count, int n)
 {
-    if (h && h->decomposer)
-        h->decomposer->config().max_imfs = max_imfs;
-}
+    if (!signals)
+        return refuse("signals is NULL");
+    if (count < 1)
+        return refuse("count %d: 1 signal or more", count);
+    if (n < 4)
+        return refuse("n %d: 4 samples or more", n);
 
-ICEEMDAN_EXPORT void iceemdan_set_max_sift_iters(ICEEMDANHandle *h, int iters)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().max_sift_iters = iters;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_sift_threshold(ICEEMDANHandle *h, double thresh)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().sift_threshold = thresh;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_rng_seed(ICEEMDANHandle *h, unsigned int seed)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().rng_seed = seed;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_s_number(ICEEMDANHandle *h, int s)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().s_number = s;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_spline_method(ICEEMDANHandle *h, int method)
-{
-    if (h && h->decomposer)
-    {
-        switch (method)
-        {
-        case ICEEMDAN_SPLINE_AKIMA:
-            h->decomposer->config().spline_method = eemd::SplineMethod::Akima;
-            break;
-        case ICEEMDAN_SPLINE_LINEAR:
-            h->decomposer->config().spline_method = eemd::SplineMethod::Linear;
-            break;
-        default:
-            h->decomposer->config().spline_method = eemd::SplineMethod::Cubic;
-            break;
-        }
-    }
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_volatility_method(ICEEMDANHandle *h, int method)
-{
-    if (h && h->decomposer)
-    {
-        switch (method)
-        {
-        case ICEEMDAN_VOLATILITY_SMA:
-            h->decomposer->config().volatility_method = eemd::VolatilityMethod::SMA;
-            break;
-        case ICEEMDAN_VOLATILITY_EMA:
-            h->decomposer->config().volatility_method = eemd::VolatilityMethod::EMA;
-            break;
-        default:
-            h->decomposer->config().volatility_method = eemd::VolatilityMethod::Global;
-            break;
-        }
-    }
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_boundary_method(ICEEMDANHandle *h, int method)
-{
-    if (h && h->decomposer)
-    {
-        switch (method)
-        {
-        case ICEEMDAN_BOUNDARY_AR:
-            h->decomposer->config().boundary_method = eemd::BoundaryMethod::AR;
-            break;
-        case ICEEMDAN_BOUNDARY_LINEAR:
-            h->decomposer->config().boundary_method = eemd::BoundaryMethod::Linear;
-            break;
-        case ICEEMDAN_BOUNDARY_SYMMETRIC:
-            h->decomposer->config().boundary_method = eemd::BoundaryMethod::Symmetric;
-            break;
-        default:
-            h->decomposer->config().boundary_method = eemd::BoundaryMethod::Mirror;
-            break;
-        }
-    }
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_local_mean_method(ICEEMDANHandle *h, int method)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().local_mean_method = (method == ICEEMDAN_LOCAL_MEAN_SINGLE_ENVELOPE)
-                                                        ? eemd::LocalMeanMethod::SingleEnvelope
-                                                        : eemd::LocalMeanMethod::Sifted;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_stop_rule(ICEEMDANHandle *h, int rule)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().sift_stop_rule =
-            (rule == ICEEMDAN_STOP_SD) ? eemd::SiftStopRule::SD : eemd::SiftStopRule::Rilling;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_antithetic(ICEEMDANHandle *h, int on)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().use_antithetic = on != 0;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_circular_bank(ICEEMDANHandle *h, int on)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().use_circular_bank = on != 0;
-}
-
-ICEEMDAN_EXPORT void iceemdan_set_noise_bank_max_bytes(ICEEMDANHandle *h, size_t bytes)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().noise_bank_max_bytes = bytes;
-}
-
-/**
- * Keep the noise bank between calls (default: 1). The bank is the decomposed
- * noise of the ensemble. It depends on the signal length, the seed, the
- * ensemble size and the sifting settings, not on the signal, so with it kept
- * every further signal of the same length skips building it and gets the same
- * result as before. 0 frees it at the end of each call.
- */
-ICEEMDAN_EXPORT void iceemdan_set_keep_noise_bank(ICEEMDANHandle *h, int keep)
-{
-    if (h && h->decomposer)
-        h->decomposer->config().keep_noise_bank = keep != 0;
-}
-
-/** Free the noise bank kept from the last call. The next call builds it again. */
-ICEEMDAN_EXPORT void iceemdan_release_noise_bank(ICEEMDANHandle *h)
-{
-    if (h && h->decomposer)
-        h->decomposer->release_noise_bank();
-}
-
-// ============================================================================
-// Decomposition
-// ============================================================================
-
-/**
- * Run ICEEMDAN decomposition
- * @param h Handle
- * @param signal Input signal array
- * @param n Signal length
- * @return Number of IMFs extracted (0 on failure)
- */
-ICEEMDAN_EXPORT int iceemdan_decompose(ICEEMDANHandle *h, const double *signal, int n)
-{
-    if (!h || !h->decomposer || !signal || n < 4)
-    {
-        if (h)
-            snprintf(h->error_msg, sizeof(h->error_msg), "Invalid input");
-        return 0;
-    }
-    h->error_msg[0] = '\0';
-
+    d->count = 0; // from here on the earlier result is gone
     try
     {
-        const bool ok = h->decomposer->decompose(signal, n, h->imfs, h->residue);
-        h->diagnostics = h->decomposer->last_diagnostics();
-        if (!ok)
-        {
-            h->imfs.clear();
-            h->residue.clear();
-            snprintf(h->error_msg, sizeof(h->error_msg),
-                     "Decomposition failed (noise bank larger than noise_bank_max_bytes?)");
-            return 0;
-        }
-        return static_cast<int>(h->imfs.size());
+        if (!d->decomposer.decompose_batch(signals, count, n, d->imfs, d->residues, &d->diagnostics))
+            return refuse("the decomposed noise of %d copies of %d samples does not fit in memory: "
+                          "a smaller ensemble_size or shorter signals",
+                          d->decomposer.config().ensemble_size, n);
     }
     catch (const std::exception &e)
     {
-        snprintf(h->error_msg, sizeof(h->error_msg), "%s", e.what());
-        return 0;
+        return refuse("decomposition stopped: %s", e.what());
     }
     catch (...)
     {
-        snprintf(h->error_msg, sizeof(h->error_msg), "Unknown error");
-        return 0;
+        return refuse("decomposition stopped: out of memory");
     }
+    size_t rows = 0;
+    for (const auto &signal_imfs : d->imfs)
+        rows = std::max(rows, signal_imfs.size());
+    d->rows = static_cast<int>(rows);
+    d->n = n;
+    d->count = count;
+    return d->rows;
 }
 
-/**
- * Run ICEEMDAN decomposition with diagnostics
- * @return Number of IMFs extracted (0 on failure)
- */
-ICEEMDAN_EXPORT int iceemdan_decompose_with_diagnostics(ICEEMDANHandle *h, const double *signal, int n)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_decompose(iceemdan_t *d, const double *signals, int count, int n)
 {
-    if (!h || !h->decomposer || !signal || n < 4)
-    {
-        if (h)
-            snprintf(h->error_msg, sizeof(h->error_msg), "Invalid input");
-        return 0;
-    }
-    h->error_msg[0] = '\0';
-
-    try
-    {
-        const bool ok = h->decomposer->decompose_with_diagnostics(signal, n, h->imfs, h->residue, h->diagnostics);
-        if (!ok)
-        {
-            h->imfs.clear();
-            h->residue.clear();
-            snprintf(h->error_msg, sizeof(h->error_msg),
-                     "Decomposition failed (noise bank larger than noise_bank_max_bytes?)");
-            return 0;
-        }
-        return static_cast<int>(h->imfs.size());
-    }
-    catch (const std::exception &e)
-    {
-        snprintf(h->error_msg, sizeof(h->error_msg), "%s", e.what());
-        return 0;
-    }
-    catch (...)
-    {
-        snprintf(h->error_msg, sizeof(h->error_msg), "Unknown error");
-        return 0;
-    }
+    set_error("");
+    return d ? decompose(d, signals, count, n) : refuse_null();
 }
 
-// ============================================================================
-// Result Access
-// ============================================================================
-
-/**
- * Get number of IMFs from last decomposition
- */
-ICEEMDAN_EXPORT int iceemdan_get_num_imfs(const ICEEMDANHandle *h)
+static ICEEMDAN_NOINLINE int result(const iceemdan_t *d, double *imfs, double *residues, int *imf_counts)
 {
-    return h ? static_cast<int>(h->imfs.size()) : 0;
-}
-
-/**
- * Get IMF length (same as input signal length)
- */
-ICEEMDAN_EXPORT int iceemdan_get_imf_length(const ICEEMDANHandle *h)
-{
-    return (h && !h->imfs.empty()) ? static_cast<int>(h->imfs[0].size()) : 0;
-}
-
-/**
- * Copy IMF data to output buffer
- * @param h Handle
- * @param imf_index Which IMF (0 = highest frequency)
- * @param out Output buffer (must be pre-allocated)
- * @return 1 on success, 0 on failure
- */
-ICEEMDAN_EXPORT int iceemdan_get_imf(const ICEEMDANHandle *h, int imf_index, double *out)
-{
-    if (!h || imf_index < 0 || imf_index >= static_cast<int>(h->imfs.size()) || !out)
+    if (d->count == 0)
+        return refuse("the decomposer holds no decomposition: iceemdan_decompose() first");
+    const size_t n = static_cast<size_t>(d->n);
+    const size_t rows = static_cast<size_t>(d->rows);
+    for (size_t s = 0; s < static_cast<size_t>(d->count); ++s)
     {
-        return 0;
-    }
-    std::memcpy(out, h->imfs[imf_index].data(), h->imfs[imf_index].size() * sizeof(double));
-    return 1;
-}
-
-/**
- * Copy residue to output buffer
- * @param h Handle
- * @param out Output buffer (must be pre-allocated)
- * @return 1 on success, 0 on failure
- */
-ICEEMDAN_EXPORT int iceemdan_get_residue(const ICEEMDANHandle *h, double *out)
-{
-    if (!h || h->residue.empty() || !out)
-    {
-        return 0;
-    }
-    std::memcpy(out, h->residue.data(), h->residue.size() * sizeof(double));
-    return 1;
-}
-
-/**
- * Copy all IMFs to a contiguous 2D buffer (row-major: imfs[k][i] -> out[k * n + i])
- * @param h Handle
- * @param out Output buffer (must be pre-allocated: num_imfs * signal_length)
- * @return 1 on success, 0 on failure
- */
-ICEEMDAN_EXPORT int iceemdan_get_all_imfs(const ICEEMDANHandle *h, double *out)
-{
-    if (!h || h->imfs.empty() || !out)
-    {
-        return 0;
-    }
-    const int n = static_cast<int>(h->imfs[0].size());
-    for (size_t k = 0; k < h->imfs.size(); ++k)
-    {
-        std::memcpy(out + k * n, h->imfs[k].data(), n * sizeof(double));
-    }
-    return 1;
-}
-
-// ============================================================================
-// Batches: many signals of one length (channels, epochs) in one call
-// ============================================================================
-
-/**
- * Decompose count signals of n samples each, stored one after another
- * (count x n, row-major): the channels of a recording, or its epochs. Each
- * result is the same, bit for bit, as iceemdan_decompose() gives for that
- * signal alone. The signals share one noise bank, and their trials are
- * interleaved on the library's threads: a thread that would wait for the end
- * of one signal's stage takes trials of the next signal instead.
- * The results stay in the handle until the next batch; read them with
- * iceemdan_batch_get() (the single-signal getters keep referring to the last
- * iceemdan_decompose()).
- * @return the largest number of IMFs of any signal, or 0 on failure (see iceemdan_get_error())
- */
-ICEEMDAN_EXPORT int iceemdan_decompose_batch(ICEEMDANHandle *h, const double *signals, int count, int n)
-{
-    if (!h || !h->decomposer || !signals || count < 1 || n < 4)
-    {
-        if (h)
-            snprintf(h->error_msg, sizeof(h->error_msg), "Invalid input");
-        return 0;
-    }
-    h->error_msg[0] = '\0';
-    try
-    {
-        h->batch_max_imfs = 0;
-        const bool ok = h->decomposer->decompose_batch(signals, count, n, h->batch_imfs, h->batch_residues,
-                                                       &h->batch_diagnostics);
-        if (!ok)
-        {
-            h->batch_imfs.clear();
-            h->batch_residues.clear();
-            snprintf(h->error_msg, sizeof(h->error_msg),
-                     "Batch decomposition failed (noise bank larger than noise_bank_max_bytes?)");
-            return 0;
-        }
-        int most = 0;
-        for (const auto &m : h->batch_imfs)
-            most = std::max(most, static_cast<int>(m.size()));
-        h->batch_max_imfs = most;
-        return most > 0 ? most : 0;
-    }
-    catch (const std::exception &e)
-    {
-        snprintf(h->error_msg, sizeof(h->error_msg), "%s", e.what());
-        return 0;
-    }
-    catch (...)
-    {
-        snprintf(h->error_msg, sizeof(h->error_msg), "Unknown error");
-        return 0;
-    }
-}
-
-/** Signals in the last batch (0 when there is none). */
-ICEEMDAN_EXPORT int iceemdan_batch_count(const ICEEMDANHandle *h)
-{
-    return h ? static_cast<int>(h->batch_residues.size()) : 0;
-}
-
-/** IMFs of signal s of the last batch; -1 when s is out of range. */
-ICEEMDAN_EXPORT int iceemdan_batch_num_imfs(const ICEEMDANHandle *h, int s)
-{
-    if (!h || s < 0 || s >= static_cast<int>(h->batch_imfs.size()))
-        return -1;
-    return static_cast<int>(h->batch_imfs[s].size());
-}
-
-/** Orthogonality index of signal s of the last batch; -1 when s is out of range. */
-ICEEMDAN_EXPORT double iceemdan_batch_orthogonality_index(const ICEEMDANHandle *h, int s)
-{
-    if (!h || s < 0 || s >= static_cast<int>(h->batch_diagnostics.size()))
-        return -1.0;
-    return h->batch_diagnostics[s].orthogonality_index;
-}
-
-/**
- * Copy the last batch out. imfs: count x max_imfs x n (max_imfs as
- * iceemdan_decompose_batch() returned it; a signal with fewer IMFs gets rows
- * of zeros after its own, so its IMFs and residue still add up to it).
- * residues: count x n. Either may be NULL.
- * @return 1, or 0 when there is no batch result
- */
-ICEEMDAN_EXPORT int iceemdan_batch_get(const ICEEMDANHandle *h, double *imfs, double *residues)
-{
-    if (!h || h->batch_residues.empty())
-        return 0;
-    const size_t count = h->batch_residues.size();
-    const size_t n = h->batch_residues[0].size();
-    const size_t k_max = static_cast<size_t>(h->batch_max_imfs);
-    for (size_t s = 0; s < count; ++s)
-    {
+        const auto &own = d->imfs[s];
         if (imfs)
         {
-            double *out = imfs + s * k_max * n;
-            for (size_t k = 0; k < k_max; ++k)
+            double *out = imfs + s * rows * n;
+            for (size_t j = 0; j < rows; ++j)
             {
-                if (k < h->batch_imfs[s].size())
-                    std::memcpy(out + k * n, h->batch_imfs[s][k].data(), n * sizeof(double));
+                if (j < own.size())
+                    std::memcpy(out + j * n, own[j].data(), n * sizeof(double));
                 else
-                    std::memset(out + k * n, 0, n * sizeof(double));
+                    std::memset(out + j * n, 0, n * sizeof(double));
             }
         }
         if (residues)
-            std::memcpy(residues + s * n, h->batch_residues[s].data(), n * sizeof(double));
+            std::memcpy(residues + s * n, d->residues[s].data(), n * sizeof(double));
+        if (imf_counts)
+            imf_counts[s] = static_cast<int>(own.size());
     }
-    return 1;
+    return 0;
+}
+
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_result(const iceemdan_t *d, double *imfs, double *residues,
+                                                       int *imf_counts)
+{
+    set_error("");
+    return d ? result(d, imfs, residues, imf_counts) : refuse_null();
 }
 
 // ============================================================================
-// Diagnostics Access
+// Facts
 // ============================================================================
 
-ICEEMDAN_EXPORT double iceemdan_get_orthogonality_index(const ICEEMDANHandle *h)
+static ICEEMDAN_NOINLINE void fill_info(const iceemdan_t *d, iceemdan_info_t *out)
 {
-    return h ? h->diagnostics.orthogonality_index : -1.0;
+    out->processors = logical_processors();
+    if (!d)
+        return;
+    out->nthreads = d->nthreads;
+    if (d->count == 0)
+        return;
+    out->signals = d->count;
+    out->n = d->n;
+    out->imfs = d->rows;
+    out->noise_kept = d->diagnostics.front().noise_bank_reused ? 1 : 0;
+    out->noise_shared = d->diagnostics.front().noise_bank_multiplier > 0 ? 1 : 0;
+    for (const eemd::DecompositionDiagnostics &g : d->diagnostics)
+        out->repaired += g.nan_count;
 }
 
-ICEEMDAN_EXPORT int iceemdan_get_nan_count(const ICEEMDANHandle *h)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_info(const iceemdan_t *d, iceemdan_info_t *out)
 {
-    return h ? h->diagnostics.nan_count : -1;
-}
-
-ICEEMDAN_EXPORT unsigned int iceemdan_get_rng_seed_used(const ICEEMDANHandle *h)
-{
-    return h ? h->diagnostics.rng_seed_used : 0;
-}
-
-ICEEMDAN_EXPORT int iceemdan_get_valid(const ICEEMDANHandle *h)
-{
-    return h ? (h->diagnostics.valid ? 1 : 0) : 0;
-}
-
-/** 1 when the last decomposition used the noise bank kept from an earlier call. */
-ICEEMDAN_EXPORT int iceemdan_get_noise_bank_reused(const ICEEMDANHandle *h)
-{
-    return h ? (h->diagnostics.noise_bank_reused ? 1 : 0) : 0;
-}
-
-// Per-IMF convergence diagnostics (index 0 = first IMF). -1 / -1.0 when out of range.
-
-static bool iceemdan_valid_imf(const ICEEMDANHandle *h, int k)
-{
-    return h && k >= 0 && k < static_cast<int>(h->diagnostics.sift_iterations.size());
-}
-
-ICEEMDAN_EXPORT int iceemdan_get_imf_sift_iterations(const ICEEMDANHandle *h, int imf_index)
-{
-    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.sift_iterations[imf_index] : -1;
-}
-
-ICEEMDAN_EXPORT double iceemdan_get_imf_mean_sift_iterations(const ICEEMDANHandle *h, int imf_index)
-{
-    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.mean_sift_iterations[imf_index] : -1.0;
-}
-
-ICEEMDAN_EXPORT int iceemdan_get_imf_nonconverged_trials(const ICEEMDANHandle *h, int imf_index)
-{
-    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.nonconverged_trials[imf_index] : -1;
-}
-
-ICEEMDAN_EXPORT int iceemdan_get_imf_trials(const ICEEMDANHandle *h, int imf_index)
-{
-    return iceemdan_valid_imf(h, imf_index) ? h->diagnostics.trials_per_imf[imf_index] : -1;
-}
-
-ICEEMDAN_EXPORT int iceemdan_get_imf_converged(const ICEEMDANHandle *h, int imf_index)
-{
-    return iceemdan_valid_imf(h, imf_index) ? (h->diagnostics.convergence_flags[imf_index] ? 1 : 0) : -1;
-}
-
-ICEEMDAN_EXPORT const char *iceemdan_get_error(const ICEEMDANHandle *h)
-{
-    return h ? h->error_msg : "Null handle";
+    set_error("");
+    if (!out)
+    {
+        set_error("out is NULL");
+        return -1;
+    }
+    out->version = ICEEMDAN_VERSION_STRING;
+    out->cpu_supported = cpu_has_avx2_fma();
+    out->processors = 0;
+    out->nthreads = 0;
+    out->signals = 0;
+    out->n = 0;
+    out->imfs = 0;
+    out->noise_kept = 0;
+    out->noise_shared = 0;
+    out->repaired = 0;
+    if (out->cpu_supported)
+        fill_info(d, out);
+    return 0;
 }
 
 // ============================================================================
-// Utility
+// The audit trail (iceemdan_diagnostics.h)
 // ============================================================================
 
-/**
- * Get library version
- */
-ICEEMDAN_EXPORT const char *iceemdan_version(void)
+static ICEEMDAN_NOINLINE int signal_stats(const iceemdan_t *d, int signal, iceemdan_signal_stats_t *out)
 {
-    return ICEEMDAN_VERSION_STRING;
+    if (!out)
+        return refuse("out is NULL");
+    if (signal < 0 || signal >= d->count)
+        return refuse("signal %d: the last decomposition has %d", signal, d->count);
+    const eemd::DecompositionDiagnostics &g = d->diagnostics[static_cast<size_t>(signal)];
+    out->imfs = static_cast<int>(d->imfs[static_cast<size_t>(signal)].size());
+    out->orthogonality = g.orthogonality_index;
+    out->repaired = g.nan_count;
+    return 0;
 }
 
-/**
- * Name of the FFT backend that transforms length n on the calling thread:
- * "VectorFFT", or "none" for n < 2 (no transform needed) and when VectorFFT
- * could not be loaded. Used by the analysis utilities.
- */
-ICEEMDAN_EXPORT const char *iceemdan_fft_backend(int n)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_signal_stats(const iceemdan_t *d, int signal,
+                                                             iceemdan_signal_stats_t *out)
 {
-    return eemd::fft::backend_name(eemd::fft::backend_for(n));
+    set_error("");
+    return d ? signal_stats(d, signal, out) : refuse_null();
 }
 
-/**
- * Number of threads a decomposition uses, for the whole process (the calling
- * thread included). n < 1: every logical processor, which is also the
- * default unless the environment variable EEMD_NUM_THREADS is set. The
- * results do not depend on it.
- */
-ICEEMDAN_EXPORT void iceemdan_set_num_threads(int n)
+static ICEEMDAN_NOINLINE int imf_stats(const iceemdan_t *d, int signal, int imf, iceemdan_imf_stats_t *out)
 {
-    eemd::set_num_threads(n);
+    if (!out)
+        return refuse("out is NULL");
+    if (signal < 0 || signal >= d->count)
+        return refuse("signal %d: the last decomposition has %d", signal, d->count);
+    const eemd::DecompositionDiagnostics &g = d->diagnostics[static_cast<size_t>(signal)];
+    if (imf < 0 || imf >= static_cast<int>(g.sift_iterations.size()))
+        return refuse("imf %d: signal %d has %d", imf, signal, static_cast<int>(g.sift_iterations.size()));
+    const size_t k = static_cast<size_t>(imf);
+    out->copies = g.trials_per_imf[k];
+    out->iterations_max = g.sift_iterations[k];
+    out->iterations_mean = g.mean_sift_iterations[k];
+    out->unconverged = g.nonconverged_trials[k];
+    return 0;
 }
 
-ICEEMDAN_EXPORT int iceemdan_get_num_threads(void)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_imf_stats(const iceemdan_t *d, int signal, int imf,
+                                                          iceemdan_imf_stats_t *out)
 {
-    return eemd::get_num_threads();
-}
-
-/**
- * Stop the library's worker threads; the next decomposition starts them
- * again. Call it before unloading this library from a running process. It is
- * not needed when the process exits.
- */
-ICEEMDAN_EXPORT void iceemdan_shutdown_threads(void)
-{
-    eemd::shutdown_threads();
+    set_error("");
+    return d ? imf_stats(d, signal, imf, out) : refuse_null();
 }
 
 // ============================================================================
-// Hilbert-Huang analysis of the IMFs (eemd_hht.hpp)
+// Hilbert-Huang analysis (eemd_hht.hpp)
 // ============================================================================
 
-/**
- * Instantaneous attributes of one IMF of n samples (n >= 2) at sample_rate
- * samples per second, from its analytic signal: amplitude, frequency in Hz
- * and phase in radians (unwrapped), n values each. Any output may be NULL.
- * Within a period or two of each end of a non-periodic IMF the values are
- * distorted. Returns 1, or 0 on bad arguments.
- */
-ICEEMDAN_EXPORT int iceemdan_instantaneous(const double *imf, int n, double sample_rate,
-                                        double *amplitude, double *frequency, double *phase)
+static ICEEMDAN_NOINLINE int instantaneous(const double *imf, int n, double sample_rate,
+                                           double *amplitude, double *frequency, double *phase)
 {
-    return eemd::hht::instantaneous(imf, n, sample_rate, amplitude, frequency, phase) ? 1 : 0;
-}
-
-/** Instantaneous frequency of one IMF averaged with its energy as the weight, Hz. */
-ICEEMDAN_EXPORT double iceemdan_mean_frequency(const double *imf, int n, double sample_rate)
-{
-    return eemd::hht::mean_frequency(imf, n, sample_rate);
-}
-
-/** Time columns of a Hilbert spectrum of n samples with time_step samples per column. */
-ICEEMDAN_EXPORT int iceemdan_spectrum_columns(int n, int time_step)
-{
-    eemd::hht::SpectrumOptions opt;
-    opt.time_step = time_step;
-    return eemd::hht::spectrum_columns(n, opt);
-}
-
-/**
- * Hilbert spectrum of n_imfs IMFs of n samples each, stored one after
- * another. spectrum receives frequency_bins rows of
- * iceemdan_spectrum_columns(n, time_step) values (row-major; row b is the
- * bin from fmin + b w to fmin + (b + 1) w, w = (fmax - fmin) / frequency_bins);
- * marginal receives frequency_bins values, each row summed over time. Either
- * may be NULL. At each sample each IMF adds its energy (amplitude squared;
- * its amplitude when amplitude != 0) to the bin of its instantaneous
- * frequency; frequencies outside [fmin, fmax] are left out. fmax <= 0 means
- * sample_rate / 2. Returns 1, or 0 on bad arguments.
- */
-ICEEMDAN_EXPORT int iceemdan_hilbert_spectrum(const double *imfs, int n_imfs, int n, double sample_rate,
-                                           int frequency_bins, double fmin, double fmax, int time_step,
-                                           int amplitude, double *spectrum, double *marginal)
-{
-    if (!imfs || n_imfs < 1)
-        return 0;
-    eemd::hht::SpectrumOptions opt;
-    opt.frequency_bins = frequency_bins;
-    opt.fmin = fmin;
-    opt.fmax = fmax;
-    opt.time_step = time_step;
-    opt.amplitude = amplitude != 0;
+    if (!imf)
+        return refuse("imf is NULL");
+    if (n < 2)
+        return refuse("n %d: 2 samples or more", n);
+    if (!eemd::is_finite_bits(sample_rate) || !(sample_rate > 0.0))
+        return refuse("sample_rate %g: above 0", sample_rate);
     try
     {
-        return eemd::hht::hilbert_spectrum(imfs, n_imfs, n, sample_rate, opt, spectrum, marginal) ? 1 : 0;
+        if (!eemd::hht::instantaneous(imf, n, sample_rate, amplitude, frequency, phase))
+            return refuse("the analytic signal of %d samples could not be computed", n);
     }
-    catch (...)
+    catch (const std::exception &e)
     {
-        return 0;
+        return refuse("instantaneous attributes stopped: %s", e.what());
     }
+    return 0;
 }
 
-/**
- * Compute energy of a signal (sum of squares)
- */
-ICEEMDAN_EXPORT double iceemdan_compute_energy(const double *signal, int n)
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_instantaneous(const double *imf, int n, double sample_rate,
+                                                              double *amplitude, double *frequency, double *phase)
 {
-    double energy = 0.0;
-    for (int i = 0; i < n; ++i)
+    set_error("");
+    if (!cpu_has_avx2_fma())
+        return refuse_processor();
+    return instantaneous(imf, n, sample_rate, amplitude, frequency, phase);
+}
+
+static ICEEMDAN_NOINLINE int spectrum_of(const double *imfs, int n_imfs, int n, double sample_rate,
+                                         const iceemdan_spectrum_t *options, double *spectrum, double *marginal)
+{
+    iceemdan_spectrum_t o;
+    std::memset(&o, 0, sizeof(o));
+    if (options)
+        o = *options;
+    if (!imfs)
+        return refuse("imfs is NULL");
+    if (n_imfs < 1)
+        return refuse("n_imfs %d: 1 IMF or more", n_imfs);
+    if (n < 2)
+        return refuse("n %d: 2 samples or more", n);
+    if (!eemd::is_finite_bits(sample_rate) || !(sample_rate > 0.0))
+        return refuse("sample_rate %g: above 0", sample_rate);
+    if (o.frequency_bins < 0)
+        return refuse("frequency_bins %d: 0 (128) or more", o.frequency_bins);
+    if (o.time_step < 0)
+        return refuse("time_step %d: 0 (every sample) or more", o.time_step);
+    if (!eemd::is_finite_bits(o.fmin) || !eemd::is_finite_bits(o.fmax) || !(o.fmin >= 0.0) || !(o.fmax >= 0.0))
+        return refuse("fmin %g, fmax %g: 0 or more", o.fmin, o.fmax);
+    const double top = o.fmax > 0.0 ? o.fmax : 0.5 * sample_rate;
+    if (!(o.fmin < top))
+        return refuse("fmin %g is not below fmax %g", o.fmin, top);
+
+    eemd::hht::SpectrumOptions opt;
+    opt.frequency_bins = o.frequency_bins > 0 ? o.frequency_bins : 128;
+    opt.fmin = o.fmin;
+    opt.fmax = o.fmax;
+    opt.time_step = o.time_step > 0 ? o.time_step : 1;
+    opt.amplitude = o.amplitude != 0;
+    int done = 0;
+    try
     {
-        energy += signal[i] * signal[i];
+        done = eemd::hht::hilbert_spectrum(imfs, n_imfs, n, sample_rate, opt, spectrum, marginal) ? 1 : 0;
     }
-    return energy;
+    catch (const std::exception &e)
+    {
+        return refuse("the spectrum stopped: %s", e.what());
+    }
+    // a large spectrum uses the worker threads: with no decomposer alive, stop them again
+    if (g_decomposers.load(std::memory_order_acquire) == 0)
+        eemd::shutdown_threads();
+    return done ? 0 : refuse("the spectrum of %d IMFs of %d samples could not be computed", n_imfs, n);
+}
+
+ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_spectrum(const double *imfs, int n_imfs, int n, double sample_rate,
+                                                         const iceemdan_spectrum_t *options, double *spectrum,
+                                                         double *marginal)
+{
+    set_error("");
+    if (!cpu_has_avx2_fma())
+        return refuse_processor();
+    return spectrum_of(imfs, n_imfs, n, sample_rate, options, spectrum, marginal);
 }

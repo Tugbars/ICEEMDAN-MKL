@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
+# The version lives in one place: ICEEMDAN_VERSION_STRING in include/iceemdan.h
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/iceemdan.h" _iceemdan_version_line
+     REGEX "^#define ICEEMDAN_VERSION_STRING ")
+string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+" ICEEMDAN_VERSION "${_iceemdan_version_line}")
+
 project(iceemdan 
-    VERSION 1.0.0
+    VERSION ${ICEEMDAN_VERSION}
     LANGUAGES C CXX
     DESCRIPTION "EEMD and ICEEMDAN (Improved Complete Ensemble EMD with Adaptive Noise)"
 )
@@ -19,13 +24,26 @@ find_package(Threads REQUIRED)
 # Compiler Detection & Flags
 # ============================================================================
 
+# For this machine (the default), or for every x86-64 processor with AVX2 and
+# FMA (Intel since 2013, AMD since 2015): the binaries of a release, which
+# then compute the same numbers on every such processor.
+option(ICEEMDAN_PORTABLE "Build for any x86-64 CPU with AVX2 and FMA instead of this one (binaries to ship)" OFF)
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     message(STATUS "Detected Intel LLVM compiler (ICX)")
     if(WIN32)
-        set(CXX_FLAGS_RELEASE /O3 /QxHost /Qipo /fp:fast /EHsc /DNDEBUG)
+        if(ICEEMDAN_PORTABLE)
+            set(CXX_FLAGS_RELEASE /O3 /QxCORE-AVX2 /Qipo /fp:fast /EHsc /DNDEBUG)
+        else()
+            set(CXX_FLAGS_RELEASE /O3 /QxHost /Qipo /fp:fast /EHsc /DNDEBUG)
+        endif()
         set(CXX_FLAGS_SIMD /Qopenmp-simd)
     else()
-        set(CXX_FLAGS_RELEASE -O3 -xHost -ipo -fp-model fast -DNDEBUG)
+        if(ICEEMDAN_PORTABLE)
+            set(CXX_FLAGS_RELEASE -O3 -xCORE-AVX2 -ipo -fp-model fast -DNDEBUG)
+        else()
+            set(CXX_FLAGS_RELEASE -O3 -xHost -ipo -fp-model fast -DNDEBUG)
+        endif()
         set(CXX_FLAGS_SIMD -qopenmp-simd)
     endif()
     set(USE_IPO TRUE)
@@ -37,7 +55,12 @@ elseif(MSVC)
 
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     message(STATUS "Detected GCC/Clang compiler")
-    set(CXX_FLAGS_RELEASE -O3 -march=native -ffast-math -funroll-loops -flto -DNDEBUG)
+    if(ICEEMDAN_PORTABLE)
+        set(_iceemdan_arch -march=x86-64-v3) # AVX2, FMA, BMI1/2 (GCC 11, Clang 12 and later)
+    else()
+        set(_iceemdan_arch -march=native)
+    endif()
+    set(CXX_FLAGS_RELEASE -O3 ${_iceemdan_arch} -ffast-math -funroll-loops -flto -DNDEBUG)
     set(CXX_FLAGS_SIMD -fopenmp-simd)
     set(USE_IPO TRUE)
 endif()
@@ -399,6 +422,15 @@ set_target_properties(iceemdan_shared PROPERTIES
     OUTPUT_NAME "iceemdan"
     POSITION_INDEPENDENT_CODE ON
 )
+if(WIN32)
+    # iceemdan.dll (not libiceemdan.dll), whatever the compiler
+    set_target_properties(iceemdan_shared PROPERTIES PREFIX "" IMPORT_PREFIX "")
+endif()
+if(MINGW)
+    # libstdc++, libgcc and winpthreads linked in: the DLL needs only what
+    # Windows has (and VectorFFT's DLLs), not the MinGW runtime DLLs
+    target_link_options(iceemdan_shared PRIVATE -static)
+endif()
 if(USE_IPO)
     set_target_properties(iceemdan_shared PROPERTIES
         INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
@@ -433,6 +465,16 @@ endforeach()
 add_test(NAME c_api COMMAND test_c_api)
 add_test(NAME c_example COMMAND c_example)
 
+# The Python module against the shared library, where Python and NumPy are there
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                    RESULT_VARIABLE _numpy_missing OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _numpy_missing)
+        add_test(NAME python COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python.py)
+    endif()
+endif()
+
 # ============================================================================
 # Installation (optional)
 # ============================================================================
@@ -462,7 +504,7 @@ install(TARGETS iceemdan_shared
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(FILES include/iceemdan.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/iceemdan.h include/iceemdan_diagnostics.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(EXPORT iceemdan_targets
     FILE iceemdan-targets.cmake
@@ -475,7 +517,9 @@ install(EXPORT iceemdan_targets
 # ============================================================================
 message(STATUS "")
 message(STATUS "=== ICEEMDAN Configuration ===")
+message(STATUS "  Version: ${PROJECT_VERSION}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
+message(STATUS "  Portable (AVX2 + FMA, for release binaries): ${ICEEMDAN_PORTABLE}")
 message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")
 message(STATUS "  EEMD header: src/core/eemd.hpp")
 message(STATUS "  ICEEMDAN header: src/core/iceemdan.hpp")

@@ -19,3 +19,5 @@ python/*.so
 /.cache/
 # working notes (README material kept for the how-to-use guide)
 /notes/
+# release builds and packages (release/make_release.py)
+/dist/

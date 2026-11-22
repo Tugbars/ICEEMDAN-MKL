@@ -1,9 +1,10 @@
 /*
- * The C interface from C: include/iceemdan.h compiled as C, against the
- * shared library. Results, batches, settings, errors and Hilbert-Huang
- * analysis through the header alone.
+ * The C interface from C: include/iceemdan.h and include/iceemdan_diagnostics.h
+ * compiled as C, against the shared library. Everything a user can call, and
+ * every way a call is refused.
  */
 #include "iceemdan.h"
+#include "iceemdan_diagnostics.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -14,10 +15,12 @@ static int failures = 0;
 
 static void check(int ok, const char *what)
 {
-    printf("  %-66s %s\n", what, ok ? "PASS" : "FAIL");
+    printf("  %-70s %s\n", what, ok ? "PASS" : "FAIL");
     if (!ok)
         ++failures;
 }
+
+enum { N = 600, COUNT = 5, MAX_ROWS = 64 };
 
 /* a signal per channel: two rhythms and deterministic noise */
 static void make_channels(double *x, int count, int n)
@@ -32,39 +35,18 @@ static void make_channels(double *x, int count, int n)
         }
 }
 
-/* decompose with h and copy the result out; returns the number of IMFs */
-static int decompose(ICEEMDANHandle *h, const double *x, int n, double *imfs, double *residue)
+/* decompose one signal with d and copy the result out; the number of IMFs, or -1 */
+static int one(iceemdan_t *d, const double *x, double *imfs, double *residue)
 {
-    const int k = iceemdan_decompose(h, x, n);
-    if (k > 0)
-    {
-        iceemdan_get_all_imfs(h, imfs);
-        iceemdan_get_residue(h, residue);
-    }
+    const int k = iceemdan_decompose(d, x, 1, N);
+    if (k >= 0 && iceemdan_result(d, imfs, residue, NULL) != 0)
+        return -1;
     return k;
 }
 
-int main(void)
+/* the largest difference of IMFs + residue from x */
+static double sum_error(const double *x, const double *imfs, const double *residue, int k)
 {
-    enum { N = 600, COUNT = 5, MAX_K = 32 };
-    double *x = malloc(sizeof(double) * COUNT * N);
-    double *imfs = malloc(sizeof(double) * MAX_K * N);
-    double *residue = malloc(sizeof(double) * N);
-    double *other = malloc(sizeof(double) * MAX_K * N);
-    double *other_res = malloc(sizeof(double) * N);
-    make_channels(x, COUNT, N);
-
-    printf("C interface %s (library %s)\n", ICEEMDAN_VERSION_STRING, iceemdan_version());
-    check(strcmp(iceemdan_version(), ICEEMDAN_VERSION_STRING) == 0, "the library is the version of this header");
-
-    ICEEMDANHandle *d = iceemdan_create(ICEEMDAN_STANDARD);
-    check(d != NULL, "iceemdan_create(ICEEMDAN_STANDARD)");
-    iceemdan_set_ensemble_size(d, 40);
-
-    /* one signal */
-    const int k = decompose(d, x, N, imfs, residue);
-    check(k > 0 && k <= MAX_K && iceemdan_get_num_imfs(d) == k && iceemdan_get_imf_length(d) == N,
-          "decompose: IMF count and length");
     double worst = 0.0;
     for (int i = 0; i < N; ++i)
     {
@@ -73,119 +55,229 @@ int main(void)
             sum += imfs[j * N + i];
         worst = fmax(worst, fabs(sum - x[i]));
     }
-    check(worst < 1e-10, "the IMFs and the residue add up to the signal");
-    int one_ok = 1;
-    for (int j = 0; j < k; ++j)
-    {
-        iceemdan_get_imf(d, j, other);
-        one_ok = one_ok && memcmp(other, imfs + j * N, sizeof(double) * N) == 0;
-    }
-    check(one_ok && !iceemdan_get_imf(d, k, other), "iceemdan_get_imf: each IMF, and none past the last");
-    check(iceemdan_get_valid(d) == 1 && iceemdan_get_error(d)[0] == '\0' &&
-              iceemdan_get_rng_seed_used(d) == 42u && iceemdan_get_noise_bank_reused(d) == 0,
-          "diagnostics: valid, no error, the default seed, the noise built");
-    int diag_ok = iceemdan_get_orthogonality_index(d) >= 0.0;
-    for (int j = 0; j < k; ++j)
-        diag_ok = diag_ok && iceemdan_get_imf_trials(d, j) == 40 && iceemdan_get_imf_sift_iterations(d, j) >= 0 &&
-                  iceemdan_get_imf_mean_sift_iterations(d, j) >= 0.0 && iceemdan_get_imf_converged(d, j) >= 0 &&
-                  iceemdan_get_imf_nonconverged_trials(d, j) >= 0;
-    check(diag_ok && iceemdan_get_imf_trials(d, k) == -1, "per-IMF diagnostics, -1 past the last IMF");
+    return worst;
+}
 
-    /* the same signal again: the kept noise, the same result */
-    const int k2 = decompose(d, x, N, other, other_res);
-    check(k2 == k && memcmp(other, imfs, sizeof(double) * k * N) == 0 && iceemdan_get_noise_bank_reused(d) == 1,
-          "a second call keeps the noise and gives the same result");
+static iceemdan_t *with(int ensemble_size, unsigned seed, int nthreads, int max_imfs, unsigned flags)
+{
+    iceemdan_config_t c;
+    memset(&c, 0, sizeof(c));
+    c.ensemble_size = ensemble_size;
+    c.seed = seed;
+    c.nthreads = nthreads;
+    c.max_imfs = max_imfs;
+    c.flags = flags;
+    return iceemdan_create(&c);
+}
 
-    /* the boundary can be set back to the default */
-    iceemdan_set_boundary_method(d, ICEEMDAN_BOUNDARY_MIRROR);
-    decompose(d, x, N, other, other_res);
-    iceemdan_set_boundary_method(d, ICEEMDAN_BOUNDARY_SYMMETRIC);
-    const int k3 = decompose(d, x, N, other, other_res);
-    check(k3 == k && memcmp(other, imfs, sizeof(double) * k * N) == 0,
-          "ICEEMDAN_BOUNDARY_SYMMETRIC restores the default after MIRROR");
+int main(void)
+{
+    double *x = malloc(sizeof(double) * COUNT * N);
+    double *imfs = malloc(sizeof(double) * MAX_ROWS * N);
+    double *residue = malloc(sizeof(double) * N);
+    double *other = malloc(sizeof(double) * MAX_ROWS * N);
+    double *other_res = malloc(sizeof(double) * N);
+    iceemdan_info_t info;
+    make_channels(x, COUNT, N);
 
-    /* the speed options change the result and still add up */
-    iceemdan_set_stop_rule(d, ICEEMDAN_STOP_SD);
-    iceemdan_set_local_mean_method(d, ICEEMDAN_LOCAL_MEAN_SINGLE_ENVELOPE);
-    iceemdan_set_circular_bank(d, 1);
-    iceemdan_set_antithetic(d, 1);
-    const int k4 = decompose(d, x, N, other, other_res);
-    worst = 0.0;
-    for (int i = 0; i < N && k4 > 0; ++i)
-    {
-        double sum = other_res[i];
-        for (int j = 0; j < k4; ++j)
-            sum += other[j * N + i];
-        worst = fmax(worst, fabs(sum - x[i]));
-    }
-    check(k4 > 0 && worst < 1e-10 && (k4 != k || memcmp(other, imfs, sizeof(double) * k * N) != 0),
-          "stop rule, local mean, circular bank, +/- pairs: set and used");
+    printf("The library\n");
+    check(iceemdan_info(NULL, &info) == 0 && strcmp(info.version, ICEEMDAN_VERSION_STRING) == 0,
+          "iceemdan_info(NULL): the library is the version of this header");
+    check(info.cpu_supported == 1 && info.processors >= 1 && info.signals == 0,
+          "this processor runs it; processors counted");
+    const int processors = info.processors;
+
+    printf("Defaults\n");
+    iceemdan_t *d = iceemdan_create(NULL);
+    check(d != NULL && iceemdan_error()[0] == '\0', "iceemdan_create(NULL)");
+    check(iceemdan_info(d, &info) == 0 && info.nthreads == processors && info.signals == 0,
+          "a new decomposer: on every processor, no decomposition yet");
+    check(iceemdan_result(d, imfs, residue, NULL) == -1 && iceemdan_error()[0] != '\0',
+          "iceemdan_result() before a decomposition: refused, with a reason");
+    const int k = one(d, x, imfs, residue);
+    check(k > 0 && k <= MAX_ROWS && iceemdan_error()[0] == '\0', "one signal decomposed");
+    check(sum_error(x, imfs, residue, k) < 1e-10, "the IMFs and the residue add up to the signal");
+    check(iceemdan_info(d, &info) == 0 && info.signals == 1 && info.n == N && info.imfs == k && info.noise_kept == 0 &&
+              info.noise_shared == 0 && info.repaired == 0,
+          "iceemdan_info(): 1 signal, its length and IMFs, the noise built");
+    const int k_again = one(d, x, other, other_res);
+    check(k_again == k && memcmp(other, imfs, sizeof(double) * k * N) == 0 && iceemdan_info(d, &info) == 0 &&
+              info.noise_kept == 1,
+          "again: the noise kept, the same result");
     iceemdan_destroy(d);
 
-    /* errors */
-    d = iceemdan_create(ICEEMDAN_STANDARD);
-    iceemdan_set_ensemble_size(d, 40);
-    check(iceemdan_decompose(d, x, 3) == 0 && iceemdan_get_error(d)[0] != '\0', "3 samples: refused, with a reason");
-    check(decompose(d, x, N, other, other_res) == k && iceemdan_get_error(d)[0] == '\0',
-          "the next call that succeeds clears the reason");
+    printf("The configuration\n");
+    d = with(0, 0, 0, 0, 0);
+    check(d && one(d, x, other, other_res) == k && memcmp(other, imfs, sizeof(double) * k * N) == 0,
+          "a zeroed configuration is the default");
+    iceemdan_destroy(d);
+    d = with(100, 42, 0, 0, 0);
+    check(d && one(d, x, other, other_res) == k && memcmp(other, imfs, sizeof(double) * k * N) == 0,
+          "ensemble_size 100 and seed 42 are the default");
+    iceemdan_destroy(d);
+    d = with(0, 7, 0, 0, 0);
+    const int k_seed = one(d, x, other, other_res);
+    check(k_seed > 0 && (k_seed != k || memcmp(other, imfs, sizeof(double) * k * N) != 0) &&
+              sum_error(x, other, other_res, k_seed) < 1e-10,
+          "another seed: another result, which adds up too");
+    iceemdan_destroy(d);
+    d = with(0, 0, 1, 0, 0);
+    check(d && iceemdan_info(d, &info) == 0 && info.nthreads == 1 && one(d, x, other, other_res) == k &&
+              memcmp(other, imfs, sizeof(double) * k * N) == 0,
+          "nthreads 1: the same result, bit for bit");
+    iceemdan_destroy(d);
+    d = with(0, 0, 0, 2, 0);
+    const int k_two = one(d, x, other, other_res);
+    check(k_two == 2 && sum_error(x, other, other_res, 2) < 1e-10, "max_imfs 2: two IMFs, the rest in the residue");
+    iceemdan_destroy(d);
+    d = with(0, 0, 0, 0, ICEEMDAN_FLAG_FAST);
+    const int k_fast = one(d, x, other, other_res);
+    check(k_fast > 0 && sum_error(x, other, other_res, k_fast) < 1e-10 && iceemdan_info(d, &info) == 0 &&
+              info.noise_shared == 1 && (k_fast != k || memcmp(other, imfs, sizeof(double) * k * N) != 0),
+          "ICEEMDAN_FLAG_FAST: another result, which adds up; noise_shared says so");
+    iceemdan_destroy(d);
 
-    /* a batch: each channel as alone */
-    const int most = iceemdan_decompose_batch(d, x, COUNT, N);
-    check(most > 0 && iceemdan_batch_count(d) == COUNT && iceemdan_batch_num_imfs(d, COUNT) == -1,
-          "decompose_batch: count, and -1 past the last signal");
-    double *bimfs = malloc(sizeof(double) * COUNT * most * N);
+    printf("Many signals\n");
+    d = with(40, 0, 0, 0, 0);
+    iceemdan_t *alone = with(40, 0, 0, 0, 0);
+    const int rows = iceemdan_decompose(d, x, COUNT, N);
+    double *bimfs = malloc(sizeof(double) * COUNT * (rows > 0 ? rows : 1) * N);
     double *bres = malloc(sizeof(double) * COUNT * N);
-    iceemdan_batch_get(d, bimfs, bres);
-    ICEEMDANHandle *alone = iceemdan_create(ICEEMDAN_STANDARD);
-    iceemdan_set_ensemble_size(alone, 40);
-    int same = 1;
+    int counts[COUNT];
+    check(rows > 0 && iceemdan_result(d, bimfs, bres, counts) == 0 && iceemdan_info(d, &info) == 0 &&
+              info.signals == COUNT && info.imfs == rows,
+          "a batch of 5 channels");
+    int same = 1, most = 0;
     for (int c = 0; c < COUNT; ++c)
     {
-        const int kc = decompose(alone, x + c * N, N, other, other_res);
-        same = same && kc == iceemdan_batch_num_imfs(d, c) &&
-               memcmp(other, bimfs + (size_t)c * most * N, sizeof(double) * kc * N) == 0 &&
-               memcmp(other_res, bres + c * N, sizeof(double) * N) == 0 &&
-               iceemdan_batch_orthogonality_index(d, c) == iceemdan_get_orthogonality_index(alone);
-        for (int j = kc; j < most; ++j)
+        const int kc = one(alone, x + c * N, other, other_res);
+        most = kc > most ? kc : most;
+        same = same && kc == counts[c] && memcmp(other, bimfs + (size_t)c * rows * N, sizeof(double) * kc * N) == 0 &&
+               memcmp(other_res, bres + c * N, sizeof(double) * N) == 0;
+        for (int j = kc; j < rows; ++j)
             for (int i = 0; i < N; ++i)
-                same = same && bimfs[((size_t)c * most + j) * N + i] == 0.0;
+                same = same && bimfs[((size_t)c * rows + j) * N + i] == 0.0;
     }
-    check(same, "every channel bit for bit as alone; rows past its own IMFs are zeros");
+    check(same && most == rows, "every channel bit for bit as alone; zeros after its own IMFs");
+    check(iceemdan_result(d, NULL, NULL, NULL) == 0, "iceemdan_result(): every output may be NULL");
+
+    printf("The audit trail\n");
+    iceemdan_signal_stats_t ss;
+    iceemdan_imf_stats_t is;
+    int stats_ok = 1;
+    for (int c = 0; c < COUNT; ++c)
+    {
+        stats_ok = stats_ok && iceemdan_signal_stats(d, c, &ss) == 0 && ss.imfs == counts[c] && ss.orthogonality >= 0.0 &&
+                   ss.repaired == 0;
+        for (int j = 0; j < counts[c]; ++j)
+            stats_ok = stats_ok && iceemdan_imf_stats(d, c, j, &is) == 0 && is.copies == 40 && is.iterations_max >= 0 &&
+                       is.iterations_mean >= 0.0 && is.iterations_mean <= is.iterations_max && is.unconverged >= 0;
+    }
+    check(stats_ok, "every signal and every IMF: its facts");
+    check(iceemdan_signal_stats(d, COUNT, &ss) == -1 && iceemdan_imf_stats(d, 0, counts[0], &is) == -1 &&
+              iceemdan_error()[0] != '\0',
+          "no such signal, no such IMF: refused, with a reason");
+
+    printf("NaN and Inf\n");
+    double *holed = malloc(sizeof(double) * N), *filled = malloc(sizeof(double) * N);
+    memcpy(holed, x, sizeof(double) * N);
+    memcpy(filled, x, sizeof(double) * N);
+    holed[100] = NAN; /* one sample: the mean of its neighbours */
+    filled[100] = x[99] + 0.5 * (x[101] - x[99]);
+    holed[300] = INFINITY; /* two in a row: on the line from sample 299 to 302 */
+    holed[301] = -INFINITY;
+    filled[300] = x[299] + (1.0 / 3) * (x[302] - x[299]);
+    filled[301] = x[299] + (2.0 / 3) * (x[302] - x[299]);
+    const int k_holed = one(d, holed, imfs, residue);
+    const int repaired = iceemdan_info(d, &info) == 0 ? info.repaired : -1;
+    check(k_holed > 0 && repaired == 3 && iceemdan_signal_stats(d, 0, &ss) == 0 && ss.repaired == 3 &&
+              sum_error(filled, imfs, residue, k_holed) < 1e-10,
+          "3 bad samples: filled in by straight lines, counted; the result adds up to that");
+    free(holed);
+    free(filled);
+
+    printf("Refused calls\n");
+    iceemdan_config_t bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.ensemble_size = -1;
+    int refused = iceemdan_create(&bad) == NULL && strstr(iceemdan_error(), "ensemble_size") != NULL;
+    memset(&bad, 0, sizeof(bad));
+    bad.noise = -0.1;
+    refused = refused && iceemdan_create(&bad) == NULL && strstr(iceemdan_error(), "noise") != NULL;
+    bad.noise = NAN;
+    refused = refused && iceemdan_create(&bad) == NULL;
+    memset(&bad, 0, sizeof(bad));
+    bad.max_imfs = 65;
+    refused = refused && iceemdan_create(&bad) == NULL && strstr(iceemdan_error(), "max_imfs") != NULL;
+    memset(&bad, 0, sizeof(bad));
+    bad.nthreads = -2;
+    refused = refused && iceemdan_create(&bad) == NULL && strstr(iceemdan_error(), "nthreads") != NULL;
+    memset(&bad, 0, sizeof(bad));
+    bad.flags = 1u << 7;
+    refused = refused && iceemdan_create(&bad) == NULL && strstr(iceemdan_error(), "flag") != NULL;
+    check(refused, "iceemdan_create(): a value out of range, NaN, an unknown flag");
+    check(iceemdan_decompose(d, x, 1, 3) == -1 && strstr(iceemdan_error(), "samples") != NULL &&
+              iceemdan_decompose(d, x, 0, N) == -1 && iceemdan_decompose(d, NULL, 1, N) == -1 &&
+              iceemdan_decompose(NULL, x, 1, N) == -1 && iceemdan_result(NULL, imfs, residue, NULL) == -1 &&
+              iceemdan_info(d, NULL) == -1,
+          "iceemdan_decompose(): 3 samples, no signals, NULL; NULL decomposers");
+    check(one(d, x, imfs, residue) > 0 && iceemdan_error()[0] == '\0', "a served call leaves no reason behind");
+    iceemdan_destroy(NULL);
     iceemdan_destroy(alone);
     iceemdan_destroy(d);
     free(bimfs);
     free(bres);
 
-    /* Hilbert-Huang analysis of a pure tone: 32 whole cycles in the window, inside a band */
+    printf("Hilbert-Huang analysis (no decomposer alive)\n");
     {
+        /* a tone of 32 whole cycles in the window, inside a frequency band */
         const double fs = 1000.0, f = 32.0 * fs / N, pi = 3.14159265358979323846;
-        double tone[N], amp[N], freq[N];
+        double tone[N], amp[N], freq[N], phase[N];
         for (int i = 0; i < N; ++i)
             tone[i] = 2.0 * cos(2 * pi * f * i / fs);
-        check(iceemdan_instantaneous(tone, N, fs, amp, freq, NULL) == 1 && fabs(amp[N / 2] - 2.0) < 1e-6 &&
-                  fabs(freq[N / 2] - f) < 1e-6,
-              "instantaneous amplitude and frequency of a tone");
-        check(fabs(iceemdan_mean_frequency(tone, N, fs) - f) < 0.5, "its mean frequency");
-        const int bins = 100, cols = iceemdan_spectrum_columns(N, 10);
-        double *spectrum = malloc(sizeof(double) * bins * cols);
-        double marginal[100];
-        check(cols == N / 10 && iceemdan_hilbert_spectrum(tone, 1, N, fs, bins, 0.0, 0.0, 10, 0, spectrum, marginal) == 1,
-              "Hilbert spectrum: its size, and computed");
+        check(iceemdan_instantaneous(tone, N, fs, amp, freq, phase) == 0 && fabs(amp[N / 2] - 2.0) < 1e-6 &&
+                  fabs(freq[N / 2] - f) < 1e-6 && phase[N - 1] > phase[0],
+              "iceemdan_instantaneous(): amplitude, frequency and phase of a tone");
+        check(iceemdan_instantaneous(tone, N, fs, NULL, NULL, NULL) == 0, "... every output may be NULL");
+
+        /* NULL options: 128 bands to fs / 2, a column per sample */
+        double *spectrum = malloc(sizeof(double) * 128 * N);
+        double marginal[128];
         int peak = 0;
-        for (int b = 1; b < bins; ++b)
+        int ok = iceemdan_spectrum(tone, 1, N, fs, NULL, spectrum, marginal) == 0;
+        for (int b = 1; b < 128; ++b)
             if (marginal[b] > marginal[peak])
                 peak = b;
-        check(peak == (int)(f / (fs / 2 / bins)), "the marginal spectrum peaks at the tone");
+        double column_sum = 0.0;
+        for (int b = 0; b < 128; ++b)
+            column_sum += spectrum[b * N + N / 2];
+        check(ok && peak == (int)(f / (fs / 2 / 128)) && fabs(column_sum - 4.0) < 1e-6,
+              "iceemdan_spectrum(NULL options): the tone's band; a column holds its energy");
+
+        iceemdan_spectrum_t o;
+        memset(&o, 0, sizeof(o));
+        o.frequency_bins = 50;
+        o.fmax = 250.0;
+        o.time_step = 10;
+        o.amplitude = 1;
+        double small[50 * (N / 10)], m50[50];
+        peak = 0;
+        ok = iceemdan_spectrum(tone, 1, N, fs, &o, small, m50) == 0;
+        for (int b = 1; b < 50; ++b)
+            if (m50[b] > m50[peak])
+                peak = b;
+        check(ok && peak == (int)(f / 5.0) && fabs(m50[peak] - 2.0 * N) < 1e-6,
+              "50 bands to 250 Hz, 10 samples per column, amplitude");
+
+        o.fmin = 300.0;
+        check(iceemdan_spectrum(tone, 1, N, fs, &o, small, m50) == -1 && strstr(iceemdan_error(), "fmin") != NULL &&
+                  iceemdan_spectrum(tone, 0, N, fs, NULL, NULL, NULL) == -1 &&
+                  iceemdan_instantaneous(tone, 1, fs, amp, NULL, NULL) == -1 &&
+                  iceemdan_instantaneous(tone, N, 0.0, amp, NULL, NULL) == -1 &&
+                  iceemdan_instantaneous(NULL, N, fs, amp, NULL, NULL) == -1,
+              "refused: fmin above fmax, no IMFs, 1 sample, no sample rate, NULL");
         free(spectrum);
     }
-
-    /* the library */
-    iceemdan_set_num_threads(3);
-    check(iceemdan_get_num_threads() == 3, "threads: set and read");
-    iceemdan_set_num_threads(0);
-    check(strcmp(iceemdan_fft_backend(1024), "VectorFFT") == 0, "the FFT is VectorFFT's");
-    const double energy = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
-    check(fabs(iceemdan_compute_energy(x, 3) - energy) <= 1e-14 * energy, "energy: the sum of squares");
 
     free(x);
     free(imfs);

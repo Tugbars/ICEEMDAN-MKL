@@ -131,6 +131,10 @@ namespace eemd
         double sift_threshold = 0.05;
         int32_t ensemble_size = 100;
         double noise_std = 0.2;
+
+        // Threads this decomposer uses: 0 = the process's thread setting
+        // (set_num_threads). The result does not depend on it.
+        int32_t num_threads = 0;
         double noise_decay = 1.0;
         int32_t boundary_extend = 2;
         uint32_t rng_seed = 42;
@@ -1461,7 +1465,7 @@ namespace eemd
             noise_imfs_.assign(ensemble_size, {});
             imf_counts_.assign(ensemble_size, 0);
 
-            threads::for_static(threads::team_size(), ensemble_size,
+            threads::for_static(threads::team_size(emd_config.num_threads), ensemble_size,
                                 [&](int32_t i_begin, int32_t i_end, int)
             {
                 if (i_begin == i_end)
@@ -1637,7 +1641,7 @@ namespace eemd
                 return false;
 
             std::vector<DecompositionDiagnostics> d(static_cast<size_t>(count));
-            const int32_t team = threads::team_size();
+            const int32_t team = threads::team_size(config_.num_threads);
             if (count == 1 || team <= 1)
             {
                 for (int32_t s = 0; s < count; ++s)
@@ -1685,6 +1689,7 @@ namespace eemd
             emd_config.spline_method = config_.spline_method;
             emd_config.stop_rule = config_.sift_stop_rule;
             emd_config.rilling = config_.rilling;
+            emd_config.num_threads = config_.num_threads;
             // Noise modes are synthetic (causality does not apply to them):
             // use the stable symmetric ends whenever sifting runs long
             emd_config.symmetric_boundary = (config_.sift_stop_rule == SiftStopRule::Rilling) ||
@@ -2306,7 +2311,7 @@ namespace eemd
         {
             SignalRun job(*this, bank, n);
             job.start(signal, diag);
-            const int32_t n_threads = threads::team_size();
+            const int32_t n_threads = threads::team_size(config_.num_threads);
             reserve_workspaces(n_threads);
             while (job.next_batch())
             {
