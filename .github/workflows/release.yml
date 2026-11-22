@@ -1,0 +1,92 @@
+# The ready-built library as a GitHub release (release/make_release.py).
+#
+#   a pushed tag v*   -> that version's release, with the Windows package and its SHA-256 attached
+#   "Run workflow"    -> (the Actions tab) a rehearsal: the package is on the run's page, nothing is published
+#
+# The tag must be the version of include/iceemdan.h (v0.9.0-beta for 0.9.0-beta): the package is named after that
+# version, and a tag that is not stops before anything is published. The release takes its title and its text
+# from release/release_notes.md (its first line is the title; @VERSION@ is the tag without its v). A version with
+# a "-" in it (0.9.0-beta) is marked as a pre-release.
+#
+# The package is built for every x86-64 processor with AVX2 and FMA, tested, and compiled against as a user
+# would, with GCC and with Visual Studio's cl, before it is packed: all of that is the script.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+      - name: Build, test and pack the library (AVX2 + FMA)
+        run: python release/make_release.py --generator Ninja
+      - name: SHA-256 of the package
+        run: |
+          cd dist
+          for f in *.zip; do sha256sum "$f" > "$f.sha256"; done
+          cat *.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  publish:
+    needs: [windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="$(sed -n 's/^#define ICEEMDAN_VERSION_STRING "\(.*\)".*/\1/p' include/iceemdan.h)"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::the tag is $TAG, include/iceemdan.h says version $VERSION: nothing published"
+            exit 1
+          fi
+          ls -la dist
+          ls "dist/iceemdan-$VERSION-windows-x64.zip"
+          TITLE="$(head -n 1 release/release_notes.md)"
+          {
+            tail -n +2 release/release_notes.md | sed "s/@VERSION@/$VERSION/g"
+            printf '\nBuilt from %s on %s UTC.\nSHA-256 of the files:\n' "$GITHUB_SHA" "$(date -u '+%Y-%m-%d %H:%M')"
+            cat dist/*.sha256
+          } > notes.md
+          PRE=""
+          case "$VERSION" in *-*) PRE="--prerelease" ;; esac
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" $PRE --title "$TITLE" --notes-file notes.md
+          gh release edit "$TAG" $PRE --title "$TITLE" --notes-file notes.md
+          gh release upload "$TAG" dist/*.zip dist/*.sha256 --clobber

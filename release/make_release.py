@@ -163,7 +163,7 @@ def try_package(stage, compilers):
                 with open(bat, "w") as f:
                     f.write(f'@call "{vcvars}" >nul\r\n'
                             "cl /nologo /O2 /Iinclude examples\\decompose.c lib\\iceemdan.lib /Fe:decompose.exe\r\n")
-                run(["cmd", "/c", bat], cwd=work, quiet=True)
+                run([os.environ.get("COMSPEC", "cmd"), "/c", bat], cwd=work, quiet=True)
                 exe = os.path.join(work, "decompose.exe")
             out = subprocess.run([exe], cwd=work, capture_output=True, text=True)
             ok = out.returncode == 0 and "IMFs" in out.stdout
