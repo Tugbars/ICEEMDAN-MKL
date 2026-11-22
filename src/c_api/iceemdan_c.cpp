@@ -21,6 +21,19 @@
 #include <thread>
 #include <vector>
 
+// the machine's memory (after the library's own headers: windows.h defines many macros)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 // Every definition is extern "C" once more: one that does not match its
 // declaration in the header is then a compile error, not a second function.
 #define ICEEMDAN_EXPORT extern "C" ICEEMDAN_API
@@ -141,6 +154,34 @@ static int logical_processors()
     return n >= 1 ? n : 1;
 }
 
+/** The memory installed in this machine, in bytes (4 GiB when the system does not say). */
+static size_t installed_memory()
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status))
+        return static_cast<size_t>(status.ullTotalPhys);
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGE_SIZE)
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page > 0)
+        return static_cast<size_t>(pages) * static_cast<size_t>(page);
+#endif
+    return static_cast<size_t>(4) << 30;
+}
+
+/** The most memory the decomposed noise of a decomposer may take: half of what is installed. */
+static size_t noise_limit()
+{
+    return installed_memory() / 2;
+}
+
+static double gib(size_t bytes)
+{
+    return static_cast<double>(bytes) / static_cast<double>(static_cast<size_t>(1) << 30);
+}
+
 static ICEEMDAN_NOINLINE iceemdan_t *create(const iceemdan_config_t *config)
 {
     iceemdan_config_t c;
@@ -171,6 +212,7 @@ static ICEEMDAN_NOINLINE iceemdan_t *create(const iceemdan_config_t *config)
         k.num_threads = d->nthreads;
         k.sanitize_input = true; // NaN and Inf filled in; finite samples are left as they are
         k.keep_noise_bank = true;
+        k.noise_bank_max_bytes = noise_limit();
         if (c.flags & ICEEMDAN_FLAG_FAST)
         {
             k.sift_stop_rule = eemd::SiftStopRule::SD;
@@ -229,13 +271,21 @@ static ICEEMDAN_NOINLINE int decompose(iceemdan_t *d, const double *signals, int
     if (n < 4)
         return refuse("n %d: 4 samples or more", n);
 
+    // The decomposed noise is kept in memory. The library does not change the
+    // algorithm on its own to make it fit: the call is refused with the numbers.
+    const eemd::ICEEMDANConfig &k = d->decomposer.config();
+    if (!k.use_circular_bank && d->decomposer.noise_bank_bytes(n) > k.noise_bank_max_bytes)
+        return refuse("the noise of %d copies of %d samples takes %.1f GiB decomposed, and this machine allows "
+                      "%.1f (half its memory): a smaller ensemble_size, shorter signals, or ICEEMDAN_FLAG_FAST",
+                      k.ensemble_size, n, gib(d->decomposer.noise_bank_bytes(n)), gib(k.noise_bank_max_bytes));
+
     d->count = 0; // from here on the earlier result is gone
     try
     {
         if (!d->decomposer.decompose_batch(signals, count, n, d->imfs, d->residues, &d->diagnostics))
-            return refuse("the decomposed noise of %d copies of %d samples does not fit in memory: "
-                          "a smaller ensemble_size or shorter signals",
-                          d->decomposer.config().ensemble_size, n);
+            return refuse("the decomposed noise for signals of %d samples does not fit in the %.1f GiB this "
+                          "machine allows (half its memory): shorter signals",
+                          n, gib(k.noise_bank_max_bytes));
     }
     catch (const std::exception &e)
     {
@@ -311,7 +361,6 @@ static ICEEMDAN_NOINLINE void fill_info(const iceemdan_t *d, iceemdan_info_t *ou
     out->n = d->n;
     out->imfs = d->rows;
     out->noise_kept = d->diagnostics.front().noise_bank_reused ? 1 : 0;
-    out->noise_shared = d->diagnostics.front().noise_bank_multiplier > 0 ? 1 : 0;
     for (const eemd::DecompositionDiagnostics &g : d->diagnostics)
         out->repaired += g.nan_count;
 }
@@ -332,7 +381,6 @@ ICEEMDAN_EXPORT ICEEMDAN_BASELINE int iceemdan_info(const iceemdan_t *d, iceemda
     out->n = 0;
     out->imfs = 0;
     out->noise_kept = 0;
-    out->noise_shared = 0;
     out->repaired = 0;
     if (out->cpu_supported)
         fill_info(d, out);

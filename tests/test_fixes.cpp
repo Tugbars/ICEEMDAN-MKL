@@ -171,19 +171,25 @@ int main()
         bank_modes = std::min(bank_modes, d.config().max_imfs);
         const size_t per_unit = size_t(bank_modes) * n * sizeof(double);
 
+        check(d.noise_bank_bytes(n) == per_unit * 20, "noise_bank_bytes(): 20 realizations of that many modes");
+
+        // the independent bank needs 20 units (20 realizations): allow 20, then 19
+        d.config().noise_bank_max_bytes = per_unit * 20;
+        check(d.decompose(x.data(), n, imfs, res) && d.last_diagnostics().noise_bank_multiplier == 0,
+              "at the cap: independent realizations");
+        d.config().noise_bank_max_bytes = per_unit * 19;
+        check(!d.decompose(x.data(), n, imfs, res),
+              "over the cap: decompose() fails; the library does not switch to the circular bank itself");
+
+        d.config().noise_bank_max_bytes = size_t(2) << 30;
         d.config().use_circular_bank = true;
         check(d.decompose(x.data(), n, imfs, res) && d.last_diagnostics().noise_bank_multiplier == 20,
               "use_circular_bank: circular bank with multiplier 20");
-        d.config().use_circular_bank = false;
-
-        // independent bank needs 20 trial units (20 independent realizations); allow 6
         d.config().noise_bank_max_bytes = per_unit * 6;
-        const bool ok6 = d.decompose(x.data(), n, imfs, res);
-        check(ok6 && d.last_diagnostics().noise_bank_multiplier == 6,
-              "over the cap: falls back to the circular bank, multiplier lowered to 6");
-
+        check(d.decompose(x.data(), n, imfs, res) && d.last_diagnostics().noise_bank_multiplier == 6,
+              "circular bank over the cap: multiplier lowered to 6");
         d.config().noise_bank_max_bytes = per_unit * 3; // below the floor of 4
-        check(!d.decompose(x.data(), n, imfs, res), "cap below the floor: decompose() fails cleanly");
+        check(!d.decompose(x.data(), n, imfs, res), "circular bank, cap below the floor: decompose() fails cleanly");
     }
 
     // ------------------------------------------------------------------

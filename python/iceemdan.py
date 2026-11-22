@@ -90,7 +90,7 @@ class _Config(ctypes.Structure):  # iceemdan_config_t
 class _Info(ctypes.Structure):  # iceemdan_info_t
     _fields_ = [("version", ctypes.c_char_p), ("cpu_supported", ctypes.c_int), ("processors", ctypes.c_int),
                 ("nthreads", ctypes.c_int), ("signals", ctypes.c_int), ("n", ctypes.c_int), ("imfs", ctypes.c_int),
-                ("noise_kept", ctypes.c_int), ("noise_shared", ctypes.c_int), ("repaired", ctypes.c_int)]
+                ("noise_kept", ctypes.c_int), ("repaired", ctypes.c_int)]
 
 
 class _Spectrum(ctypes.Structure):  # iceemdan_spectrum_t
@@ -302,16 +302,15 @@ class ICEEMDAN:
         """
         The decomposer's facts: threads, and of its last decomposition
         signals, n, imfs (the most of any signal), noise_kept (it used the
-        noise of an earlier call), noise_shared (one shared noise
-        decomposition: fast, or more than 2 GiB of noise) and repaired (NaN
-        and Inf samples filled in).
+        noise of an earlier call) and repaired (NaN and Inf samples filled
+        in).
         """
         if not self._handle:
             raise ValueError("the decomposer is closed")
         f = _Info()
         _lib.iceemdan_info(self._handle, ctypes.byref(f))
         return {"threads": f.nthreads, "signals": f.signals, "n": f.n, "imfs": f.imfs,
-                "noise_kept": bool(f.noise_kept), "noise_shared": bool(f.noise_shared), "repaired": f.repaired}
+                "noise_kept": bool(f.noise_kept), "repaired": f.repaired}
 
     def diagnostics(self, signal: int = 0) -> Dict:
         """

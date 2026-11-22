@@ -124,10 +124,11 @@ extern "C"
    *
    * The first decomposition of a signal length also decomposes the noise of
    * the ensemble, which the decomposer keeps: further calls with that length
-   * skip the step. A call with another length replaces the kept noise. Above
-   * 2 GiB of decomposed noise (signals of about 140,000 samples at the
-   * default ensemble) the noise of all copies is cut from one long
-   * decomposed noise signal instead, and iceemdan_info() says so.
+   * skip the step. A call with another length replaces the kept noise. The
+   * kept noise takes about 14 kB for every sample of a signal at the default
+   * ensemble; a length whose noise would take more than half of this
+   * machine's memory is refused (the library does not change the algorithm
+   * on its own to make it fit).
    *
    * NaN and Inf samples are filled in from their neighbours by a straight
    * line before the decomposition; iceemdan_info() counts them.
@@ -175,9 +176,6 @@ extern "C"
     int n;               /**< ... the samples of each */
     int imfs;            /**< ... its IMF rows: the most IMFs of any signal */
     int noise_kept;      /**< ... 1 when it used the noise kept from an earlier call */
-    int noise_shared;    /**< ... 1 when the noise of all copies came from one long
-                              decomposed noise signal (ICEEMDAN_FLAG_FAST, or more than
-                              2 GiB of noise) */
     int repaired;        /**< ... the NaN and Inf samples filled in, over all signals */
   } iceemdan_info_t;
 

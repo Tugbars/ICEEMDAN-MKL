@@ -171,9 +171,10 @@ namespace eemd
         bool use_circular_bank = false;
         int32_t circular_multiplier = 20;  // Long buffer = N × multiplier
         // Memory cap for the noise bank. The independent bank holds
-        // base_trials x max_imfs x N doubles; above the cap the circular bank
-        // is used instead (multiplier lowered, not below 4); if even that does
-        // not fit, decompose() fails instead of exhausting memory.
+        // noise_bank_bytes(N) (base_trials x modes x N doubles): above the cap
+        // decompose() fails instead of exhausting memory or changing the
+        // algorithm on its own. The circular bank (use_circular_bank) lowers
+        // its multiplier to fit, not below 4; below that it fails as well.
         size_t noise_bank_max_bytes = size_t(2) << 30; // 2 GiB
         // The noise bank (the EMD modes of the noise realizations) depends on
         // the signal length, the seed and the sifting settings, not on the
@@ -1567,8 +1568,8 @@ namespace eemd
          * white noise and M the local-mean operator (local_mean_method).
          *
          * Optimizations:
-         * - Circular noise bank (optional, default off; automatic fallback
-         *   when the independent bank exceeds noise_bank_max_bytes)
+         * - Circular noise bank (optional, default off; never chosen by the
+         *   library itself)
          * - Antithetic variables (optional, default on)
          * - Linear interp fast path for sparse extrema
          *
@@ -1704,27 +1705,31 @@ namespace eemd
         }
 
         /**
-         * The noise bank for signals of length n (independent realizations or
-         * circular): kept from the last call when everything it depends on is
-         * the same, built otherwise. False when even the circular bank would
-         * not fit in noise_bank_max_bytes.
+         * The modes the bank holds for each noise realization of length n: a
+         * realization has about log2(n) of them.
+         */
+        int32_t bank_modes(int32_t n) const
+        {
+            int32_t modes = 2;
+            for (int32_t len = n; len > 1; len >>= 1)
+                ++modes;
+            return std::min(modes, config_.max_imfs);
+        }
+
+        /**
+         * The noise bank for signals of length n (independent realizations,
+         * or circular with use_circular_bank): kept from the last call when
+         * everything it depends on is the same, built otherwise. False when
+         * it would not fit in noise_bank_max_bytes.
          */
         bool prepare_bank(int32_t n, BankUse &use)
         {
             const EEMDConfig emd_config = bank_sifting();
             const int32_t trials = base_trials();
-
-            // A realization of length n has about log2(n) modes, so the bank
-            // never holds more than this many per realization
-            int32_t bank_modes = 2;
-            for (int32_t len = n; len > 1; len >>= 1)
-                ++bank_modes;
-            bank_modes = std::min(bank_modes, config_.max_imfs);
-            const size_t independent_bytes = static_cast<size_t>(trials) *
-                                             static_cast<size_t>(bank_modes) *
-                                             static_cast<size_t>(n) * sizeof(double);
-            const bool use_circular = config_.use_circular_bank ||
-                                      independent_bytes > config_.noise_bank_max_bytes;
+            const int32_t bank_modes = this->bank_modes(n);
+            const bool use_circular = config_.use_circular_bank;
+            if (!use_circular && noise_bank_bytes(n) > config_.noise_bank_max_bytes)
+                return false; // the library does not change the algorithm on its own
 
             NoiseBankKey key;
             key.n = n;
@@ -2505,6 +2510,18 @@ namespace eemd
         ICEEMDANConfig &config() { return config_; }
         const ICEEMDANConfig &config() const { return config_; }
         ProcessingMode mode() const { return mode_; }
+
+        /**
+         * The memory the noise bank of signals of n samples takes with the
+         * current settings (independent realizations: one of every trial,
+         * about log2(n) modes each). decompose() fails when it is more than
+         * config.noise_bank_max_bytes.
+         */
+        size_t noise_bank_bytes(int32_t n) const
+        {
+            return static_cast<size_t>(base_trials()) * static_cast<size_t>(bank_modes(n)) *
+                   static_cast<size_t>(std::max(n, 0)) * sizeof(double);
+        }
 
         /**
          * Frees the noise bank kept from the last decomposition

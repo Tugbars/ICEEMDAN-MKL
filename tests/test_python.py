@@ -50,7 +50,7 @@ a, ra = d.decompose(x)
 check(np.array_equal(a, imfs) and np.array_equal(ra, residue), "a decomposer gives the same")
 facts = d.info()
 check(facts["threads"] == iceemdan.info()["processors"] and facts["signals"] == 1 and facts["n"] == n and
-      facts["imfs"] == len(imfs) and not facts["noise_kept"] and not facts["noise_shared"] and facts["repaired"] == 0,
+      facts["imfs"] == len(imfs) and not facts["noise_kept"] and facts["repaired"] == 0,
       "info(): threads, the last decomposition")
 b, rb = d.decompose(x)
 check(np.array_equal(b, imfs) and d.info()["noise_kept"], "again: the noise kept, the same result")
@@ -62,7 +62,7 @@ two, r2 = iceemdan.decompose(x, max_imfs=2)
 check(two.shape == (2, n) and np.abs(two.sum(axis=0) + r2 - x).max() < 1e-10, "max_imfs=2: two IMFs, the rest in the residue")
 with iceemdan.ICEEMDAN(fast=True) as fast:
     f_imfs, f_res = fast.decompose(x)
-    check(np.abs(f_imfs.sum(axis=0) + f_res - x).max() < 1e-10 and fast.info()["noise_shared"] and
+    check(np.abs(f_imfs.sum(axis=0) + f_res - x).max() < 1e-10 and
           (f_imfs.shape != imfs.shape or not np.array_equal(f_imfs, imfs)), "fast=True: another result, which adds up")
 
 print("Many signals")
@@ -99,6 +99,13 @@ check(d40.info()["repaired"] == 3 and d40.diagnostics()["repaired"] == 3 and
       np.abs(h_imfs.sum(axis=0) + h_res - filled).max() < 1e-10, "3 bad samples: filled in by straight lines and counted")
 
 print("Refused")
+huge = iceemdan.ICEEMDAN(ensemble_size=2 ** 30)
+try:
+    huge.decompose(x)
+    message = ""
+except ValueError as e:
+    message = str(e)
+check("GiB" in message and "ICEEMDAN_FLAG_FAST" in message, "noise that does not fit in half the memory: refused, with the numbers")
 check(raises(ValueError, lambda: iceemdan.ICEEMDAN(ensemble_size=-1)) and raises(ValueError, lambda: iceemdan.ICEEMDAN(max_imfs=99))
       and raises(ValueError, lambda: iceemdan.ICEEMDAN(noise=float("nan"))), "a setting out of range: ValueError")
 check(raises(ValueError, lambda: d.decompose(eeg)) and raises(ValueError, lambda: d.decompose(x[:3])) and

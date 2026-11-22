@@ -98,7 +98,7 @@ int main(void)
     check(k > 0 && k <= MAX_ROWS && iceemdan_error()[0] == '\0', "one signal decomposed");
     check(sum_error(x, imfs, residue, k) < 1e-10, "the IMFs and the residue add up to the signal");
     check(iceemdan_info(d, &info) == 0 && info.signals == 1 && info.n == N && info.imfs == k && info.noise_kept == 0 &&
-              info.noise_shared == 0 && info.repaired == 0,
+              info.repaired == 0,
           "iceemdan_info(): 1 signal, its length and IMFs, the noise built");
     const int k_again = one(d, x, other, other_res);
     check(k_again == k && memcmp(other, imfs, sizeof(double) * k * N) == 0 && iceemdan_info(d, &info) == 0 &&
@@ -132,9 +132,9 @@ int main(void)
     iceemdan_destroy(d);
     d = with(0, 0, 0, 0, ICEEMDAN_FLAG_FAST);
     const int k_fast = one(d, x, other, other_res);
-    check(k_fast > 0 && sum_error(x, other, other_res, k_fast) < 1e-10 && iceemdan_info(d, &info) == 0 &&
-              info.noise_shared == 1 && (k_fast != k || memcmp(other, imfs, sizeof(double) * k * N) != 0),
-          "ICEEMDAN_FLAG_FAST: another result, which adds up; noise_shared says so");
+    check(k_fast > 0 && sum_error(x, other, other_res, k_fast) < 1e-10 &&
+              (k_fast != k || memcmp(other, imfs, sizeof(double) * k * N) != 0),
+          "ICEEMDAN_FLAG_FAST: another result, which adds up");
     iceemdan_destroy(d);
 
     printf("Many signals\n");
@@ -221,6 +221,11 @@ int main(void)
               iceemdan_decompose(NULL, x, 1, N) == -1 && iceemdan_result(NULL, imfs, residue, NULL) == -1 &&
               iceemdan_info(d, NULL) == -1,
           "iceemdan_decompose(): 3 samples, no signals, NULL; NULL decomposers");
+    iceemdan_t *huge = with(1 << 30, 0, 0, 0, 0); /* a billion copies: far more noise than any memory */
+    check(huge && iceemdan_decompose(huge, x, 1, N) == -1 && strstr(iceemdan_error(), "GiB") != NULL &&
+              strstr(iceemdan_error(), "ICEEMDAN_FLAG_FAST") != NULL,
+          "noise that does not fit in half the memory: refused, with the numbers");
+    iceemdan_destroy(huge);
     check(one(d, x, imfs, residue) > 0 && iceemdan_error()[0] == '\0', "a served call leaves no reason behind");
     iceemdan_destroy(NULL);
     iceemdan_destroy(alone);
