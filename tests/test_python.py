@@ -105,7 +105,7 @@ try:
     message = ""
 except ValueError as e:
     message = str(e)
-check("GiB" in message and "ICEEMDAN_FLAG_FAST" in message, "noise that does not fit in half the memory: refused, with the numbers")
+check("GiB" in message and "fast option" in message, "noise that does not fit in half the memory: refused, with the numbers")
 check(raises(ValueError, lambda: iceemdan.ICEEMDAN(ensemble_size=-1)) and raises(ValueError, lambda: iceemdan.ICEEMDAN(max_imfs=99))
       and raises(ValueError, lambda: iceemdan.ICEEMDAN(noise=float("nan"))), "a setting out of range: ValueError")
 check(raises(ValueError, lambda: d.decompose(eeg)) and raises(ValueError, lambda: d.decompose(x[:3])) and

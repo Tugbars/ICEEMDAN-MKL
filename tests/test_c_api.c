@@ -223,7 +223,7 @@ int main(void)
           "iceemdan_decompose(): 3 samples, no signals, NULL; NULL decomposers");
     iceemdan_t *huge = with(1 << 30, 0, 0, 0, 0); /* a billion copies: far more noise than any memory */
     check(huge && iceemdan_decompose(huge, x, 1, N) == -1 && strstr(iceemdan_error(), "GiB") != NULL &&
-              strstr(iceemdan_error(), "ICEEMDAN_FLAG_FAST") != NULL,
+              strstr(iceemdan_error(), "fast option") != NULL,
           "noise that does not fit in half the memory: refused, with the numbers");
     iceemdan_destroy(huge);
     check(one(d, x, imfs, residue) > 0 && iceemdan_error()[0] == '\0', "a served call leaves no reason behind");

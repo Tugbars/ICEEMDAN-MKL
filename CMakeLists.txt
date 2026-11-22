@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 
-# The version lives in one place: ICEEMDAN_VERSION_STRING in include/iceemdan.h
+# The version is ICEEMDAN_VERSION_STRING of include/iceemdan.h; the C++ header
+# include/iceemdan.hpp carries the same string for programs that use it alone
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/iceemdan.h" _iceemdan_version_line
      REGEX "^#define ICEEMDAN_VERSION_STRING ")
 string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+" ICEEMDAN_VERSION "${_iceemdan_version_line}")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/iceemdan.hpp" _iceemdan_hpp_version_line
+     REGEX "^#define ICEEMDAN_VERSION_STRING ")
+string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+" _iceemdan_hpp_version "${_iceemdan_hpp_version_line}")
+if(NOT ICEEMDAN_VERSION STREQUAL _iceemdan_hpp_version)
+    message(FATAL_ERROR "include/iceemdan.h says version ${ICEEMDAN_VERSION}, "
+                        "include/iceemdan.hpp says ${_iceemdan_hpp_version}: they must be the same")
+endif()
 
 project(iceemdan 
     VERSION ${ICEEMDAN_VERSION}
@@ -240,6 +248,7 @@ add_library(iceemdan INTERFACE)
 add_library(iceemdan::iceemdan ALIAS iceemdan)
 
 target_include_directories(iceemdan INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core>
     $<INSTALL_INTERFACE:include>
 )
@@ -288,6 +297,8 @@ add_iceemdan_executable(test_threads tests/test_threads.cpp)
 add_iceemdan_executable(test_spline tests/test_spline.cpp)
 add_iceemdan_executable(test_rng tests/test_rng.cpp)
 add_iceemdan_executable(test_hht tests/test_hht.cpp)
+add_iceemdan_executable(test_cpp_api tests/test_cpp_api.cpp)
+add_iceemdan_executable(cpp_example examples/cpp/decompose.cpp)
 
 enable_testing()
 add_test(NAME fft_hilbert COMMAND test_fft_hilbert)
@@ -296,6 +307,8 @@ add_test(NAME threads COMMAND test_threads)
 add_test(NAME spline COMMAND test_spline)
 add_test(NAME rng COMMAND test_rng)
 add_test(NAME hht COMMAND test_hht)
+add_test(NAME cpp_api COMMAND test_cpp_api)
+add_test(NAME cpp_example COMMAND cpp_example)
 
 # --- Test programs run by hand ---
 add_eemd_executable(eemd_test tests/eemd_test.cpp)
@@ -477,9 +490,17 @@ install(TARGETS eemd iceemdan
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
+# The C++ interface (iceemdan.hpp) and the implementation headers it stands on
 install(FILES
+    include/iceemdan.hpp
+    src/core/iceemdan_engine.hpp
     src/core/eemd.hpp
-    src/core/iceemdan.hpp
+    src/core/eemd_base.hpp
+    src/core/eemd_extrema.hpp
+    src/core/eemd_sift.hpp
+    src/core/eemd_local_mean.hpp
+    src/core/eemd_noise.hpp
+    src/core/eemd_system.hpp
     src/fft/eemd_fft.hpp
     src/threads/eemd_threads.hpp
     src/spline/cubic_spline.hpp
@@ -512,7 +533,7 @@ message(STATUS "  Version: ${PROJECT_VERSION}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  Portable (AVX2 + FMA, for release binaries): ${ICEEMDAN_PORTABLE}")
 message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")
-message(STATUS "  EEMD header: src/core/eemd.hpp")
-message(STATUS "  ICEEMDAN header: src/core/iceemdan.hpp")
+message(STATUS "  C++ interface: include/iceemdan.hpp")
+message(STATUS "  C interface: include/iceemdan.h (the shared library iceemdan)")
 message(STATUS "  FFT backend: ${ICEEMDAN_FFT_BACKEND}")
 message(STATUS "")
