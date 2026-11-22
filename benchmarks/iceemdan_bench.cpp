@@ -12,7 +12,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#include "iceemdan.hpp"
+#include "eemd.hpp"
+#include "iceemdan_engine.hpp"
 #include <iostream>
 #include <iomanip>
 #include <chrono>

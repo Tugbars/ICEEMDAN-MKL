@@ -5,7 +5,7 @@
  * Exits non-zero on any failure.
  */
 
-#include "iceemdan.hpp"
+#include "eemd.hpp"
 
 #include <cstdio>
 #include <cmath>

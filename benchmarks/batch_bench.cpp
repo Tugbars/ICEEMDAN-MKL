@@ -11,7 +11,7 @@
  * the ratio.
  */
 
-#include "iceemdan.hpp"
+#include "iceemdan_engine.hpp"
 
 #include <algorithm>
 #include <chrono>

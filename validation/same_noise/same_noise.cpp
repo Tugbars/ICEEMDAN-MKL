@@ -18,7 +18,8 @@
  *   --ensemble M        realizations (default 100)
  */
 
-#include "iceemdan.hpp"
+#include "eemd.hpp"
+#include "iceemdan_engine.hpp"
 
 #include <cstdio>
 #include <cstdlib>

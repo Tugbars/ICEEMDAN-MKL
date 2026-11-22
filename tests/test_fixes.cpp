@@ -6,7 +6,8 @@
  * Exits non-zero on any failure.
  */
 
-#include "iceemdan.hpp"
+#include "eemd.hpp"
+#include "iceemdan_engine.hpp"
 
 #include <algorithm>
 #include <cmath>

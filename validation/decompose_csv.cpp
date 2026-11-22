@@ -7,7 +7,7 @@
  *     --single    LocalMeanMethod::SingleEnvelope instead of Sifted
  *     --circular  circular noise bank instead of independent realizations
  */
-#include "iceemdan.hpp"
+#include "iceemdan_engine.hpp"
 
 #include <cstdio>
 #include <cstdlib>
