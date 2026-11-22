@@ -46,31 +46,30 @@ namespace eemd
     // Configuration
     // ============================================================================
 
+    /**
+     * The settings of sifting, and of the EMD / EEMD engine (emd_engine.hpp).
+     * As they stand they are those of emd.m: its stop rule and thresholds,
+     * its boundary extension, at most 2000 sifting iterations for a mode.
+     */
     struct EEMDConfig
     {
-        int32_t max_imfs = 10;
-        int32_t max_sift_iters = 100;
-        double sift_threshold = 0.05;
-        int32_t ensemble_size = 100;
-        double noise_std = 0.2;
-        int32_t boundary_extend = 2;
-        uint32_t rng_seed = 42;
+        int32_t max_imfs = 32;         // a safety net: a signal has about log2(N) modes
+        int32_t max_sift_iters = 2000; // sifting iterations for one mode at most (emd.m: MAXITERATIONS)
+        int32_t boundary_extend = 2;   // extrema mirrored past each end (emd.m: NBSYM)
 
-        // S-number stopping criterion: stop after S consecutive iterations
-        // where extrema count is stable. Benchmarks show S=6 gives ~12% speedup.
-        // Set to 0 to disable (use only SD criterion).
+        // Sifting stop rule (see SiftStopRule) and its thresholds
+        SiftStopRule stop_rule = SiftStopRule::Rilling;
+        RillingThresholds rilling;
+        // SD rule: its threshold, and the S-number (stop after S consecutive
+        // iterations with an unchanged extrema count; 0 = off)
+        double sift_threshold = 0.05;
         int32_t s_number = 6;
 
-        // Sifting stop rule (see SiftStopRule); sift_threshold and s_number
-        // apply to SD, rilling to Rilling.
-        SiftStopRule stop_rule = SiftStopRule::SD;
-        RillingThresholds rilling;
-
-        // Envelope ends: false = mirror boundary_extend extrema plus a linear
-        // end point (extend_extrema_raw, the original scheme); true = the
-        // symmetric extension of emd.m (extend_extrema_symmetric), which stays
-        // stable when sifting runs for many iterations.
-        bool symmetric_boundary = false;
+        // EEMD: the noisy copies averaged, the noise amplitude relative to the
+        // standard deviation of the signal, and the seed of the noise
+        int32_t ensemble_size = 100;
+        double noise_std = 0.2;
+        uint32_t rng_seed = 42;
 
         // Threads to use: 0 = the process's thread setting (set_num_threads).
         // The result does not depend on it.
@@ -210,9 +209,8 @@ namespace eemd
         int32_t n_max = 0;
         int32_t n_min = 0;
         int32_t n_ext = 0;
-        int32_t ext_start = 0;
 
-        // Second knot buffer pair (symmetric extension builds both envelopes at once)
+        // Second knot buffer pair (the lower envelope's knots)
         std::vector<double> ext_x2;
         std::vector<double> ext_y2;
         int32_t n_ext2 = 0;
@@ -269,12 +267,9 @@ namespace eemd
 
                 const bool rilling = (config_.stop_rule == SiftStopRule::Rilling);
 
-                // Enough extrema for envelopes: with the symmetric ends, three
-                // in all (emd.m); otherwise two of each kind
-                const bool enough = config_.symmetric_boundary
-                                        ? (scratch_.n_max >= 1 && scratch_.n_min >= 1 &&
-                                           scratch_.n_max + scratch_.n_min >= 3)
-                                        : (scratch_.n_max >= 2 && scratch_.n_min >= 2);
+                // Enough extrema for envelopes: three in all (emd.m)
+                const bool enough = scratch_.n_max >= 1 && scratch_.n_min >= 1 &&
+                                    scratch_.n_max + scratch_.n_min >= 3;
                 if (!enough)
                 {
                     // Rilling (as emd.m): a mode that runs out of extrema
@@ -305,26 +300,14 @@ namespace eemd
                 }
 
                 // Knots of the upper envelope in (ext_x, ext_y), of the lower
-                // one in (ext_x2, ext_y2)
+                // one in (ext_x2, ext_y2): the extrema, and those mirrored past
+                // each end (emd.m)
                 double *p_ext_x2 = scratch_.ext_x2.data();
                 double *p_ext_y2 = scratch_.ext_y2.data();
-                bool knots_ok = true;
-                if (config_.symmetric_boundary)
-                {
-                    knots_ok = extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
-                                                        w, n, config_.boundary_extend,
-                                                        p_ext_x, p_ext_y, scratch_.n_ext,
-                                                        p_ext_x2, p_ext_y2, scratch_.n_ext2);
-                }
-                else
-                {
-                    extend_extrema_raw(p_max, scratch_.n_max, w, n,
-                                       config_.boundary_extend, p_ext_x, p_ext_y,
-                                       scratch_.n_ext, scratch_.ext_start);
-                    extend_extrema_raw(p_min, scratch_.n_min, w, n,
-                                       config_.boundary_extend, p_ext_x2, p_ext_y2,
-                                       scratch_.n_ext2, scratch_.ext_start);
-                }
+                const bool knots_ok = extend_extrema_symmetric(p_max, scratch_.n_max, p_min, scratch_.n_min,
+                                                               w, n, config_.boundary_extend,
+                                                               p_ext_x, p_ext_y, scratch_.n_ext,
+                                                               p_ext_x2, p_ext_y2, scratch_.n_ext2);
 
                 // The two envelopes share nothing (a spline, a knot set and an
                 // output each). A long series sifted outside a fork, as the
@@ -361,7 +344,7 @@ namespace eemd
                 }
                 if (!(env_ok[0] && env_ok[1]))
                 {
-                    if (config_.symmetric_boundary && rilling && iter > 0)
+                    if (rilling && iter > 0)
                         break; // keep the mode as it stands (emd.m)
                     return false;
                 }

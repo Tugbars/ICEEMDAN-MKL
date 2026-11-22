@@ -6,7 +6,7 @@
  * Exits non-zero on any failure.
  */
 
-#include "eemd.hpp"
+#include "emd_engine.hpp"
 #include "iceemdan_engine.hpp"
 
 #include <algorithm>
@@ -341,32 +341,24 @@ int main()
     }
 
     // ------------------------------------------------------------------
-    std::printf("EEMD: repeatable at a fixed thread count, stable across counts\n");
+    std::printf("EEMD: identical results at 1, 2, 3 and 5 threads\n");
     {
         eemd::EEMDConfig cfg;
         cfg.ensemble_size = 24;
         eemd::EEMD e(cfg);
-        std::vector<std::vector<double>> a, b, c;
-        int32_t na = 0, nb = 0, nc = 0;
-        eemd::set_num_threads(2);
-        e.decompose(x.data(), n, a, na);
-        e.decompose(x.data(), n, b, nb);
-        bool same = na == nb;
-        for (int k = 0; same && k < na; ++k)
-            same = std::memcmp(a[k].data(), b[k].data(), n * sizeof(double)) == 0;
-        check(same, "two runs at 2 threads are bit-identical");
-
+        std::vector<std::vector<double>> a, b;
+        std::vector<double> ra, rb;
         eemd::set_num_threads(1);
-        e.decompose(x.data(), n, c, nc);
-        double diff = 0, amax = 0;
-        bool count_ok = nc == na;
-        for (int k = 0; count_ok && k < na; ++k)
-            for (int i = 0; i < n; ++i)
-            {
-                diff = std::max(diff, std::abs(a[k][i] - c[k][i]));
-                amax = std::max(amax, std::abs(a[k][i]));
-            }
-        check(count_ok && diff / amax < 1e-10, "1 vs 2 threads agree to summation rounding (1e-10)");
+        bool same = e.decompose(x.data(), n, a, ra);
+        for (int threads : {2, 3, 5})
+        {
+            eemd::set_num_threads(threads);
+            same = same && e.decompose(x.data(), n, b, rb) && a.size() == b.size() &&
+                   std::memcmp(ra.data(), rb.data(), n * sizeof(double)) == 0;
+            for (size_t k = 0; same && k < a.size(); ++k)
+                same = std::memcmp(a[k].data(), b[k].data(), n * sizeof(double)) == 0;
+        }
+        check(same, "every IMF and the residue, bit for bit");
     }
 
     // ------------------------------------------------------------------

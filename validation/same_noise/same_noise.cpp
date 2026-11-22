@@ -18,7 +18,7 @@
  *   --ensemble M        realizations (default 100)
  */
 
-#include "eemd.hpp"
+#include "emd_engine.hpp"
 #include "iceemdan_engine.hpp"
 
 #include <cstdio>
@@ -99,7 +99,6 @@ int main(int argc, char **argv)
         e.config().boundary_extend = ic.boundary_extend;
         e.config().stop_rule = ic.sift_stop_rule;
         e.config().rilling = ic.rilling;
-        e.config().symmetric_boundary = true;
         for (int a = 6; a < argc; ++a)
             if (!std::strcmp(argv[a], "--max-iters") && a + 1 < argc)
                 e.config().max_sift_iters = std::atoi(argv[++a]);

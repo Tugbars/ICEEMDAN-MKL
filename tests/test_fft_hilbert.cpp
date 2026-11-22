@@ -5,7 +5,8 @@
  * Exits non-zero on any failure.
  */
 
-#include "eemd.hpp"
+#include "eemd_fft.hpp"
+#include "eemd_hht.hpp"
 
 #include <cstdio>
 #include <cmath>
@@ -88,7 +89,7 @@ int main()
             v = gauss(rng);
             amax = std::max(amax, std::abs(v));
         }
-        const bool ok = eemd::compute_hilbert_transform(x.data(), n, y.data());
+        const bool ok = eemd::fft::hilbert(x.data(), n, y.data());
         std::vector<double> ref = hilbert_reference(x);
         double err = 0;
         for (int i = 0; i < n; ++i)
@@ -107,7 +108,7 @@ int main()
         std::vector<double> x(n), inst(n);
         for (int i = 0; i < n; ++i)
             x[i] = std::cos(2 * M_PI * f * i + 0.3);
-        const bool ok = eemd::compute_instantaneous_frequency(x.data(), n, inst.data(), 1.0);
+        const bool ok = eemd::hht::instantaneous(x.data(), n, 1.0, nullptr, inst.data(), nullptr);
         // edges of a non-periodic tone are distorted; check the middle half
         double err = 0;
         for (int i = n / 4; i < 3 * n / 4; ++i)

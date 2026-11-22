@@ -1,7 +1,7 @@
 /**
  * The extrema of a signal and the knots of its envelopes: local maxima and
  * minima (flat ones included), zero crossings, and the extension of the
- * extrema past both ends, as emd.m does it (symmetric) or by mirroring.
+ * extrema past both ends, as emd.m does it.
  *
  * License: MIT
  */
@@ -201,111 +201,6 @@ namespace eemd
         if (n > 0 && signal[0] == 0.0)
             ++count; // a run of zeros starts at 0
         return count;
-    }
-
-    // ============================================================================
-    // Boundary Extension - Raw Pointer Output
-    // ============================================================================
-
-    inline void extend_extrema_raw(
-        const int32_t *__restrict indices,
-        int32_t n_indices,
-        const double *__restrict signal,
-        int32_t signal_len,
-        int32_t extend_count,
-        double *__restrict out_x,
-        double *__restrict out_y,
-        int32_t &out_count,
-        int32_t &original_start)
-    {
-        if (n_indices < 2)
-        {
-            out_count = n_indices;
-            original_start = 0;
-            for (int32_t i = 0; i < n_indices; ++i)
-            {
-                out_x[i] = static_cast<double>(indices[i]);
-                out_y[i] = signal[indices[i]];
-            }
-            return;
-        }
-
-        const int32_t left_ext = std::min(extend_count, n_indices - 1);
-        const int32_t right_ext = std::min(extend_count, n_indices - 1);
-
-        // Compute coverage after mirroring
-        double leftmost_x = static_cast<double>(indices[0]);
-        double rightmost_x = static_cast<double>(indices[n_indices - 1]);
-
-        if (left_ext > 0)
-        {
-            leftmost_x = 2.0 * indices[0] - indices[left_ext];
-        }
-        if (right_ext > 0)
-        {
-            rightmost_x = 2.0 * indices[n_indices - 1] - indices[n_indices - 1 - right_ext];
-        }
-
-        const bool need_left = (leftmost_x > 0.0);
-        const bool need_right = (rightmost_x < static_cast<double>(signal_len - 1));
-
-        int32_t pos = 0;
-
-        // Left boundary point (linear extrapolation)
-        if (need_left)
-        {
-            const double x0 = static_cast<double>(indices[0]);
-            const double x1 = static_cast<double>(indices[1]);
-            const double y0 = signal[indices[0]];
-            const double y1 = signal[indices[1]];
-            const double slope = (y1 - y0) / (x1 - x0);
-            out_x[pos] = -1.0;
-            out_y[pos] = y0 + slope * (-1.0 - x0);
-            ++pos;
-        }
-
-        // Mirror left
-        for (int32_t i = 0; i < left_ext; ++i)
-        {
-            const int32_t src = left_ext - i;
-            out_x[pos] = 2.0 * indices[0] - indices[src];
-            out_y[pos] = signal[indices[src]];
-            ++pos;
-        }
-
-        original_start = pos;
-
-        // Original extrema
-        for (int32_t i = 0; i < n_indices; ++i)
-        {
-            out_x[pos] = static_cast<double>(indices[i]);
-            out_y[pos] = signal[indices[i]];
-            ++pos;
-        }
-
-        // Mirror right
-        for (int32_t i = 0; i < right_ext; ++i)
-        {
-            const int32_t src = n_indices - 2 - i;
-            out_x[pos] = 2.0 * indices[n_indices - 1] - indices[src];
-            out_y[pos] = signal[indices[src]];
-            ++pos;
-        }
-
-        // Right boundary point
-        if (need_right)
-        {
-            const double x0 = static_cast<double>(indices[n_indices - 2]);
-            const double x1 = static_cast<double>(indices[n_indices - 1]);
-            const double y0 = signal[indices[n_indices - 2]];
-            const double y1 = signal[indices[n_indices - 1]];
-            const double slope = (y1 - y0) / (x1 - x0);
-            out_x[pos] = static_cast<double>(signal_len);
-            out_y[pos] = y1 + slope * (signal_len - x1);
-            ++pos;
-        }
-
-        out_count = pos;
     }
 
     // ============================================================================

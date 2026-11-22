@@ -40,6 +40,15 @@
 #define EEMD_OMP_SIMD_REDUCTION2(op, v1, v2)
 #endif
 
+// One copy of a function's machine code for every caller: decompose() and
+// decompose_batch() must compute the same bits, and under -ffast-math two
+// inlined copies of the same code may sum in different orders
+#if defined(_MSC_VER) && !defined(__clang__)
+#define EEMD_NOINLINE __declspec(noinline)
+#else
+#define EEMD_NOINLINE __attribute__((noinline))
+#endif
+
 // Buffers are aligned to a cache line
 #define EEMD_CACHE_LINE 64
 
