@@ -106,7 +106,7 @@ target_compile_definitions(eemd INTERFACE
 # ============================================================================
 # FFT: VectorFFT (https://github.com/Tugbars/VectorFFT), required
 #
-# The Hilbert transform, instantaneous frequency and spectral entropy run on
+# The Hilbert transform and the instantaneous frequency run on
 # VectorFFT's ready-built release library: libvfft.dll / libvfft.so, the two
 # kernel libraries it loads from (AVX2, AVX-512) and vfft.h. It has a C
 # interface and needs only the system's C runtime, so every compiler links it.
@@ -278,12 +278,6 @@ macro(add_iceemdan_executable name source)
 endmacro()
 
 # ============================================================================
-# Examples (examples/)
-# ============================================================================
-
-add_iceemdan_executable(example_finance_csv examples/finance_csv/example_finance_csv.cpp)
-
-# ============================================================================
 # Tests (tests/)
 # ============================================================================
 
@@ -313,9 +307,6 @@ add_iceemdan_executable(accuracy_test tests/iceemdan_accuracy_test.cpp)
 
 add_eemd_executable(eemd_bench benchmarks/eemd_bench.cpp)
 add_iceemdan_executable(iceemdan_bench benchmarks/iceemdan_bench.cpp)
-add_iceemdan_executable(iceemdan_finance_bench benchmarks/iceemdan_finance_bench.cpp)
-add_iceemdan_executable(bench_adaptive benchmarks/bench_adaptive.cpp)
-add_iceemdan_executable(bench_snumber benchmarks/bench_snumber.cpp)
 # batch_bench: many channels one by one against one decompose_batch() call
 add_iceemdan_executable(batch_bench benchmarks/batch_bench.cpp)
 

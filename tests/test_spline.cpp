@@ -257,7 +257,9 @@ int main()
             std::vector<double> xa, ya, xb, yb;
             knots(ka, xa, ya);
             knots(kb, xb, yb);
-            const int n = 1 + static_cast<int>(std::max(xa[ka - 1], xb[kb - 1])) + static_cast<int>(rng() % 5);
+            // samples up to the last knot and a few past it (short knot sets may end before sample 0)
+            const int n = std::max(1, 1 + static_cast<int>(std::max(xa[ka - 1], xb[kb - 1]))) +
+                          static_cast<int>(rng() % 5);
             std::vector<double> pa(n), pb(n), sa(n), sb(n);
             const bool ok = eemd::CubicSpline::construct_pair(a, xa.data(), ya.data(), ka, b, xb.data(), yb.data(), kb) &&
                             a.evaluate_uniform(pa.data(), n) && b.evaluate_uniform(pb.data(), n);

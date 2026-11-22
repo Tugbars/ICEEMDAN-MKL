@@ -1,11 +1,11 @@
 /**
- * Spline benchmark: the library's envelope splines (cubic_spline.hpp) against
- * MKL Data Fitting set up the same way, evaluated at the samples 0 .. n-1:
- * the cubic spline with not-a-knot ends, Akima's spline, straight lines.
- * Built only when MKL is found; the library itself does not use MKL.
+ * Spline benchmark: the library's envelope spline (cubic_spline.hpp), the
+ * cubic spline with not-a-knot ends, against MKL Data Fitting set up the same
+ * way, evaluated at the samples 0 .. n-1. Built only when MKL is found; the
+ * library itself does not use MKL.
  *
- * Prints the largest difference between the two for each kind and the time
- * of one envelope (one construction and one evaluation).
+ * Prints the largest difference between the two and the time of one envelope
+ * (one construction and one evaluation).
  */
 
 #include "cubic_spline.hpp"
@@ -20,32 +20,15 @@
 #include <random>
 #include <vector>
 
-enum class Kind
-{
-    Cubic,
-    Akima,
-    Linear
-};
-
 // One envelope with MKL Data Fitting: a task, the spline, its values, the task deleted
-static bool mkl_envelope(Kind kind, const double *x, const double *y, int k, double *coeff, double *out, int n)
+static bool mkl_envelope(const double *x, const double *y, int k, double *coeff, double *out, int n)
 {
     DFTaskPtr task = nullptr;
     if (dfdNewTask1D(&task, k, x, DF_NON_UNIFORM_PARTITION, 1, y, DF_NO_HINT) != DF_STATUS_OK)
         return false;
-    MKL_INT order = DF_PP_CUBIC, type = DF_PP_NATURAL, bc = k >= 4 ? DF_BC_NOT_A_KNOT : DF_BC_FREE_END;
-    if (kind == Kind::Akima)
-    {
-        type = DF_PP_AKIMA; // order cubic, type Akima
-        bc = DF_NO_BC;
-    }
-    else if (kind == Kind::Linear)
-    {
-        order = DF_PP_LINEAR;
-        type = DF_PP_DEFAULT;
-        bc = DF_NO_BC;
-    }
-    bool ok = dfdEditPPSpline1D(task, order, type, bc, nullptr, DF_NO_IC, nullptr, coeff, DF_NO_HINT) == DF_STATUS_OK &&
+    const MKL_INT bc = k >= 4 ? DF_BC_NOT_A_KNOT : DF_BC_FREE_END;
+    bool ok = dfdEditPPSpline1D(task, DF_PP_CUBIC, DF_PP_NATURAL, bc, nullptr, DF_NO_IC, nullptr, coeff,
+                                DF_NO_HINT) == DF_STATUS_OK &&
               dfdConstruct1D(task, DF_PP_SPLINE, DF_METHOD_STD) == DF_STATUS_OK;
     if (ok)
     {
@@ -58,13 +41,9 @@ static bool mkl_envelope(Kind kind, const double *x, const double *y, int k, dou
     return ok;
 }
 
-static bool library_envelope(eemd::CubicSpline &s, Kind kind, const double *x, const double *y, int k, double *out,
-                             int n)
+static bool library_envelope(eemd::CubicSpline &s, const double *x, const double *y, int k, double *out, int n)
 {
-    const bool built = kind == Kind::Cubic   ? s.construct(x, y, k)
-                       : kind == Kind::Akima ? s.construct_akima(x, y, k)
-                                             : s.construct_linear(x, y, k);
-    return built && s.evaluate_uniform(out, n);
+    return s.construct(x, y, k) && s.evaluate_uniform(out, n);
 }
 
 int main()
@@ -75,12 +54,10 @@ int main()
     std::mt19937_64 rng(1);
     std::uniform_real_distribution<double> u(-1.0, 1.0);
     eemd::CubicSpline spline;
-    const char *names[] = {"cubic (not-a-knot)", "Akima", "linear"};
 
     // ---- agreement on random knot sets
     std::printf("Agreement with MKL Data Fitting on random knot sets (5 to 404 knots),\n");
     std::printf("largest difference between the knots, relative to the data:\n");
-    for (Kind kind : {Kind::Cubic, Kind::Akima, Kind::Linear})
     {
         double inner = 0, ends = 0;
         int sets = 0;
@@ -99,8 +76,8 @@ int main()
                 y[i] = u(rng);
                 scale = std::max(scale, std::abs(y[i]));
             }
-            if (!library_envelope(spline, kind, x.data(), y.data(), k, a.data(), n) ||
-                !mkl_envelope(kind, x.data(), y.data(), k, coeff.data(), b.data(), n))
+            if (!library_envelope(spline, x.data(), y.data(), k, a.data(), n) ||
+                !mkl_envelope(x.data(), y.data(), k, coeff.data(), b.data(), n))
                 continue;
             ++sets;
             for (int j = 0; j < n; ++j)
@@ -113,50 +90,46 @@ int main()
                 worst = std::max(worst, std::abs(a[j] - b[j]) / scale);
             }
         }
-        std::printf("  %-20s %4d sets: inner pieces %.2e, end pieces %.2e\n", names[static_cast<int>(kind)], sets,
-                    inner, ends);
+        std::printf("  cubic (not-a-knot)   %4d sets: inner pieces %.2e, end pieces %.2e\n", sets, inner, ends);
     }
 
     // ---- time of one envelope
     std::printf("\nTime of one envelope (construct + evaluate), microseconds\n");
-    std::printf("  %-20s %-9s %-7s %10s %10s %8s\n", "", "samples", "knots", "MKL", "library", "ratio");
-    for (Kind kind : {Kind::Cubic, Kind::Akima, Kind::Linear})
+    std::printf("  %-9s %-7s %10s %10s %8s\n", "samples", "knots", "MKL", "library", "ratio");
+    for (int n : {1024, 4096})
     {
-        for (int n : {1024, 4096})
+        for (int k : {n / 6, n / 24, n / 96})
         {
-            for (int k : {n / 6, n / 24, n / 96})
+            std::vector<double> x(k), y(k), out(n), coeff(4 * k);
+            for (int i = 0; i < k; ++i)
             {
-                std::vector<double> x(k), y(k), out(n), coeff(4 * k);
-                for (int i = 0; i < k; ++i)
-                {
-                    x[i] = std::floor(-3.0 + i * ((n + 6.0) / (k - 1)));
-                    y[i] = u(rng);
-                }
-                for (int i = 1; i < k; ++i)
-                    if (x[i] <= x[i - 1])
-                        x[i] = x[i - 1] + 1;
-                const int reps = 400000 / (n / 256);
-                double sink = 0;
-                const auto t0 = std::chrono::steady_clock::now();
-                for (int r = 0; r < reps; ++r)
-                {
-                    y[r % k] += 1e-9;
-                    mkl_envelope(kind, x.data(), y.data(), k, coeff.data(), out.data(), n);
-                    sink += out[r % n];
-                }
-                const auto t1 = std::chrono::steady_clock::now();
-                for (int r = 0; r < reps; ++r)
-                {
-                    y[r % k] += 1e-9;
-                    library_envelope(spline, kind, x.data(), y.data(), k, out.data(), n);
-                    sink += out[r % n];
-                }
-                const auto t2 = std::chrono::steady_clock::now();
-                const double mkl_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
-                const double lib_us = std::chrono::duration<double, std::micro>(t2 - t1).count() / reps;
-                std::printf("  %-20s %-9d %-7d %10.3f %10.3f %7.1fx%s\n", names[static_cast<int>(kind)], n, k, mkl_us,
-                            lib_us, mkl_us / lib_us, sink == 12345.678 ? "!" : "");
+                x[i] = std::floor(-3.0 + i * ((n + 6.0) / (k - 1)));
+                y[i] = u(rng);
             }
+            for (int i = 1; i < k; ++i)
+                if (x[i] <= x[i - 1])
+                    x[i] = x[i - 1] + 1;
+            const int reps = 400000 / (n / 256);
+            double sink = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r)
+            {
+                y[r % k] += 1e-9;
+                mkl_envelope(x.data(), y.data(), k, coeff.data(), out.data(), n);
+                sink += out[r % n];
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r)
+            {
+                y[r % k] += 1e-9;
+                library_envelope(spline, x.data(), y.data(), k, out.data(), n);
+                sink += out[r % n];
+            }
+            const auto t2 = std::chrono::steady_clock::now();
+            const double mkl_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+            const double lib_us = std::chrono::duration<double, std::micro>(t2 - t1).count() / reps;
+            std::printf("  %-9d %-7d %10.3f %10.3f %7.1fx%s\n", n, k, mkl_us, lib_us, mkl_us / lib_us,
+                        sink == 12345.678 ? "!" : "");
         }
     }
     return 0;

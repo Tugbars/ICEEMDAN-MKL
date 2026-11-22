@@ -86,15 +86,15 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 **The decomposition**
 
-- **ICEEMDAN as published**, by default, computed the way the authors' code computes it; EEMD and plain EMD as well.
+- **ICEEMDAN as published**, by default, computed the way the authors' code computes it: its stop rule for sifting, its boundary extension, cubic spline envelopes, independent noise for every copy. EEMD and plain EMD as well, from C++.
 - **Complete**: the IMFs and the residue add up to the signal to rounding.
 - **Reproducible**: for a given seed, the same result bit for bit at any number of threads. The noise is the library's own (Philox4x32-10 and the inverse normal distribution function) and comes out the same bit for bit from GCC and MSVC, on Windows and Linux.
-- **Three presets**: Standard, Scientific (no shortcuts, an audit trail) and Finance (Akima splines, noise scaled to the local volatility, causal boundaries, NaN and Inf cleaned from the input).
-- **Envelopes**: cubic (not-a-knot), Akima or linear splines; symmetric, mirrored, autoregressive or linear boundary extension.
+- **Gaps in the data**: NaN and Inf samples are filled in from their neighbours by straight lines, and counted.
 - **Batches and channels**: one call decomposes many signals of one length, such as the channels of an EEG or its epochs, from C++, C and Python. They share one noise bank, and their trials are interleaved on the threads, so no thread waits for the end of one signal's stage; every result is the same, bit for bit, as decomposing that signal alone. The decomposed noise is also kept between calls, so further signals of the same length take half the time or less.
-- **Speed options** for when exact agreement with the paper matters less than time (among them ± noise pairs, which halve the noise to decompose), and a memory cap for the noise bank.
+- **A fast option** for when exact agreement with the paper matters less than time: a simpler stop rule, one envelope mean for each noisy copy and one shared noise decomposition, 8 to 12 times faster.
+- **Never another algorithm than the one asked for**: a signal whose decomposed noise would not fit in half of the machine's memory is refused, with the numbers, instead of being computed some other way.
 - **Diagnostics** for every IMF: sifting iterations, trials that did not converge, the number of trials averaged, the orthogonality index.
-- **Hilbert–Huang analysis**: the instantaneous amplitude, frequency and phase of every IMF, the Hilbert spectrum (energy over time and frequency) and the marginal spectrum, from C++, C and Python; spectral entropy.
+- **Hilbert–Huang analysis**: the instantaneous amplitude, frequency and phase of every IMF, the Hilbert spectrum (energy over time and frequency) and the marginal spectrum, from C++, C and Python.
 
 **The library**
 
@@ -116,11 +116,9 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 5. **Sifting stop rule and boundary extension**: Rilling, G., Flandrin, P., & Gonçalves, P. (2003). On empirical mode decomposition and its algorithms. *IEEE-EURASIP Workshop on Nonlinear Signal and Image Processing (NSIP-03)*.
 
-6. **Akima Splines**: Akima, H. (1970). A new method of interpolation and smooth curve fitting based on local procedures. *Journal of the ACM*, 17(4), 589-602.
+6. **The noise generator**: Salmon, J. K., Moraes, M. A., Dror, R. O., & Shaw, D. E. (2011). Parallel random numbers: as easy as 1, 2, 3. *SC '11: Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis*.
 
-7. **The noise generator**: Salmon, J. K., Moraes, M. A., Dror, R. O., & Shaw, D. E. (2011). Parallel random numbers: as easy as 1, 2, 3. *SC '11: Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis*.
-
-8. **The inverse normal distribution function**: Wichura, M. J. (1988). Algorithm AS 241: The percentage points of the normal distribution. *Applied Statistics*, 37(3), 477-484.
+7. **The inverse normal distribution function**: Wichura, M. J. (1988). Algorithm AS 241: The percentage points of the normal distribution. *Applied Statistics*, 37(3), 477-484.
 
 ## Citation
 
