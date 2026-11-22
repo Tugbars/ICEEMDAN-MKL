@@ -8,7 +8,7 @@
  * - Zero-malloc scratch pads (pre-allocated, reused buffers, grow-only)
  *
  * Everything is this library's own except the FFTs:
- * - the envelope splines: cubic_spline.hpp (cubic, Akima, linear)
+ * - the envelope spline: cubic_spline.hpp
  * - the noise: eemd_rng.hpp (Philox4x32-10 and the inverse normal
  *   distribution function)
  * - the threads: eemd_threads.hpp, a fork-join pool on std::thread
@@ -105,23 +105,6 @@ inline void eemd_init_throughput(int n_cores = EEMD_P_CORES, bool verbose = fals
 namespace eemd
 {
 
-    // ============================================================================
-    // Spline Method Selection
-    // ============================================================================
-
-    /**
-     * Spline interpolation method for envelope construction
-     * - Cubic: Smooth C2 spline with not-a-knot ends, can overshoot on sharp changes (default)
-     * - Akima: Local C1 spline, resistant to outliers (recommended for finance)
-     * - Linear: Simple linear interpolation (fastest, least accurate)
-     */
-    enum class SplineMethod : uint8_t
-    {
-        Cubic = 0, // smooth (C2), can overshoot on sharp changes
-        Akima = 1, // local (C1), outlier-resistant
-        Linear = 2 // fastest, for very few extrema
-    };
-
     /**
      * When sifting a mode stops
      * - SD:      sum(m^2) / sum(h^2) < sift_threshold, plus the S-number and
@@ -166,9 +149,6 @@ namespace eemd
         // where extrema count is stable. Benchmarks show S=6 gives ~12% speedup.
         // Set to 0 to disable (use only SD criterion).
         int32_t s_number = 6;
-
-        // Spline method for envelope interpolation
-        SplineMethod spline_method = SplineMethod::Cubic;
 
         // Sifting stop rule (see SiftStopRule); sift_threshold and s_number
         // apply to SD, rilling to Rilling.
@@ -945,59 +925,6 @@ namespace eemd
     }
 
     // ============================================================================
-    // Envelope spline: the library's own (cubic_spline.hpp)
-    //
-    // Cubic (the default): not-a-knot ends, natural below 4 knots.
-    // Akima: Akima's local spline; below 5 knots the cubic spline.
-    // Linear: straight lines between the knots.
-    // ============================================================================
-
-    class EnvelopeSpline
-    {
-    public:
-        EnvelopeSpline() = default;
-
-        EnvelopeSpline(const EnvelopeSpline &) = delete;
-        EnvelopeSpline &operator=(const EnvelopeSpline &) = delete;
-
-        /**
-         * Fits the spline through the knots (x strictly increasing). x and y
-         * must stay as they are until the spline has been evaluated.
-         */
-        bool construct(const double *x, const double *y, int32_t n,
-                       SplineMethod method = SplineMethod::Cubic)
-        {
-            if (method == SplineMethod::Linear)
-                return spline_.construct_linear(x, y, n);
-            if (method == SplineMethod::Akima && n >= 5)
-                return spline_.construct_akima(x, y, n);
-            return spline_.construct(x, y, n);
-        }
-
-        /**
-         * construct() of a and b, the same as one after the other; two cubic
-         * splines have their solves done together (CubicSpline::construct_pair).
-         */
-        static bool construct_pair(EnvelopeSpline &a, const double *xa, const double *ya, int32_t na,
-                                   EnvelopeSpline &b, const double *xb, const double *yb, int32_t nb,
-                                   SplineMethod method = SplineMethod::Cubic)
-        {
-            if (method == SplineMethod::Cubic)
-                return CubicSpline::construct_pair(a.spline_, xa, ya, na, b.spline_, xb, yb, nb);
-            return a.construct(xa, ya, na, method) && b.construct(xb, yb, nb, method);
-        }
-
-        /** results[j] = spline at j, for j = 0 .. n_sites - 1. */
-        bool evaluate_uniform(double *results, int32_t n_sites) const
-        {
-            return spline_.evaluate_uniform(results, n_sites);
-        }
-
-    private:
-        CubicSpline spline_;
-    };
-
-    // ============================================================================
     // Sifter - Fused Loops, Raw Pointers
     // ============================================================================
 
@@ -1105,9 +1032,8 @@ namespace eemd
                     if (env_threads == 1)
                     {
                         env_ok[0] = env_ok[1] =
-                            EnvelopeSpline::construct_pair(upper_spline_, p_ext_x, p_ext_y, scratch_.n_ext,
-                                                           lower_spline_, p_ext_x2, p_ext_y2, scratch_.n_ext2,
-                                                           config_.spline_method) &&
+                            CubicSpline::construct_pair(upper_spline_, p_ext_x, p_ext_y, scratch_.n_ext,
+                                                        lower_spline_, p_ext_x2, p_ext_y2, scratch_.n_ext2) &&
                             upper_spline_.evaluate_uniform(upper_env_.data, n) &&
                             lower_spline_.evaluate_uniform(lower_env_.data, n);
                     }
@@ -1118,9 +1044,9 @@ namespace eemd
                             for (int32_t e = first; e < last; ++e)
                             {
                                 env_ok[e] = (e == 0)
-                                                ? upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext, config_.spline_method) &&
+                                                ? upper_spline_.construct(p_ext_x, p_ext_y, scratch_.n_ext) &&
                                                       upper_spline_.evaluate_uniform(upper_env_.data, n)
-                                                : lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2, config_.spline_method) &&
+                                                : lower_spline_.construct(p_ext_x2, p_ext_y2, scratch_.n_ext2) &&
                                                       lower_spline_.evaluate_uniform(lower_env_.data, n);
                             }
                         });
@@ -1207,8 +1133,8 @@ namespace eemd
         AlignedBuffer<double> upper_env_;
         AlignedBuffer<double> lower_env_;
 
-        EnvelopeSpline upper_spline_;
-        EnvelopeSpline lower_spline_;
+        CubicSpline upper_spline_; // the envelopes: cubic_spline.hpp
+        CubicSpline lower_spline_;
     };
 
     // ============================================================================

@@ -1,6 +1,6 @@
 /**
- * FFT backend tests: Hilbert transform, instantaneous frequency and spectral
- * entropy against direct O(n^2) DFT references, at even, odd and prime n.
+ * FFT backend tests: Hilbert transform and instantaneous frequency against
+ * direct O(n^2) DFT references, at even, odd and prime n.
  *
  * Exits non-zero on any failure.
  */
@@ -115,45 +115,6 @@ int main()
         char label[96];
         std::snprintf(label, sizeof(label), "n=%d, f=%.4f (middle half)", n, f);
         check(ok && err < 2e-3, label, err, 2e-3);
-    }
-
-    std::printf("Spectral entropy vs direct DFT\n");
-    for (int n : {64, 101, 1000})
-    {
-        std::vector<double> x(n);
-        for (auto &v : x)
-            v = gauss(rng);
-        const double h = eemd::compute_spectral_entropy(x.data(), n);
-        double mean = 0;
-        for (double v : x)
-            mean += v;
-        mean /= n;
-        const int nf = n / 2 + 1;
-        std::vector<double> psd(nf);
-        double total = 0;
-        for (int k = 0; k < nf; ++k)
-        {
-            double sr = 0, si = 0;
-            for (int t = 0; t < n; ++t)
-            {
-                const double a = -2.0 * M_PI * k * t / n;
-                sr += (x[t] - mean) * std::cos(a);
-                si += (x[t] - mean) * std::sin(a);
-            }
-            psd[k] = sr * sr + si * si;
-            total += psd[k];
-        }
-        double ent = 0;
-        for (double p : psd)
-        {
-            const double q = p / total;
-            if (q > 1e-15)
-                ent -= q * std::log(q);
-        }
-        ent /= std::log(static_cast<double>(nf));
-        char label[96];
-        std::snprintf(label, sizeof(label), "n=%d", n);
-        check(std::abs(h - ent) < 1e-10, label, std::abs(h - ent), 1e-10);
     }
 
 #ifdef HAVE_MXCSR

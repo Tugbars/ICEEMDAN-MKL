@@ -48,14 +48,26 @@ struct Run
     bool ok = false;
 };
 
-static Run run(const std::vector<double> &x, eemd::ProcessingMode mode,
-               eemd::LocalMeanMethod lm, bool adaptive, int threads)
+/** What to decompose with: the published algorithm, or parts of the fast option. */
+struct Variant
+{
+    const char *name;
+    eemd::SiftStopRule stop_rule;
+    eemd::LocalMeanMethod local_mean;
+    bool circular;
+};
+static const Variant published = {"published", eemd::SiftStopRule::Rilling, eemd::LocalMeanMethod::Sifted, false};
+static const Variant single_envelope = {"single envelope", eemd::SiftStopRule::Rilling,
+                                        eemd::LocalMeanMethod::SingleEnvelope, false};
+
+static Run run(const std::vector<double> &x, const Variant &v, int threads)
 {
     eemd::set_num_threads(threads);
-    eemd::ICEEMDAN d(mode);
+    eemd::ICEEMDAN d;
     d.config().ensemble_size = 50;
-    d.config().local_mean_method = lm;
-    d.config().adaptive_ensemble = adaptive;
+    d.config().sift_stop_rule = v.stop_rule;
+    d.config().local_mean_method = v.local_mean;
+    d.config().use_circular_bank = v.circular;
     Run r;
     r.ok = d.decompose_with_diagnostics(x.data(), static_cast<int>(x.size()), r.imfs, r.residue, r.diag);
     return r;
@@ -78,36 +90,27 @@ int main()
 
     // ------------------------------------------------------------------
     std::printf("ICEEMDAN: identical results at 1, 2, 3 and 4 threads\n");
-    const struct
+    const Variant variants[] = {
+        published,
+        single_envelope,
+        {"SD stop rule", eemd::SiftStopRule::SD, eemd::LocalMeanMethod::Sifted, false},
+        {"circular noise bank", eemd::SiftStopRule::Rilling, eemd::LocalMeanMethod::Sifted, true},
+        {"fast (all three)", eemd::SiftStopRule::SD, eemd::LocalMeanMethod::SingleEnvelope, true}};
+    for (const Variant &v : variants)
     {
-        eemd::ProcessingMode mode;
-        const char *name;
-    } modes[] = {{eemd::ProcessingMode::Standard, "Standard"},
-                 {eemd::ProcessingMode::Finance, "Finance"},
-                 {eemd::ProcessingMode::Scientific, "Scientific"}};
-    for (const auto &m : modes)
-    {
-        for (eemd::LocalMeanMethod lm : {eemd::LocalMeanMethod::Sifted, eemd::LocalMeanMethod::SingleEnvelope})
-        {
-            for (bool adaptive : {false, true})
-            {
-                const Run ref = run(x, m.mode, lm, adaptive, 1);
-                bool same = ref.ok;
-                for (int t : {2, 3, 4})
-                    same = same && bitwise_equal(ref, run(x, m.mode, lm, adaptive, t));
-                char label[128];
-                std::snprintf(label, sizeof(label), "%-10s %-14s adaptive=%d (%zu IMFs)", m.name,
-                              lm == eemd::LocalMeanMethod::Sifted ? "Sifted" : "SingleEnvelope",
-                              adaptive ? 1 : 0, ref.imfs.size());
-                check(same, label);
-            }
-        }
+        const Run ref = run(x, v, 1);
+        bool same = ref.ok;
+        for (int t : {2, 3, 4})
+            same = same && bitwise_equal(ref, run(x, v, t));
+        char label[128];
+        std::snprintf(label, sizeof(label), "%-20s (%zu IMFs)", v.name, ref.imfs.size());
+        check(same, label);
     }
 
     // ------------------------------------------------------------------
     std::printf("ICEEMDAN: completeness and diagnostics\n");
     {
-        const Run r = run(x, eemd::ProcessingMode::Standard, eemd::LocalMeanMethod::Sifted, false, 2);
+        const Run r = run(x, published, 2);
         double err = 0, amax = 0;
         for (int i = 0; i < n; ++i)
         {
@@ -136,7 +139,7 @@ int main()
         check(trials_ok, "trials per IMF within 1..ensemble_size");
         check(r.diag.noise_bank_multiplier == 0, "default: independent noise realizations (multiplier 0)");
 
-        const Run s = run(x, eemd::ProcessingMode::Standard, eemd::LocalMeanMethod::SingleEnvelope, false, 2);
+        const Run s = run(x, single_envelope, 2);
         bool one = s.ok;
         for (size_t k = 0; k < s.imfs.size(); ++k)
             one = one && s.diag.sift_iterations[k] == 1 && s.diag.convergence_flags[k];
@@ -430,7 +433,7 @@ int main()
         check(y[0] == x[1] && y[n - 1] == x[n - 2], "edge samples extrapolated from the nearest finite one");
 
         eemd::set_num_threads(2);
-        eemd::ICEEMDAN d(eemd::ProcessingMode::Finance);
+        eemd::ICEEMDAN d;
         d.config().ensemble_size = 20;
         std::vector<std::vector<double>> imfs;
         std::vector<double> res;
@@ -442,7 +445,7 @@ int main()
         for (const auto &imf : imfs)
             for (double v : imf)
                 clean = clean && eemd::is_finite_bits(v);
-        check(ok && clean && diag.nan_count == 1, "Finance mode decomposes a series with a NaN");
+        check(ok && clean && diag.nan_count == 1, "a series with a NaN is decomposed, the NaN counted");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures,

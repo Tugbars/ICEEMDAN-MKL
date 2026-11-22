@@ -244,10 +244,9 @@ double test_determinism(int32_t n, uint32_t seed) {
     std::vector<double> signal(n);
     generate_garch(signal.data(), n, 12345);
     
-    eemd::ICEEMDAN decomposer1(eemd::ProcessingMode::Scientific);
+    eemd::ICEEMDAN decomposer1;
     decomposer1.config().ensemble_size = 50;
     decomposer1.config().rng_seed = seed;
-    decomposer1.config().use_antithetic = false;  // Ensure determinism
     decomposer1.config().use_circular_bank = false;
     
     std::vector<std::vector<double>> imfs1, imfs2;
@@ -255,10 +254,9 @@ double test_determinism(int32_t n, uint32_t seed) {
     
     decomposer1.decompose(signal.data(), n, imfs1, residue1);
     
-    eemd::ICEEMDAN decomposer2(eemd::ProcessingMode::Scientific);
+    eemd::ICEEMDAN decomposer2;
     decomposer2.config().ensemble_size = 50;
     decomposer2.config().rng_seed = seed;
-    decomposer2.config().use_antithetic = false;
     decomposer2.config().use_circular_bank = false;
     
     decomposer2.decompose(signal.data(), n, imfs2, residue2);
@@ -382,12 +380,11 @@ double test_input_preservation(int32_t n) {
 // Test Runners
 // ============================================================================
 
-void run_signal_tests(const std::string& name, double* signal, int32_t n, 
-                      eemd::ProcessingMode mode = eemd::ProcessingMode::Standard,
+void run_signal_tests(const std::string& name, double* signal, int32_t n,
                       bool is_simple_signal = false) {
     std::cout << "\n--- " << name << " (N=" << n << ") ---\n";
     
-    eemd::ICEEMDAN decomposer(mode);
+    eemd::ICEEMDAN decomposer;
     decomposer.config().ensemble_size = 100;
     decomposer.config().rng_seed = 42;
     
@@ -433,61 +430,49 @@ void run_edge_case_tests() {
     {
         std::vector<double> signal(64);
         generate_sum_of_sines(signal.data(), 64, 42);
-        run_signal_tests("Short signal", signal.data(), 64, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Short signal", signal.data(), 64, false);
     }
     
     // Power of 2
     {
         std::vector<double> signal(1024);
         generate_garch(signal.data(), 1024, 42);
-        run_signal_tests("Power-of-2 length", signal.data(), 1024, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Power-of-2 length", signal.data(), 1024, false);
     }
     
     // Non-power of 2
     {
         std::vector<double> signal(1000);
         generate_garch(signal.data(), 1000, 42);
-        run_signal_tests("Non-power-of-2 length", signal.data(), 1000, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Non-power-of-2 length", signal.data(), 1000, false);
     }
     
     // Constant signal (simple)
     {
         std::vector<double> signal(512, 42.0);
-        run_signal_tests("Constant signal", signal.data(), 512, eemd::ProcessingMode::Standard, true);
+        run_signal_tests("Constant signal", signal.data(), 512, true);
     }
     
     // Pure noise
     {
         std::vector<double> signal(1024);
         generate_white_noise(signal.data(), 1024, 42);
-        run_signal_tests("White noise", signal.data(), 1024, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("White noise", signal.data(), 1024, false);
     }
     
     // Step function
     {
         std::vector<double> signal(512);
         generate_step(signal.data(), 512);
-        run_signal_tests("Step function", signal.data(), 512, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Step function", signal.data(), 512, false);
     }
     
     // Ramp (simple)
     {
         std::vector<double> signal(512);
         generate_ramp(signal.data(), 512);
-        run_signal_tests("Ramp signal", signal.data(), 512, eemd::ProcessingMode::Standard, true);
+        run_signal_tests("Ramp signal", signal.data(), 512, true);
     }
-}
-
-void run_mode_comparison_tests() {
-    std::cout << "\n=== Processing Mode Comparison ===\n";
-    
-    const int32_t n = 2048;
-    std::vector<double> signal(n);
-    generate_garch(signal.data(), n, 42);
-    
-    run_signal_tests("Standard mode", signal.data(), n, eemd::ProcessingMode::Standard, false);
-    run_signal_tests("Finance mode", signal.data(), n, eemd::ProcessingMode::Finance, false);
-    run_signal_tests("Scientific mode", signal.data(), n, eemd::ProcessingMode::Scientific, false);
 }
 
 void run_robustness_tests() {
@@ -544,7 +529,7 @@ void run_numerical_stress_tests() {
         for (int32_t i = 0; i < n; ++i) {
             signal[i] = 1e10 * std::sin(2 * M_PI * 10 * i / n);
         }
-        run_signal_tests("Large amplitude (1e10)", signal.data(), n, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Large amplitude (1e10)", signal.data(), n, false);
     }
     
     // Small values
@@ -553,7 +538,7 @@ void run_numerical_stress_tests() {
         for (int32_t i = 0; i < n; ++i) {
             signal[i] = 1e-10 * std::sin(2 * M_PI * 10 * i / n);
         }
-        run_signal_tests("Small amplitude (1e-10)", signal.data(), n, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Small amplitude (1e-10)", signal.data(), n, false);
     }
     
     // Signal with outliers
@@ -562,7 +547,7 @@ void run_numerical_stress_tests() {
         generate_sum_of_sines(signal.data(), n, 42);
         signal[n/4] = 1000.0;   // Spike
         signal[n/2] = -1000.0;  // Spike
-        run_signal_tests("Signal with outliers", signal.data(), n, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Signal with outliers", signal.data(), n, false);
     }
 }
 
@@ -581,14 +566,13 @@ int main() {
         std::vector<double> signal(n);
         
         generate_sum_of_sines(signal.data(), n, 42);
-        run_signal_tests("Sum of sines", signal.data(), n, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("Sum of sines", signal.data(), n, false);
         
         generate_garch(signal.data(), n, 42);
-        run_signal_tests("GARCH price", signal.data(), n, eemd::ProcessingMode::Standard, false);
+        run_signal_tests("GARCH price", signal.data(), n, false);
     }
     
     run_edge_case_tests();
-    run_mode_comparison_tests();
     run_robustness_tests();
     run_numerical_stress_tests();
     

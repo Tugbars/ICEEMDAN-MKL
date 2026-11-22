@@ -3,7 +3,7 @@
 //   figure_tool decompose <in.csv> <out.csv> [options]   IMFs one per column, residue last
 //   figure_tool time <in.csv> <runs> [options]            prints: median ms, min ms, number of IMFs
 //
-// options: --seed S  --threads T  --sd  --single  --circular  --mirror
+// options: --seed S  --threads T  --sd  --single  --circular
 //          --no-keep   the noise bank is not kept between calls: every timed decomposition
 //                      costs what the first one of its length costs
 #include "iceemdan.hpp"
@@ -38,7 +38,7 @@ int main(int argc, char **argv)
     }
     const int32_t n = static_cast<int32_t>(x.size());
 
-    eemd::ICEEMDAN d; // ProcessingMode::Standard defaults: the published algorithm
+    eemd::ICEEMDAN d; // the defaults: the published algorithm
     for (int a = 4; a < argc; ++a)
     {
         if (!std::strcmp(argv[a], "--seed") && a + 1 < argc)
@@ -51,8 +51,6 @@ int main(int argc, char **argv)
             d.config().local_mean_method = eemd::LocalMeanMethod::SingleEnvelope;
         else if (!std::strcmp(argv[a], "--circular"))
             d.config().use_circular_bank = true;
-        else if (!std::strcmp(argv[a], "--mirror"))
-            d.config().boundary_method = eemd::BoundaryMethod::Mirror;
         else if (!std::strcmp(argv[a], "--no-keep"))
             d.config().keep_noise_bank = false;
     }

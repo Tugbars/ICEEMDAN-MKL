@@ -34,7 +34,7 @@ int main(int argc, char **argv)
         std::fclose(f);
     }
 
-    eemd::ICEEMDAN d; // ProcessingMode::Standard defaults
+    eemd::ICEEMDAN d; // the defaults: the published algorithm
     for (int a = 3; a < argc; ++a)
     {
         if (!std::strcmp(argv[a], "--seed") && a + 1 < argc)

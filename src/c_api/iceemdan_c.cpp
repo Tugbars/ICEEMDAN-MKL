@@ -210,7 +210,6 @@ static ICEEMDAN_NOINLINE iceemdan_t *create(const iceemdan_config_t *config)
         k.rng_seed = c.seed != 0 ? c.seed : 42u;
         d->nthreads = c.nthreads > 0 ? c.nthreads : logical_processors();
         k.num_threads = d->nthreads;
-        k.sanitize_input = true; // NaN and Inf filled in; finite samples are left as they are
         k.keep_noise_bank = true;
         k.noise_bank_max_bytes = noise_limit();
         if (c.flags & ICEEMDAN_FLAG_FAST)

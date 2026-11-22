@@ -1,6 +1,6 @@
 /**
- * Real FFTs for the EEMD/ICEEMDAN analysis utilities
- * (Hilbert transform, instantaneous frequency, spectral entropy).
+ * Real FFTs for the Hilbert-Huang analysis (Hilbert transform, instantaneous
+ * frequency).
  *
  * The transforms are VectorFFT's (https://github.com/Tugbars/VectorFFT): link
  * VectorFFT::vfft (CMake does, from the ready-built release library). It
@@ -206,8 +206,8 @@ namespace eemd
         /**
          * Which backend transforms length n on this thread (for logs and
          * tests): VectorFFT, or None when there is no plan for n. That is the
-         * case for n = 1, which hilbert() and power_spectrum() compute
-         * without a transform, and when VectorFFT could not be loaded.
+         * case for n = 1, which hilbert() computes without a transform, and
+         * when VectorFFT could not be loaded.
          */
         inline Backend backend_for(int32_t n)
         {
@@ -265,36 +265,6 @@ namespace eemd
             const double scale = 1.0 / n;
             for (int32_t i = 0; i < n; ++i)
                 y[i] *= scale;
-            return true;
-        }
-
-        /**
-         * One-sided power spectrum |X[k]|^2 for k = 0 .. n/2 of a real signal.
-         * psd must hold n/2 + 1 doubles.
-         */
-        inline bool power_spectrum(const double *x, int32_t n, double *psd)
-        {
-            if (n < 1)
-                return false;
-            if (n == 1)
-            {
-                psd[0] = x[0] * x[0]; // the only bin is the sample itself
-                return true;
-            }
-            RealFFT *plan = thread_plan(n);
-            if (!plan)
-                return false;
-            const int32_t nb = plan->bins();
-            thread_local std::vector<double> spec;
-            spec.resize(2 * static_cast<size_t>(nb));
-            if (!plan->forward(x, spec.data()))
-                return false;
-            for (int32_t k = 0; k < nb; ++k)
-            {
-                const double re = spec[2 * k];
-                const double im = spec[2 * k + 1];
-                psd[k] = re * re + im * im;
-            }
             return true;
         }
 

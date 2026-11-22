@@ -5,7 +5,7 @@
  *
  *   same_noise noise <n> <count> <seed> <out.csv>
  *       the library's noise realizations 0 .. count-1 of the seed, one per row
- *       (the realizations ICEEMDAN uses without antithetic pairs)
+ *       (the realizations ICEEMDAN uses)
  *   same_noise emd <n> <seed> <index> <out.csv> [--max-iters K]
  *       the EMD of realization <index>, as the noise bank makes it: the modes
  *       one per column, the residue last
@@ -14,7 +14,6 @@
  *       column, the residue last
  *
  * options of iceemdan:
- *   --antithetic        +/- noise pairs: ensemble/2 realizations, each used twice
  *   --max-iters K       sifting iterations at most, for the local means
  *   --ensemble M        realizations (default 100)
  */
@@ -100,7 +99,6 @@ int main(int argc, char **argv)
         e.config().stop_rule = ic.sift_stop_rule;
         e.config().rilling = ic.rilling;
         e.config().symmetric_boundary = true;
-        e.config().spline_method = ic.spline_method;
         for (int a = 6; a < argc; ++a)
             if (!std::strcmp(argv[a], "--max-iters") && a + 1 < argc)
                 e.config().max_sift_iters = std::atoi(argv[++a]);
@@ -117,13 +115,10 @@ int main(int argc, char **argv)
     {
         const std::vector<double> x = read_column(argv[2]);
         eemd::ICEEMDAN d;
-        d.config().use_antithetic = false;
         for (int a = 4; a < argc; ++a)
         {
             if (!std::strcmp(argv[a], "--seed") && a + 1 < argc)
                 d.config().rng_seed = static_cast<uint32_t>(std::strtoul(argv[++a], nullptr, 10));
-            else if (!std::strcmp(argv[a], "--antithetic"))
-                d.config().use_antithetic = true;
             else if (!std::strcmp(argv[a], "--max-iters") && a + 1 < argc)
                 d.config().max_sift_iters = std::atoi(argv[++a]);
             else if (!std::strcmp(argv[a], "--ensemble") && a + 1 < argc)
