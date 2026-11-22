@@ -56,4 +56,4 @@ R, C# (DllImport), LabVIEW (Call Library Function).
 A decomposition comes out the same, bit for bit, on every processor that runs
 the library and at any number of threads, for the same settings and seed.
 
-Source, documentation and the Python package: https://github.com/Tugbars/iceemdan
+Source, documentation and the Python package: https://github.com/Tugbars/VectorEMD---ICEEMDAN

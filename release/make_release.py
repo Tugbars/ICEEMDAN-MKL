@@ -53,7 +53,7 @@ HEADERS = ("iceemdan.h", "iceemdan_diagnostics.h", "emd.h")
 
 def header_version_and_functions():
     text = "".join(open(os.path.join(ROOT, "include", h), encoding="utf-8").read() for h in HEADERS)
-    version = re.search(r'#define ICEEMDAN_VERSION_STRING "([0-9.]+)"', text).group(1)
+    version = re.search(r'#define ICEEMDAN_VERSION_STRING "([^"]+)"', text).group(1)
     functions = re.findall(r"(?:ICEEMDAN|EMD)_API\s+[^;(]*?\b((?:iceemdan|emd)_\w+)\s*\(", text)
     return version, sorted(set(functions))
 

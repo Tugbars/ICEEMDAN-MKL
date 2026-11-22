@@ -5,11 +5,12 @@ cmake_minimum_required(VERSION 3.20)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/iceemdan.h" _iceemdan_version_line
      REGEX "^#define ICEEMDAN_VERSION_STRING ")
 string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+" ICEEMDAN_VERSION "${_iceemdan_version_line}")
+string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+[^\"]*" ICEEMDAN_VERSION_FULL "${_iceemdan_version_line}")
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/iceemdan.hpp" _iceemdan_hpp_version_line
      REGEX "^#define ICEEMDAN_VERSION_STRING ")
-string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+" _iceemdan_hpp_version "${_iceemdan_hpp_version_line}")
-if(NOT ICEEMDAN_VERSION STREQUAL _iceemdan_hpp_version)
-    message(FATAL_ERROR "include/iceemdan.h says version ${ICEEMDAN_VERSION}, "
+string(REGEX MATCH "[0-9]+[.][0-9]+[.][0-9]+[^\"]*" _iceemdan_hpp_version "${_iceemdan_hpp_version_line}")
+if(NOT ICEEMDAN_VERSION_FULL STREQUAL _iceemdan_hpp_version)
+    message(FATAL_ERROR "include/iceemdan.h says version ${ICEEMDAN_VERSION_FULL}, "
                         "include/iceemdan.hpp says ${_iceemdan_hpp_version}: they must be the same")
 endif()
 
@@ -533,7 +534,7 @@ install(EXPORT iceemdan_targets
 # ============================================================================
 message(STATUS "")
 message(STATUS "=== ICEEMDAN Configuration ===")
-message(STATUS "  Version: ${PROJECT_VERSION}")
+message(STATUS "  Version: ${ICEEMDAN_VERSION_FULL}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  Portable (AVX2 + FMA, for release binaries): ${ICEEMDAN_PORTABLE}")
 message(STATUS "  MKL comparison programs: ${EEMD_MKL_COMPARISONS}")

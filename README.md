@@ -1,6 +1,6 @@
 # VectorEMD
 
-**ICEEMDAN (Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise), EEMD and EMD in C++, with C and Python interfaces.** The repository, the CMake package and the Python module are named `iceemdan`.
+**ICEEMDAN (Improved Complete Ensemble Empirical Mode Decomposition with Adaptive Noise), EEMD and EMD in C++, with C and Python interfaces.** The CMake package and the Python module are named `iceemdan`. Version 0.9 beta.
 
 It follows the published algorithm of Colominas et al. (2014), agrees with the authors' own code, and decomposes a signal of 1,024 samples with an ensemble of 100 in 8 ms on eight threads, where the authors' code takes 36 s. Every further signal of that length takes 3 ms.
 
@@ -80,6 +80,32 @@ True components: relative error of the recovered component, edges excluded.
 
 With their own random numbers the two codes agree statistically: the first six bands of white noise within 0.005 octave on average, all 10 within 0.079, the last ones varying most because not every seed has them. The modes and the residue add up to the signal to rounding (2 × 10⁻¹⁶). A baseline slower than two cycles is not a single mode; its error is that of the slow modes summed. Method: [`validation/README.md`](validation/README.md).
 
+### The remaining gaps
+
+Where a dot does not sit in its ring, the cause is the noise, not the computation. On the same noise the two codes return the same modes. With their own noise, every number of the figure varies from seed to seed, and the authors' code, at one to two minutes for a decomposition, was run for 3 seeds: a mean of 3 seeds still scatters. Each gap is within that scatter, measured on 200 seeds of this library:
+
+<details>
+<summary>The gaps against the scatter</summary>
+
+| | This library, 200 seeds | Scatter of one seed | Authors' code, 3 seeds | Gap, in standard errors of a 3-seed mean |
+|---|---|---|---|---|
+| Trend under the tones | 8.8 % | 3.4 points | 5.8 % | 1.5 |
+| Tone of 8 cycles | 7.9 % | 2.4 points | 5.8 % | 1.5 |
+| Rhythm on the baseline | 5.4 % | 0.58 points | 5.0 % | 1.2 |
+| Tone of 128 cycles | 26.6 % | 0.81 points | 26.9 % | 0.6 |
+| Tone of 32 cycles | 30.7 % | 2.8 points | 30.2 % | 0.3 |
+| Wandering baseline | 0.35 % | 0.05 points | 0.34 % | 0.1 |
+
+Of the 19 numbers compared (these, the bands of white noise and the number of modes of the three signals), none is further than 1.6 standard errors from the library's mean. Different noise alone produces such gaps: about one number in twenty would lie beyond two.
+
+</details>
+
+The two largest gaps of the figure are those of the 8-cycle tone and of the trend, the two numbers that vary by about a third of their own value from one seed to the next. The gaps can be reduced:
+
+- **More seeds of the authors' code.** A gap shrinks with the square root of the number of seeds: 20 seeds in place of 3 make it about 2.6 times smaller, for about 80 minutes of Octave. The seeds are the loop of [`validation/run_reference.m`](validation/run_reference.m).
+- **More seeds of this library.** They cost little (200 seeds of the three signals take under a minute), but on their own they change little: the 3 seeds of the authors' code dominate the gap.
+- **The scatter beside the gap.** [`validation/compare.py`](validation/compare.py) prints both for every number, so that a gap is read against what different noise produces.
+
 ## Speed
 
 ![Time per decomposition as a matrix over signal length 1,024 to 8,192. The authors' code takes 35.7 to 111 s. For the first signal of a length, this library is 778 to 169 times faster on one thread and 4,680 to 1,020 times faster on eight; for further signals, 1,930 to 616 times on one thread and 10,860 to 3,460 times on eight.](docs/img/speed.svg)
@@ -125,7 +151,7 @@ Many signals of one length in one call, such as the channels of a recording, are
 
 - **Three interfaces with the same settings and the same results**:
   - C++17, header-only: [`include/iceemdan.hpp`](include/iceemdan.hpp) (example: [`examples/cpp/decompose.cpp`](examples/cpp/decompose.cpp));
-  - C, eight functions in one header: [`include/iceemdan.h`](include/iceemdan.h) (example: [`examples/c/decompose.c`](examples/c/decompose.c)), built as a shared library that any language can call;
+  - C, eight functions in one header: [`include/iceemdan.h`](include/iceemdan.h) (example: [`examples/c/decompose.c`](examples/c/decompose.c)), built as a shared library that any language can call, ready-built for Windows in the [releases](https://github.com/Tugbars/VectorEMD---ICEEMDAN/releases);
   - Python, a module on NumPy arrays: [`python/iceemdan.py`](python/iceemdan.py).
 
   EMD and EEMD have headers of the same shape, [`include/emd.hpp`](include/emd.hpp) and [`include/emd.h`](include/emd.h), and `emd()` and `eemd()` in Python.
@@ -159,7 +185,7 @@ If you use this implementation in your research, please cite:
   author = {Tugbars Heptaskin},
   title = {VectorEMD: ICEEMDAN, EEMD and EMD in C++},
   year = {2025},
-  url = {https://github.com/Tugbars/iceemdan}
+  url = {https://github.com/Tugbars/VectorEMD---ICEEMDAN}
 }
 ```
 

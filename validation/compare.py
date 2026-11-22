@@ -6,9 +6,10 @@ Usage: python compare.py [run dir] [--json accuracy.json]
 Reads, in the run directory (default: the working directory), <prefix>_<signal>_<seed>.csv
 with the modes one per column and the residue last:
 
-  ref_*    the authors' code                      (run_reference.m)
-  after_*  this library, the published algorithm  (decompose_csv)
-  fast_*   this library, its fast option          (decompose_csv --sd --single --circular)
+  ref_*      the authors' code                      (run_reference.m)
+  after_*    this library, the published algorithm  (decompose_csv)
+  fast_*     this library, its fast option          (decompose_csv --sd --single --circular)
+  scatter_*  this library over many seeds, to tell how much a number varies from seed to seed
 
 for the signals of make_signals.py (wn, sines, baseline). And, in its folder same_noise/, the
 authors' code on the library's own noise, same_<signal>.csv (run_same_noise.m), against
@@ -174,6 +175,51 @@ if same:
         entry['library_modes'].append(len(b) - 1)
         print(f'  {name:10s} IMFs {len(a) - 1} (authors) / {len(b) - 1} (library): ' + ' '.join(f'{v:.0e}' for v in d))
     result['same_noise'] = entry
+
+# ---------------- how much each number varies from seed to seed --------------------------------
+# On the same noise the two codes return the same modes, so the standard deviation over many
+# seeds of this library is the scatter of one seed of either code, and a mean over n seeds
+# scatters by that over sqrt(n): the standard error of the authors' mean. A gap of up to about
+# two standard errors is what different noise alone produces.
+def seeds_of(prefix, signal):
+    return [modes(p) for p in sorted(glob.glob(f'{run}/{prefix}_{signal}_*.csv'))]
+
+
+many = {signal: seeds_of('scatter', signal) for signal in ('sines', 'baseline', 'wn')}
+reference = {signal: seeds_of('ref', signal) for signal in many}
+if all(many.values()) and all(reference.values()):
+    k = min(len(m) - 1 for m in many['wn'] + reference['wn'])  # the bands every seed has
+    groups = [
+        ('sines', ['tone of 128 cycles', 'tone of 32 cycles', 'tone of 8 cycles', 'trend under the tones',
+                   'tones: number of IMFs'], lambda m: tones_errors(m) + [len(m) - 1]),
+        ('baseline', ['rhythm on the baseline', 'wandering baseline', 'baseline: number of IMFs'],
+         lambda m: baseline_errors(m) + [len(m) - 1]),
+        ('wn', [f'white noise: band {i + 1}, in octaves' for i in range(k)] + ['white noise: number of IMFs'],
+         lambda m: [np.log2(centroid(v)) for v in m[:k]] + [len(m) - 1]),
+    ]
+    n_many, n_ref = len(many['sines']), len(reference['sines'])
+    print(f'\nSeed-to-seed scatter: this library over {n_many} seeds, and the authors\' mean of {n_ref} seeds in')
+    print('standard errors of such a mean (the bands as log2 of the mean frequency)')
+    print(row('', ['mean', 'one seed', 'authors', 'std errors'], '{:>12s}'))
+    entry = {'what': f'this library over {n_many} seeds: the mean of each number and its standard deviation from seed '
+                     f'to seed; the mean of the authors\' {n_ref} seeds, and its distance from the library\'s mean '
+                     'in standard errors of a mean of that many seeds. Bands: log2 of the mean frequency (octaves)',
+             'seeds': n_many, 'reference_seeds': n_ref, 'names': [], 'mean': [], 'one_seed': [], 'reference': [],
+             'standard_errors': []}
+    for signal, names, measure in groups:
+        v = np.array([measure(m) for m in many[signal]], dtype=float)
+        r = np.array([measure(m) for m in reference[signal]], dtype=float)
+        mean, sd, ref_mean = v.mean(axis=0), v.std(axis=0, ddof=1), r.mean(axis=0)
+        z = (ref_mean - mean) / (sd / np.sqrt(len(r)))
+        for j, name in enumerate(names):
+            entry['names'].append(name)
+            entry['mean'].append(round(float(mean[j]), 6))
+            entry['one_seed'].append(round(float(sd[j]), 6))
+            entry['reference'].append(round(float(ref_mean[j]), 6))
+            entry['standard_errors'].append(round(float(z[j]), 4))
+            print(row(name, [mean[j], sd[j], ref_mean[j], z[j]], '{:12.4f}'))
+    result['scatter'] = entry
+    print(f"  largest distance: {max(abs(v) for v in entry['standard_errors']):.2f} standard errors")
 
 if json_path:
     seeds = result['seeds']

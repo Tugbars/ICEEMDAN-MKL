@@ -37,7 +37,7 @@ x = eeg[0]
 
 print("The library")
 header = open(os.path.join(ROOT, "include", "iceemdan.h"), encoding="utf-8").read()
-check(iceemdan.version() == re.search(r'ICEEMDAN_VERSION_STRING "([0-9.]+)"', header).group(1),
+check(iceemdan.version() == re.search(r'ICEEMDAN_VERSION_STRING "([^"]+)"', header).group(1),
       f"version {iceemdan.version()}, as the header")
 check(iceemdan.info()["processors"] >= 1, f"processors: {iceemdan.info()['processors']}")
 

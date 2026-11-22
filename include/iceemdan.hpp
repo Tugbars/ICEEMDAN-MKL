@@ -44,9 +44,10 @@
 #include <utility>
 #include <vector>
 
-/** "MAJOR.MINOR.PATCH"; the same as in iceemdan.h (CMake checks that). */
+/** "MAJOR.MINOR.PATCH", "-beta" after it before the first full release; the same as in
+ *  iceemdan.h (CMake checks that). */
 #ifndef ICEEMDAN_VERSION_STRING
-#define ICEEMDAN_VERSION_STRING "1.1.0"
+#define ICEEMDAN_VERSION_STRING "0.9.0-beta"
 #endif
 
 namespace iceemdan

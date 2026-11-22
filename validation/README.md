@@ -23,6 +23,11 @@ for s in 1 2 3 4 5; do for sig in wn sines baseline; do
   ../../build/decompose_csv $sig.csv fast_${sig}_$s.csv  --seed $s --sd --single --circular
 done; done
 
+# this library over many seeds: how much each number varies from seed to seed (under a minute)
+for s in $(seq 1 200); do for sig in wn sines baseline; do
+  ../../build/decompose_csv $sig.csv scatter_${sig}_$s.csv --seed $s
+done; done
+
 # the same noise: the authors' code on the noise realizations of this library
 mkdir same_noise && cd same_noise
 cp ../ref/ceemdan.m ../ref/emd.m ../../same_noise/randn.m ../../same_noise/run_same_noise.m .
@@ -60,6 +65,11 @@ What is compared:
   against the baseline's own variation. A baseline slower than two cycles is not one mode; what
   matters to someone who removes it is the sum.
 - **The fast option** of this library on the same signals: what it gives up for its speed.
+- **The scatter of one seed**: the standard deviation of each number over the 200 seeds of this
+  library. A mean of n seeds scatters by that over √n, its standard error; the gap between the
+  authors' mean and the library's is given in standard errors of the authors' mean. Different
+  noise alone produces gaps of up to about two. More seeds in `run_reference.m` shrink the gaps
+  with the square root of their number.
 - **The same noise**: in the folder `same_noise`, `randn.m` stands in for Octave's `randn` and
   hands the unchanged `ceemdan.m` the noise realizations this library draws for seed 1. Both then
   decompose the same signal with the same noise, and every mode is compared sample by sample:

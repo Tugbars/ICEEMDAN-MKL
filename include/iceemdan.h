@@ -46,8 +46,9 @@
 
 #include <stddef.h>
 
-/** @brief "MAJOR.MINOR.PATCH" of this header; iceemdan_info() gives the loaded library's. */
-#define ICEEMDAN_VERSION_STRING "1.1.0"
+/** @brief "MAJOR.MINOR.PATCH" of this header, "-beta" after it before the first full release;
+ *  iceemdan_info() gives the loaded library's. */
+#define ICEEMDAN_VERSION_STRING "0.9.0-beta"
 
 /* ICEEMDAN_API marks the functions of the public headers: the shared library exports them and nothing else. */
 #ifndef ICEEMDAN_API
