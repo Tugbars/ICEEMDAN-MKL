@@ -84,6 +84,88 @@ static bool bitwise_equal(const Run &a, const Run &b)
     return std::memcmp(a.residue.data(), b.residue.data(), a.residue.size() * sizeof(double)) == 0;
 }
 
+/** The polynomial through the k knots, at x (Lagrange form). */
+static double polynomial_through(const double *tx, const double *ty, int k, double x)
+{
+    double sum = 0.0;
+    for (int i = 0; i < k; ++i)
+    {
+        double w = ty[i];
+        for (int j = 0; j < k; ++j)
+            if (j != i)
+                w *= (x - tx[j]) / (tx[i] - tx[j]);
+        sum += w;
+    }
+    return sum;
+}
+
+/** The straight lines from knot to knot, at x (the first and the last continued). */
+static double lines_through(const double *tx, const double *ty, int k, double x)
+{
+    int i = 0;
+    while (i < k - 2 && x > tx[i + 1])
+        ++i;
+    return ty[i] + (ty[i + 1] - ty[i]) * (x - tx[i]) / (tx[i + 1] - tx[i]);
+}
+
+struct FewKnots
+{
+    int upper_knots = 0, lower_knots = 0;
+    bool sifted = false;     // the local mean took exactly one sifting step
+    double error = 0.0;      // its distance from the mean of the envelopes made here
+    double from_lines = 0.0; // its distance from the mean of straight-line envelopes
+};
+
+/**
+ * One sifting step of x by the trials' local mean (LocalMeanComputer), which
+ * leaves the mean of the two envelopes, against envelopes made here: the knots
+ * of emd.m's boundary extension, and through them what interp1(..., 'spline')
+ * gives. At 3 and 4 knots that is the polynomial through the knots, evaluated
+ * here directly; from 5 knots on, the spline of test_spline.
+ */
+static FewKnots few_knots(const std::vector<double> &x)
+{
+    const int n = static_cast<int>(x.size());
+    FewKnots r;
+    std::vector<int32_t> imax(n / 2 + 2), imin(n / 2 + 2);
+    int32_t n_max = 0, n_min = 0;
+    eemd::find_extrema_raw(x.data(), n, imax.data(), n_max, imin.data(), n_min);
+    std::vector<double> tu(n_max + 8), zu(n_max + 8), tl(n_min + 8), zl(n_min + 8);
+    int32_t ku = 0, kl = 0;
+    if (!eemd::extend_extrema_symmetric(imax.data(), n_max, imin.data(), n_min, x.data(), n, 2,
+                                        tu.data(), zu.data(), ku, tl.data(), zl.data(), kl))
+        return r;
+    r.upper_knots = ku;
+    r.lower_knots = kl;
+
+    std::vector<double> upper(n), lower(n);
+    eemd::CubicSpline spline;
+    auto envelope = [&](const std::vector<double> &tx, const std::vector<double> &ty, int k, std::vector<double> &out)
+    {
+        if (k <= 4)
+            for (int j = 0; j < n; ++j)
+                out[j] = polynomial_through(tx.data(), ty.data(), k, j);
+        else if (!(spline.construct(tx.data(), ty.data(), k) && spline.evaluate_uniform(out.data(), n)))
+            r.error = 1e300;
+    };
+    envelope(tu, zu, ku, upper);
+    envelope(tl, zl, kl, lower);
+
+    eemd::SiftParams one_step;
+    one_step.max_iters = 1; // then M(x) = x - (x - envelope mean)
+    eemd::LocalMeanComputer lm(n, 2, eemd::LocalMeanMethod::Sifted, one_step);
+    std::vector<double> mean(n);
+    eemd::SiftStats stats;
+    r.sifted = lm.compute(x.data(), n, mean.data(), &stats) && !stats.unsifted && stats.iterations == 1;
+    for (int j = 0; j < n; ++j)
+    {
+        const double lines = 0.5 * (lines_through(tu.data(), zu.data(), ku, j) + lines_through(tl.data(), zl.data(), kl, j));
+        r.error = std::max(r.error, std::abs(mean[j] - 0.5 * (upper[j] + lower[j])));
+        r.from_lines = std::max(r.from_lines, std::abs(mean[j] - lines));
+    }
+    return r;
+}
+
 int main()
 {
     const std::vector<double> x = test_signal(1500, 7);
@@ -405,6 +487,61 @@ int main()
                    std::equal(mn.begin(), mn.begin() + n_mn, mn2.begin());
         }
         check(same, "find_extrema_raw gives the indices of the two separate scans");
+    }
+
+    // ------------------------------------------------------------------
+    std::printf("Envelopes through few knots: the spline, as emd.m's interp1(..., 'spline')\n");
+    {
+        // The slow end of a decomposition: a signal with one or two extrema
+        // of a kind, on an offset (so the stop rule lets it be sifted).
+        const int len = 240;
+        std::vector<double> humps(len), dips(len), cycles(len);
+        for (int i = 0; i < len; ++i)
+        {
+            const double t = static_cast<double>(i) / len;
+            humps[i] = 10.0 + 2.0 * t + (1.0 + 0.4 * t) * std::sin(3.0 * M_PI * t);         // maximum, minimum, maximum
+            dips[i] = 20.0 - humps[i];                                                      // minimum, maximum, minimum
+            cycles[i] = 10.0 + 2.0 * t + (1.0 + 0.4 * t) * std::sin(4.0 * M_PI * t + 0.3);  // two of each
+        }
+        char label[160];
+
+        const FewKnots a = few_knots(humps);
+        std::snprintf(label, sizeof(label), "2 maxima, 1 minimum (%d and %d knots): cubic and parabola", a.upper_knots,
+                      a.lower_knots);
+        check(a.upper_knots == 4 && a.lower_knots == 3 && a.sifted && a.error < 1e-11, label);
+        check(a.from_lines > 1e-2, "  ... and not straight lines from knot to knot");
+
+        const FewKnots b = few_knots(dips);
+        std::snprintf(label, sizeof(label), "1 maximum, 2 minima (%d and %d knots): parabola and cubic", b.upper_knots,
+                      b.lower_knots);
+        check(b.upper_knots == 3 && b.lower_knots == 4 && b.sifted && b.error < 1e-11, label);
+        check(b.from_lines > 1e-2, "  ... and not straight lines from knot to knot");
+
+        const FewKnots c = few_knots(cycles);
+        std::snprintf(label, sizeof(label), "2 maxima, 2 minima (%d and %d knots): the splines", c.upper_knots,
+                      c.lower_knots);
+        check(c.upper_knots == 5 && c.lower_knots == 5 && c.sifted && c.error < 1e-11, label);
+        check(c.from_lines > 1e-2, "  ... and not straight lines from knot to knot");
+
+        // The trials sift as the EMD of the noise does: the same first mode,
+        // whichever of the two takes it out of the signal
+        bool same = true;
+        double worst = 0.0;
+        for (const std::vector<double> *s : {&humps, &dips, &cycles})
+        {
+            eemd::EEMDConfig emd_config; // emd.m's defaults
+            eemd::Sifter sifter(len, emd_config);
+            std::vector<double> copy(*s), mode(len), mean(len);
+            eemd::SiftParams as_emd;
+            as_emd.max_iters = emd_config.max_sift_iters;
+            as_emd.rule = emd_config.stop_rule;
+            as_emd.rilling = emd_config.rilling;
+            eemd::LocalMeanComputer lm(len, emd_config.boundary_extend, eemd::LocalMeanMethod::Sifted, as_emd);
+            same = same && sifter.sift_imf(copy.data(), mode.data(), len) && lm.compute(s->data(), len, mean.data());
+            for (int i = 0; i < len; ++i)
+                worst = std::max(worst, std::abs((*s)[i] - mode[i] - mean[i]));
+        }
+        check(same && worst < 1e-11, "the trials' sifting and the EMD's take out the same first mode");
     }
 
     // ------------------------------------------------------------------

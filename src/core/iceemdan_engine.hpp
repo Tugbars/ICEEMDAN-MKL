@@ -98,10 +98,6 @@ namespace eemd
         // when decompose() returns. ICEEMDAN::release_noise_bank() frees it at
         // any time.
         bool keep_noise_bank = true;
-
-        // An envelope through fewer knots than this is drawn with straight
-        // lines instead of the spline
-        int32_t spline_fast_threshold = 6;
     };
 
     /**
@@ -379,7 +375,7 @@ namespace eemd
 
             TrialWorkspace(int32_t len, const ICEEMDANConfig &c)
                 : n(len), made_for(c),
-                  lm_computer(len, c.boundary_extend, c.spline_fast_threshold, c.local_mean_method, sift_params(c)),
+                  lm_computer(len, c.boundary_extend, c.local_mean_method, sift_params(c)),
                   perturbed(len), local_mean(len)
             {
             }
@@ -389,7 +385,6 @@ namespace eemd
             {
                 const ICEEMDANConfig &m = made_for;
                 return n == len && m.boundary_extend == c.boundary_extend &&
-                       m.spline_fast_threshold == c.spline_fast_threshold &&
                        m.local_mean_method == c.local_mean_method && m.max_sift_iters == c.max_sift_iters &&
                        m.sift_threshold == c.sift_threshold && m.s_number == c.s_number &&
                        m.sift_stop_rule == c.sift_stop_rule && m.rilling.theta1 == c.rilling.theta1 &&

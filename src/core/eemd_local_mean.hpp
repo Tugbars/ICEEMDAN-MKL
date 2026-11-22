@@ -32,82 +32,11 @@ namespace eemd
     };
 
     // ============================================================================
-    // Fast Linear Interpolation (for sparse extrema)
-    // ============================================================================
-
-    inline void fast_linear_interp(
-        const double *__restrict x_knots,
-        const double *__restrict y_knots,
-        int32_t n_knots,
-        double *__restrict output,
-        int32_t n_output)
-    {
-        if (n_knots < 2)
-        {
-            double val = (n_knots == 1) ? y_knots[0] : 0.0;
-            for (int32_t i = 0; i < n_output; ++i)
-            {
-                output[i] = val;
-            }
-            return;
-        }
-
-        int32_t knot_idx = 0;
-
-        for (int32_t i = 0; i < n_output; ++i)
-        {
-            double x = static_cast<double>(i);
-
-            // Advance knot index if needed
-            while (knot_idx < n_knots - 2 && x > x_knots[knot_idx + 1])
-            {
-                ++knot_idx;
-            }
-
-            // Handle boundaries
-            if (x <= x_knots[0])
-            {
-                // Extrapolate left (with division-by-zero protection)
-                double dx = x_knots[1] - x_knots[0];
-                if (std::abs(dx) < 1e-10)
-                    dx = 1.0; // Fallback to flat
-                double slope = (y_knots[1] - y_knots[0]) / dx;
-                output[i] = y_knots[0] + slope * (x - x_knots[0]);
-            }
-            else if (x >= x_knots[n_knots - 1])
-            {
-                // Extrapolate right (with division-by-zero protection)
-                double dx = x_knots[n_knots - 1] - x_knots[n_knots - 2];
-                if (std::abs(dx) < 1e-10)
-                    dx = 1.0;
-                double slope = (y_knots[n_knots - 1] - y_knots[n_knots - 2]) / dx;
-                output[i] = y_knots[n_knots - 1] + slope * (x - x_knots[n_knots - 1]);
-            }
-            else
-            {
-                // Linear interpolation (with division-by-zero protection)
-                double x0 = x_knots[knot_idx];
-                double x1 = x_knots[knot_idx + 1];
-                double y0 = y_knots[knot_idx];
-                double y1 = y_knots[knot_idx + 1];
-                double dx = x1 - x0;
-                if (std::abs(dx) < 1e-10)
-                {
-                    output[i] = 0.5 * (y0 + y1); // Degenerate: average
-                }
-                else
-                {
-                    double t = (x - x0) / dx;
-                    output[i] = y0 + t * (y1 - y0);
-                }
-            }
-        }
-    }
-
-    // ============================================================================
     // Local Mean Computer
-    // - Envelopes: cubic splines through the extrema, continued past the ends
-    //   by the symmetric extension of emd.m; straight lines for sparse extrema
+    // - Envelopes: the cubic spline through the extrema, continued past the
+    //   ends by the symmetric extension of emd.m. Always the spline, as
+    //   emd.m's interp1(..., 'spline'), however few the knots: the extension
+    //   leaves at least 3, where the spline is the parabola through them
     // - Sifted mode: M(x) = x - E1(x), E1 sifted to convergence (the operator
     //   of Colominas et al. 2014); SingleEnvelope mode: one envelope mean
     // ============================================================================
@@ -137,12 +66,10 @@ namespace eemd
     {
     public:
         explicit LocalMeanComputer(int32_t max_len, int32_t boundary_extend,
-                                   int32_t fast_threshold = 6,
                                    LocalMeanMethod method = LocalMeanMethod::Sifted,
                                    SiftParams sift = SiftParams())
             : max_len_(max_len),
               boundary_extend_(boundary_extend),
-              fast_threshold_(fast_threshold),
               method_(method),
               sift_(sift),
               max_idx_(max_len / 2 + 2),
@@ -390,37 +317,23 @@ namespace eemd
             return true;
         }
 
-        /** One envelope through its knots: the cubic spline, or straight lines for sparse knots. */
-        bool compute_envelope(const double *x_knots, const double *y_knots,
-                              int32_t n_knots, double *envelope, int32_t n)
-        {
-            if (n_knots < fast_threshold_)
-            {
-                fast_linear_interp(x_knots, y_knots, n_knots, envelope, n);
-                return true;
-            }
-            return spline_.construct(x_knots, y_knots, n_knots) && spline_.evaluate_uniform(envelope, n);
-        }
-
         /**
-         * Both envelopes, the same as compute_envelope() for the upper and
-         * then the lower one. Two cubic splines are built together
-         * (CubicSpline::construct_pair).
+         * Both envelopes: the cubic spline through the upper knots and the
+         * one through the lower knots (CubicSpline: not-a-knot ends; the
+         * parabola at 3 knots, the straight line at 2), each over the samples
+         * 0 .. n - 1. The two are built together (construct_pair). False when
+         * a spline cannot be built: fewer than 2 knots, or knots that do not
+         * increase.
          */
         bool compute_envelopes(const double *xu, const double *yu, int32_t ku,
                                const double *xl, const double *yl, int32_t kl, int32_t n)
         {
-            if (ku >= fast_threshold_ && kl >= fast_threshold_ &&
-                CubicSpline::construct_pair(spline_, xu, yu, ku, spline2_, xl, yl, kl) &&
-                spline_.evaluate_uniform(upper_env_.data, n) && spline2_.evaluate_uniform(lower_env_.data, n))
-                return true;
-            // otherwise, and should that fail, one after the other as before
-            return compute_envelope(xu, yu, ku, upper_env_.data, n) && compute_envelope(xl, yl, kl, lower_env_.data, n);
+            return CubicSpline::construct_pair(spline_, xu, yu, ku, spline2_, xl, yl, kl) &&
+                   spline_.evaluate_uniform(upper_env_.data, n) && spline2_.evaluate_uniform(lower_env_.data, n);
         }
 
         int32_t max_len_;
         int32_t boundary_extend_;
-        int32_t fast_threshold_;
         LocalMeanMethod method_;
         SiftParams sift_;
 
